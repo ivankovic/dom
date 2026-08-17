@@ -152,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
 async fn statistics_task(state: SharedState, pool: SqlitePool) {
     stats::refresh(&pool, &state).await;
     loop {
-        match db::rollup_energy_daily(&pool, ROLLUP_THROTTLE).await {
+        match db::rollup_history(&pool, ROLLUP_THROTTLE).await {
             Ok(0) => {}
             Ok(n) => log::info!("rolled up {n} device-days of energy"),
             Err(e) => log::warn!("energy rollup failed: {e:#}"),

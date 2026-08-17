@@ -215,6 +215,89 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
         .execute(&pool)
         .await?;
 
+    // Per-minute energy, rolled up from the 2s rows in `Energy`.
+    //
+    // The middle tier of `2s -> 1min -> daily`. Its purpose is to be the tier
+    // that *survives*: the 2s series is only kept for a few days (see
+    // `prune_energy_2s`), so anything a chart or a future historical view might
+    // want has to be recoverable from here.
+    //
+    // A separate table rather than `Energy` rows with `resolution = '1min'`,
+    // which the `resolution` column originally anticipated. Three reasons: the
+    // aggregate-only columns below are meaningless for a 2s sample; a
+    // (device, minute, metric) primary key gives idempotent upserts, which
+    // `Energy` has no unique key for; and adding rows to `Energy` would grow
+    // `idx_energy_metric_res_time`, already the single largest object in the
+    // database at 914 MB against a 555 MB table.
+    //
+    // `energy_ws` stays the exact integral — summing 2s energies into a minute
+    // loses no energy at all, only intra-minute shape. The positive and negative
+    // parts are stored separately because a sign split is *not* tier-invariant: a
+    // minute in which the battery both charged and discharged nets out, so
+    // splitting after aggregation would understate both directions.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS EnergyMinute (
+            device_id      INTEGER NOT NULL REFERENCES Devices(id),
+            minute         TEXT    NOT NULL,
+            metric         TEXT    NOT NULL,
+            energy_ws      REAL    NOT NULL,
+            energy_ws_pos  REAL    NOT NULL,
+            energy_ws_neg  REAL    NOT NULL,
+            span_secs      INTEGER NOT NULL,
+            peak_w         REAL    NOT NULL,
+            PRIMARY KEY (device_id, minute, metric)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_energyminute_time ON EnergyMinute (minute, metric)",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Which local days each rollup tier has already processed.
+    //
+    // Recorded explicitly rather than inferred from whether a tier produced rows,
+    // because "produced nothing" is a legitimate outcome — a day with no battery
+    // samples yields no `StorageDaily` row — and inferring would leave such a day
+    // looking unprocessed forever, re-scanning all history on every pass.
+    //
+    // Keyed by tier so that adding a tier later backfills across existing history
+    // on its own: its marker set starts empty, so every day is outstanding for it
+    // while the established tiers are skipped.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS RollupProgress (
+            tier  TEXT NOT NULL,
+            day   TEXT NOT NULL,
+            PRIMARY KEY (tier, day)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Per-local-day battery state of charge.
+    //
+    // `EnergyStorage` records RSOC every 2 seconds and nothing has ever read it —
+    // 65 MB of rows plus a 124 MB index that no query touches. Rolled up to one
+    // row per device-day so the 2s rows can be pruned without foreclosing
+    // battery-health statistics later. RSOC is a state, not a flow, so min/max/avg
+    // are the useful summaries rather than a sum.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS StorageDaily (
+            device_id  INTEGER NOT NULL REFERENCES Devices(id),
+            day        TEXT    NOT NULL,
+            rsoc_min   REAL    NOT NULL,
+            rsoc_max   REAL    NOT NULL,
+            rsoc_avg   REAL    NOT NULL,
+            samples    INTEGER NOT NULL,
+            PRIMARY KEY (device_id, day)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }
 
@@ -292,6 +375,130 @@ fn local_day_bounds_utc(day: chrono::NaiveDate) -> Option<(String, String)> {
     ))
 }
 
+/// Aggregates one local day of one device's 2s rows into `EnergyMinute`.
+///
+/// Only *complete* minutes are written: `cutoff` must be the start of the current
+/// UTC minute, and rows at or after it are ignored. A partial minute row would
+/// otherwise be indistinguishable from a whole one, and would then be treated as
+/// final once the 2s rows behind it were pruned.
+///
+/// Idempotent by replacement rather than accumulation, so re-rolling a day that
+/// has since gained more samples corrects it.
+pub async fn rollup_energy_minute(
+    pool: &SqlitePool,
+    device_id: i64,
+    day: chrono::NaiveDate,
+    cutoff: &str,
+) -> anyhow::Result<u64> {
+    let Some((start, end)) = local_day_bounds_utc(day) else {
+        return Ok(0);
+    };
+    // Never look past the last complete minute, even if the day extends beyond it.
+    let end = if end.as_str() < cutoff {
+        end
+    } else {
+        cutoff.to_string()
+    };
+    if start >= end {
+        return Ok(0);
+    }
+
+    let result = sqlx::query(
+        "INSERT INTO EnergyMinute
+             (device_id, minute, metric, energy_ws, energy_ws_pos, energy_ws_neg,
+              span_secs, peak_w)
+         SELECT device_id,
+                strftime('%Y-%m-%d %H:%M:00', timestamp),
+                metric,
+                SUM(energy_ws),
+                SUM(CASE WHEN energy_ws > 0 THEN  energy_ws ELSE 0 END),
+                SUM(CASE WHEN energy_ws < 0 THEN -energy_ws ELSE 0 END),
+                -- Seconds actually covered, not a nominal 60: a device that was
+                -- offline for part of the minute must not have its average power
+                -- diluted across time it never reported.
+                COUNT(*) * 2,
+                -- Each 2s row's energy is already a 2-second average power once
+                -- divided by its interval; the peak is the largest of those. This
+                -- is the one quantity pruning the 2s rows makes unrecoverable.
+                MAX(ABS(energy_ws)) / 2.0
+         FROM Energy
+         WHERE device_id = ?
+           AND resolution = '2s'
+           AND timestamp >= ?
+           AND timestamp < ?
+         GROUP BY device_id, strftime('%Y-%m-%d %H:%M:00', timestamp), metric
+         ON CONFLICT(device_id, minute, metric) DO UPDATE SET
+             energy_ws     = excluded.energy_ws,
+             energy_ws_pos = excluded.energy_ws_pos,
+             energy_ws_neg = excluded.energy_ws_neg,
+             span_secs     = excluded.span_secs,
+             peak_w        = excluded.peak_w",
+    )
+    .bind(device_id)
+    .bind(&start)
+    .bind(&end)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Start of the current UTC minute — the cutoff for `rollup_energy_minute`.
+pub fn current_minute_start() -> String {
+    chrono::Utc::now().format("%Y-%m-%d %H:%M:00").to_string()
+}
+
+/// Summarises one local day of one device's `EnergyStorage` rows into
+/// `StorageDaily`.
+pub async fn rollup_storage_day(
+    pool: &SqlitePool,
+    device_id: i64,
+    day: chrono::NaiveDate,
+) -> anyhow::Result<()> {
+    let Some((start, end)) = local_day_bounds_utc(day) else {
+        return Ok(());
+    };
+    let day_str = day.format("%Y-%m-%d").to_string();
+
+    let row = sqlx::query(
+        "SELECT MIN(rsoc_avg) AS lo, MAX(rsoc_avg) AS hi, AVG(rsoc_avg) AS mean,
+                COUNT(*) AS samples
+         FROM EnergyStorage
+         WHERE device_id = ? AND resolution = '2s' AND timestamp >= ? AND timestamp < ?",
+    )
+    .bind(device_id)
+    .bind(&start)
+    .bind(&end)
+    .fetch_one(pool)
+    .await?;
+
+    let samples: i64 = row.get("samples");
+    if samples == 0 {
+        return Ok(());
+    }
+    let lo: f64 = row.get("lo");
+    let hi: f64 = row.get("hi");
+    let mean: f64 = row.get("mean");
+
+    sqlx::query(
+        "INSERT INTO StorageDaily (device_id, day, rsoc_min, rsoc_max, rsoc_avg, samples)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(device_id, day) DO UPDATE SET
+             rsoc_min = excluded.rsoc_min,
+             rsoc_max = excluded.rsoc_max,
+             rsoc_avg = excluded.rsoc_avg,
+             samples  = excluded.samples",
+    )
+    .bind(device_id)
+    .bind(&day_str)
+    .bind(lo)
+    .bind(hi)
+    .bind(mean)
+    .bind(samples)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Aggregates one local day of one device's 2s rows into `EnergyDaily`.
 ///
 /// Scoped to a single device because that is what the existing
@@ -362,47 +569,32 @@ pub async fn rollup_energy_day(
     Ok(())
 }
 
-/// Brings `EnergyDaily` up to date, returning how many device-days it wrote.
+/// The rollup tiers, in the order they must run for a given day: each reads what
+/// the one before it wrote, or the 2s series in the case of the first two.
+const TIERS: [&str; 3] = ["minute", "storage", "daily"];
+
+/// Brings every rollup tier up to date, returning how many local days it worked.
 ///
-/// Rolls every local day from the oldest `Energy` row to today that has no rows
-/// yet, plus the `DAYS_ALWAYS_REROLLED` most recent days regardless. `throttle`
-/// is awaited between days: the first run after this feature ships has ~47 days
-/// of history to work through against a live multi-gigabyte database, and
-/// spreading that out keeps it from evicting the page cache the running poll
-/// loops depend on. Steady state is two days per pass.
-pub async fn rollup_energy_daily(
+/// Advances `2s -> EnergyMinute`, `EnergyStorage -> StorageDaily` and
+/// `2s -> EnergyDaily` together, so the tiers never drift apart: a coarser tier
+/// must always cover at least as much history as the finer one, or pruning the 2s
+/// series would drop data that never made it upwards.
+///
+/// Progress is tracked per tier in `RollupProgress`, so a newly added tier
+/// backfills across history the others already cover, while they are skipped.
+/// The `DAYS_ALWAYS_REROLLED` most recent days are always redone regardless.
+///
+/// `throttle` is awaited between days: the first run after a tier is added has the
+/// whole history to work through against a live multi-gigabyte database, and
+/// spreading it out keeps it from starving the poll loops of I/O.
+pub async fn rollup_history(
     pool: &SqlitePool,
     throttle: std::time::Duration,
 ) -> anyhow::Result<usize> {
-    let Some(oldest): Option<Option<String>> =
-        sqlx::query_scalar("SELECT MIN(timestamp) FROM Energy")
-            .fetch_optional(pool)
-            .await?
-    else {
+    let Some(first_day) = oldest_energy_sample_day(pool).await? else {
         return Ok(0);
     };
-    let Some(oldest) = oldest else { return Ok(0) };
-    let Some(first_day) =
-        chrono::NaiveDateTime::parse_from_str(&oldest, crate::devices::DB_TIMESTAMP_FMT)
-            .ok()
-            .map(|ndt| {
-                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc)
-                    .with_timezone(&chrono::Local)
-                    .date_naive()
-            })
-    else {
-        return Ok(0);
-    };
-
     let today = chrono::Local::now().date_naive();
-
-    // Days that already have at least one row, so they can be skipped.
-    let done: std::collections::HashSet<String> =
-        sqlx::query_scalar("SELECT DISTINCT day FROM EnergyDaily")
-            .fetch_all(pool)
-            .await?
-            .into_iter()
-            .collect();
 
     let mut days: Vec<chrono::NaiveDate> = Vec::new();
     let mut d = first_day;
@@ -412,32 +604,105 @@ pub async fn rollup_energy_daily(
         d = next;
     }
     let always_from = days.len().saturating_sub(DAYS_ALWAYS_REROLLED);
-    let todo: Vec<chrono::NaiveDate> = days
-        .iter()
-        .enumerate()
-        .filter(|(i, day)| *i >= always_from || !done.contains(&day.format("%Y-%m-%d").to_string()))
-        .map(|(_, day)| *day)
-        .collect();
 
-    if todo.is_empty() {
+    // For each day, which tiers still need to run on it.
+    let mut plan: Vec<(chrono::NaiveDate, Vec<&'static str>)> = Vec::new();
+    for tier in TIERS {
+        let done = distinct_days(
+            pool,
+            "SELECT day FROM RollupProgress WHERE tier = ?",
+            Some(tier),
+        )
+        .await?;
+        for (i, day) in days.iter().enumerate() {
+            let outstanding =
+                i >= always_from || !done.contains(&day.format("%Y-%m-%d").to_string());
+            if !outstanding {
+                continue;
+            }
+            match plan.iter_mut().find(|(d, _)| d == day) {
+                Some((_, tiers)) => tiers.push(tier),
+                None => plan.push((*day, vec![tier])),
+            }
+        }
+    }
+    if plan.is_empty() {
         return Ok(0);
     }
+    plan.sort_by_key(|(day, _)| *day);
 
     let device_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM Devices")
         .fetch_all(pool)
         .await?;
+    let cutoff = current_minute_start();
 
-    let mut written = 0usize;
-    for day in todo {
+    let mut worked = 0usize;
+    for (day, tiers) in plan {
         for &device_id in &device_ids {
-            rollup_energy_day(pool, device_id, day).await?;
-            written += 1;
+            // Run in tier order so a day's minute rows exist before anything
+            // that may later be derived from them.
+            for tier in TIERS.iter().filter(|t| tiers.contains(t)) {
+                match *tier {
+                    "minute" => {
+                        rollup_energy_minute(pool, device_id, day, &cutoff).await?;
+                    }
+                    "storage" => rollup_storage_day(pool, device_id, day).await?,
+                    "daily" => rollup_energy_day(pool, device_id, day).await?,
+                    _ => {}
+                }
+            }
         }
+        // Mark the day done for every tier that ran, whether or not it produced
+        // rows. Today is deliberately marked too: it is inside the
+        // always-rerolled window, so the marker never stops it being redone.
+        for tier in &tiers {
+            sqlx::query(
+                "INSERT INTO RollupProgress (tier, day) VALUES (?, ?)
+                 ON CONFLICT(tier, day) DO NOTHING",
+            )
+            .bind(tier)
+            .bind(day.format("%Y-%m-%d").to_string())
+            .execute(pool)
+            .await?;
+        }
+        worked += 1;
         if !throttle.is_zero() {
             tokio::time::sleep(throttle).await;
         }
     }
-    Ok(written)
+    Ok(worked)
+}
+
+/// Local day of the oldest 2s energy sample, or `None` when there are none.
+async fn oldest_energy_sample_day(pool: &SqlitePool) -> anyhow::Result<Option<chrono::NaiveDate>> {
+    let oldest: Option<Option<String>> = sqlx::query_scalar("SELECT MIN(timestamp) FROM Energy")
+        .fetch_optional(pool)
+        .await?;
+    let Some(Some(oldest)) = oldest else {
+        return Ok(None);
+    };
+    Ok(
+        chrono::NaiveDateTime::parse_from_str(&oldest, crate::devices::DB_TIMESTAMP_FMT)
+            .ok()
+            .map(|ndt| {
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc)
+                    .with_timezone(&chrono::Local)
+                    .date_naive()
+            }),
+    )
+}
+
+/// Runs a query returning one `YYYY-MM-DD` column and collects it into a set.
+async fn distinct_days(
+    pool: &SqlitePool,
+    query: &str,
+    bind: Option<&str>,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut q = sqlx::query_scalar::<_, Option<String>>(query);
+    if let Some(b) = bind {
+        q = q.bind(b.to_string());
+    }
+    Ok(q.fetch_all(pool).await?.into_iter().flatten().collect())
 }
 
 /// One local day's energy totals, summed over every device, in kWh.
@@ -1223,7 +1488,7 @@ mod tests {
         // empty table yields one NULL row, which must read as "nothing to do"
         // rather than failing to decode.
         let pool = init("sqlite::memory:").await.unwrap();
-        let written = rollup_energy_daily(&pool, std::time::Duration::ZERO)
+        let written = rollup_history(&pool, std::time::Duration::ZERO)
             .await
             .unwrap();
         assert_eq!(written, 0);
@@ -1241,7 +1506,7 @@ mod tests {
         let pool = init("sqlite::memory:").await.unwrap();
         let _ = device(&pool, "10.0.0.9").await;
         assert_eq!(
-            rollup_energy_daily(&pool, std::time::Duration::ZERO)
+            rollup_history(&pool, std::time::Duration::ZERO)
                 .await
                 .unwrap(),
             0
@@ -1251,6 +1516,314 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    // ── Minute and storage tiers ──────────────────────────────────────────────
+
+    /// A cutoff far in the future, so tests roll up every minute they seeded.
+    const NO_CUTOFF: &str = "2099-01-01 00:00:00";
+
+    async fn storage_sample(pool: &SqlitePool, device_id: i64, local: &str, rsoc: f64) {
+        use chrono::{Local, TimeZone};
+        let naive = chrono::NaiveDateTime::parse_from_str(local, "%Y-%m-%d %H:%M:%S").unwrap();
+        let utc = Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .unwrap()
+            .naive_utc();
+        sqlx::query(
+            "INSERT INTO EnergyStorage (device_id, timestamp, resolution, rsoc_avg)
+             VALUES (?, ?, '2s', ?)",
+        )
+        .bind(device_id)
+        .bind(utc.format(crate::devices::DB_TIMESTAMP_FMT).to_string())
+        .bind(rsoc)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn minute_rollup_preserves_energy_exactly_and_splits_by_sign() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.1.0.1").await;
+        // Three samples inside one minute, two directions.
+        sample(&pool, id, "2026-05-10 09:00:00", "grid", -3600.0).await;
+        sample(&pool, id, "2026-05-10 09:00:02", "grid", -1800.0).await;
+        sample(&pool, id, "2026-05-10 09:00:04", "grid", 7200.0).await;
+
+        rollup_energy_minute(&pool, id, day("2026-05-10"), NO_CUTOFF)
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT energy_ws, energy_ws_pos, energy_ws_neg, span_secs, peak_w
+             FROM EnergyMinute WHERE device_id = ? AND metric = 'grid'",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let net: f64 = row.get("energy_ws");
+        let pos: f64 = row.get("energy_ws_pos");
+        let neg: f64 = row.get("energy_ws_neg");
+        let span: i64 = row.get("span_secs");
+        let peak: f64 = row.get("peak_w");
+
+        // Net is the exact integral: -3600 - 1800 + 7200.
+        assert!((net - 1800.0).abs() < 1e-9, "{net}");
+        // Both directions survive. Splitting after aggregation would have given
+        // 1800 exported and nothing imported, losing 5400 Ws of import.
+        assert!((pos - 7200.0).abs() < 1e-9, "{pos}");
+        assert!((neg - 5400.0).abs() < 1e-9, "{neg}");
+        assert_eq!(span, 6, "three 2s samples cover six seconds, not sixty");
+        // Largest 2s average power in the minute: 7200 Ws over 2 s.
+        assert!((peak - 3600.0).abs() < 1e-9, "{peak}");
+    }
+
+    #[tokio::test]
+    async fn minute_rollup_buckets_by_minute() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.1.0.2").await;
+        sample(&pool, id, "2026-05-10 09:00:58", "consumption", 3600.0).await;
+        sample(&pool, id, "2026-05-10 09:01:00", "consumption", 7200.0).await;
+
+        rollup_energy_minute(&pool, id, day("2026-05-10"), NO_CUTOFF)
+            .await
+            .unwrap();
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM EnergyMinute")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "samples either side of :00 belong to different minutes"
+        );
+    }
+
+    #[tokio::test]
+    async fn minute_rollup_skips_the_minute_still_in_progress() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.1.0.3").await;
+        sample(&pool, id, "2026-05-10 09:00:00", "consumption", 3600.0).await;
+        sample(&pool, id, "2026-05-10 09:01:00", "consumption", 3600.0).await;
+
+        // Pretend "now" is inside 09:01, so only 09:00 is complete. Writing a
+        // partial 09:01 row would look final once the 2s rows were pruned.
+        let cutoff = {
+            use chrono::{Local, TimeZone};
+            let naive =
+                chrono::NaiveDateTime::parse_from_str("2026-05-10 09:01:00", "%Y-%m-%d %H:%M:%S")
+                    .unwrap();
+            Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .unwrap()
+                .naive_utc()
+                .format(crate::devices::DB_TIMESTAMP_FMT)
+                .to_string()
+        };
+        rollup_energy_minute(&pool, id, day("2026-05-10"), &cutoff)
+            .await
+            .unwrap();
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM EnergyMinute")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "only the completed minute is written");
+    }
+
+    #[tokio::test]
+    async fn minute_rollup_is_idempotent() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.1.0.4").await;
+        sample(&pool, id, "2026-05-10 09:00:00", "consumption", 3600.0).await;
+
+        for _ in 0..3 {
+            rollup_energy_minute(&pool, id, day("2026-05-10"), NO_CUTOFF)
+                .await
+                .unwrap();
+        }
+        let (rows, total): (i64, f64) =
+            sqlx::query_as("SELECT COUNT(*), SUM(energy_ws) FROM EnergyMinute")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+        assert!(
+            (total - 3600.0).abs() < 1e-9,
+            "replaced, not accumulated: {total}"
+        );
+    }
+
+    #[tokio::test]
+    async fn minute_tier_totals_match_the_daily_tier_exactly() {
+        // The gate for pruning the 2s series: rolling a day up by minutes and
+        // then summing those minutes must equal rolling the same day up directly.
+        // Summing an integral in two stages is lossless, and this proves it on
+        // real arithmetic rather than by assertion.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.1.0.5").await;
+        for (i, metric) in ["consumption", "production", "grid"].iter().enumerate() {
+            for m in 0..90 {
+                let ws = match *metric {
+                    "grid" if m % 3 == 0 => -1234.5 - m as f64,
+                    "grid" => 987.6 + m as f64,
+                    _ => 1000.0 + (m as f64) * (i as f64 + 1.0),
+                };
+                sample(
+                    &pool,
+                    id,
+                    &format!(
+                        "2026-05-10 {:02}:{:02}:{:02}",
+                        8 + m / 60,
+                        m % 60,
+                        (m * 7) % 60
+                    ),
+                    metric,
+                    ws,
+                )
+                .await;
+            }
+        }
+
+        rollup_energy_minute(&pool, id, day("2026-05-10"), NO_CUTOFF)
+            .await
+            .unwrap();
+        rollup_energy_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+
+        // From the daily tier.
+        let daily = query_daily_energy(&pool, day("2026-05-10"), day("2026-05-10"))
+            .await
+            .unwrap();
+        let d = &daily[0];
+
+        // The same figures rebuilt from the minute tier.
+        let row = sqlx::query(
+            "SELECT
+                 SUM(CASE WHEN metric='consumption' THEN energy_ws     ELSE 0 END)/3600.0/1000.0 AS c,
+                 SUM(CASE WHEN metric='production'  THEN energy_ws     ELSE 0 END)/3600.0/1000.0 AS p,
+                 SUM(CASE WHEN metric='grid'        THEN energy_ws_neg ELSE 0 END)/3600.0/1000.0 AS imp,
+                 SUM(CASE WHEN metric='grid'        THEN energy_ws_pos ELSE 0 END)/3600.0/1000.0 AS exp
+             FROM EnergyMinute WHERE device_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (c, p, imp, exp): (f64, f64, f64, f64) =
+            (row.get("c"), row.get("p"), row.get("imp"), row.get("exp"));
+
+        assert!(
+            (c - d.consumption_kwh).abs() < 1e-9,
+            "consumption {c} vs {:?}",
+            d
+        );
+        assert!(
+            (p - d.production_kwh).abs() < 1e-9,
+            "production {p} vs {:?}",
+            d
+        );
+        assert!(
+            (imp - d.grid_import_kwh).abs() < 1e-9,
+            "import {imp} vs {:?}",
+            d
+        );
+        assert!(
+            (exp - d.grid_export_kwh).abs() < 1e-9,
+            "export {exp} vs {:?}",
+            d
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_rollup_summarises_state_of_charge() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.1.0.6").await;
+        storage_sample(&pool, id, "2026-05-10 06:00:00", 20.0).await;
+        storage_sample(&pool, id, "2026-05-10 12:00:00", 90.0).await;
+        storage_sample(&pool, id, "2026-05-10 20:00:00", 40.0).await;
+        // A different day must not bleed in.
+        storage_sample(&pool, id, "2026-05-11 06:00:00", 5.0).await;
+
+        rollup_storage_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT rsoc_min, rsoc_max, rsoc_avg, samples FROM StorageDaily WHERE day = '2026-05-10'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let lo: f64 = row.get("rsoc_min");
+        let hi: f64 = row.get("rsoc_max");
+        let mean: f64 = row.get("rsoc_avg");
+        let n: i64 = row.get("samples");
+        assert_eq!((lo, hi, n), (20.0, 90.0, 3));
+        assert!((mean - 50.0).abs() < 1e-9, "{mean}");
+    }
+
+    #[tokio::test]
+    async fn storage_rollup_writes_nothing_when_there_are_no_samples() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.1.0.7").await;
+        rollup_storage_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM StorageDaily")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn rollup_history_backfills_a_new_tier_across_days_the_old_one_already_covered() {
+        // The migration case: EnergyDaily rows exist from before EnergyMinute
+        // did. Those days must still be worked, or their minute rows would never
+        // exist and pruning the 2s series would lose them permanently.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.1.0.8").await;
+        let today = chrono::Local::now().date_naive();
+        for back in 2..6 {
+            let d = today - chrono::Duration::days(back);
+            sample(
+                &pool,
+                id,
+                &format!("{} 09:00:00", d.format("%Y-%m-%d")),
+                "consumption",
+                3600.0,
+            )
+            .await;
+            // Pretend the daily tier already covered this day.
+            rollup_energy_day(&pool, id, d).await.unwrap();
+        }
+        let minutes_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM EnergyMinute")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(minutes_before, 0);
+
+        rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let minutes_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM EnergyMinute")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(minutes_after, 4, "every day with data gets minute rows");
+
+        // And a second pass settles to just the re-rolled tail.
+        let second = rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(second, DAYS_ALWAYS_REROLLED);
     }
 
     #[tokio::test]
@@ -1430,7 +2003,7 @@ mod tests {
             .await;
         }
 
-        let first = rollup_energy_daily(&pool, std::time::Duration::ZERO)
+        let first = rollup_history(&pool, std::time::Duration::ZERO)
             .await
             .unwrap();
         assert!(
@@ -1439,7 +2012,7 @@ mod tests {
         );
 
         // Second pass has nothing new, so it only re-rolls the most recent days.
-        let second = rollup_energy_daily(&pool, std::time::Duration::ZERO)
+        let second = rollup_history(&pool, std::time::Duration::ZERO)
             .await
             .unwrap();
         assert_eq!(second, DAYS_ALWAYS_REROLLED);
