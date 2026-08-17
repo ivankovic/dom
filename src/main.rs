@@ -29,7 +29,7 @@ use surge_ping::{Client, Config};
 use tokio::sync::Notify;
 
 use dom::app::{SharedState, SwitchAutoMode};
-use dom::{app, db, devices, fingerprint, tui};
+use dom::{app, db, devices, fingerprint, stats, tui};
 
 /// How long after startup the ICMP ping scan's one-time early follow-up runs,
 /// to catch devices that weren't up yet at the very first (t=0) scan.
@@ -48,6 +48,14 @@ const DISCOVERY_INTERVAL_SECS: u64 = 5 * 60;
 /// Cap on the in-memory (and bootstrap-loaded) network status event list
 /// shown in the Network view.
 const NETWORK_STATUS_HISTORY_LEN: i64 = 200;
+/// How often the daily energy rollup is brought up to date. The current day's
+/// totals only move as the day accrues, so this need not be frequent; the
+/// statistics view also reloads immediately whenever the user changes period.
+const ROLLUP_INTERVAL_SECS: u64 = 15 * 60;
+/// Pause between days while rolling up. The first run has the whole history to
+/// work through against a database that the poll loops are reading at the same
+/// time; spreading the work out keeps it from starving them of I/O.
+const ROLLUP_THROTTLE: Duration = Duration::from_millis(200);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -121,10 +129,37 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Background: keeps the daily energy rollup and the statistics view current.
+    tokio::spawn(statistics_task(state.clone(), pool.clone()));
+
     // Background: fires scheduled switch timers every 30s.
     tokio::spawn(timer_job(state.clone()));
 
     tui::run(state, pool, rescan_notify).await
+}
+
+// ── Long-term statistics ──────────────────────────────────────────────────────
+
+/// Keeps `EnergyDaily` up to date and reloads the statistics view from it.
+///
+/// The statistics view reads only the daily rollup, never the 2s `Energy` rows —
+/// at 2s resolution even a single month is millions of rows. This task is what
+/// makes that rollup exist.
+///
+/// Refreshes the view before rolling up as well as after, so an existing rollup
+/// is on screen immediately rather than after the first pass completes: the very
+/// first run has the entire recorded history to aggregate.
+async fn statistics_task(state: SharedState, pool: SqlitePool) {
+    stats::refresh(&pool, &state).await;
+    loop {
+        match db::rollup_energy_daily(&pool, ROLLUP_THROTTLE).await {
+            Ok(0) => {}
+            Ok(n) => log::info!("rolled up {n} device-days of energy"),
+            Err(e) => log::warn!("energy rollup failed: {e:#}"),
+        }
+        stats::refresh(&pool, &state).await;
+        tokio::time::sleep(Duration::from_secs(ROLLUP_INTERVAL_SECS)).await;
+    }
 }
 
 // ── Ping scan ─────────────────────────────────────────────────────────────────

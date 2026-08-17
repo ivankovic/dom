@@ -37,6 +37,9 @@ pub enum View {
     Energy,
     Network,
     Devices,
+    /// Long-term energy statistics, read from the daily rollup rather than the
+    /// 2s series — see `crate::stats`.
+    Statistics,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -359,6 +362,9 @@ pub struct App {
     pub network_status_events: Vec<NetworkStatusEvent>,
     /// 2-minute-resolution chart of the modem's Internet-facing (lte1) traffic.
     pub internet_traffic_chart: InternetTrafficChartData,
+    /// Long-term statistics: the selected window and period, and the buckets
+    /// loaded for it. Populated by `stats::refresh`, not computed during render.
+    pub stats: crate::stats::Stats,
     /// Which colour palette to draw with. Auto-detected from the terminal at
     /// startup unless the user has stored an explicit choice, and toggled with
     /// 't' — see `tui::theme`. Stored as the mode rather than a built `Theme`

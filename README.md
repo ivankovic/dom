@@ -24,12 +24,13 @@ information available to make the correct choice, and the dark theme is used.
 
 ## Views
 
-There are four views:
+There are five views:
 
 - **Current** ('c'): the overview — energy gauges plus the state of your network infrastructure.
 - **Energy** ('e'): consumption, production, grid and battery in detail.
 - **Network** ('n'): routers, modems and access points, their health, and Internet traffic.
 - **Devices** ('d'): every device discovered on the network, configured or not, with a detail panel.
+- **Statistics** ('w'/'m'/'y'): long-term energy totals and self-sufficiency, by week, month or year.
 
 Security, Environment and Household are intended categories that are not implemented yet — no
 sensors of those kinds are supported, and there are no views for them.
@@ -45,6 +46,10 @@ sensors of those kinds are supported, and there are no views for them.
 | e | Energy view |
 | n | Network view |
 | d | Devices view |
+| w | Statistics, weekly |
+| m | Statistics, monthly |
+| y | Statistics, yearly |
+| Left, Right | In Statistics: previous/next period |
 | s | Rescan now (wakes the ping scan and discovery immediately) |
 | r | Rename the selected device |
 | Tab | Move between the device list and the detail panel |
@@ -97,6 +102,40 @@ disabled and time-based, and adding or deleting scheduled timers. For a KEBA wal
 switching the charging mode between disabled and full power — the new mode is only shown as fact once
 the wallbox confirms it.
 
+## Statistics view
+
+Long-term energy, aggregated by calendar period. 'w', 'm' and 'y' each open the view directly on the
+weekly, monthly or yearly window; pressing the same key again returns to the current period after
+you have browsed. Left and Right step back and forward one period, stopping at the oldest recorded
+day and at today.
+
+The top shows period totals — consumption, production, grid import, grid export — and two ratios:
+
+- **Self-sufficiency**: the share of what you consumed that did not come from the grid.
+- **Self-consumption**: the share of what you produced that you used rather than exported.
+
+Both read as a dash rather than 0% when there is nothing to divide by, so a period with no data is
+never mistaken for a period where you bought everything from the grid.
+
+Below is one bar per day (per month, in the yearly window). Each bar's length is that period's
+consumption relative to the largest in view, split into the part covered by your own production and
+the part imported, so the self-sufficiency of each day is visible without reading the numbers. A day
+with no recorded data is marked as such rather than drawn as a zero.
+
+The current period is partial: this week means Monday to today, not Monday to Sunday.
+
+### Where the numbers come from
+
+The statistics view reads a daily rollup table, not the 2s measurement series. The series is far too
+large to aggregate on demand — a single month of it is millions of rows — so a background task
+totals each local day into `EnergyDaily` once, and the view reads that. The first run after this
+feature was added has the whole recorded history to work through, and does so gradually so as not to
+compete with the device poll loops for disk.
+
+Grid import and export are split when the day is rolled up, not afterwards: the underlying series is
+signed, and a daily sum of it would collapse the two into a net figure that could not be separated
+again.
+
 ## Supported devices
 
 - Sonnen Eco 8 battery
@@ -120,7 +159,11 @@ Device discovery, polling and storage all run as background tasks alongside the 
 leaving the app running is what collects data. There is no separate headless mode.
 
 State lives in `db.sqlite` in the working directory: discovered devices and their credentials,
-measurement history, and application settings such as the chosen theme (in the `Config` table).
+measurement history, per-day energy rollups, and application settings such as the chosen theme (in
+the `Config` table).
+
+Note that the measurement series is never pruned, so the database grows steadily — roughly a
+gigabyte per month of continuous recording with a battery and a few switches.
 
 ## Platform Support
 
@@ -311,6 +354,7 @@ Rust's project structure is followed.
         |                    types it holds. This is the model.
         |- db.rs          <- Schema, migrations and every query
         |- fingerprint.rs <- Port scan + HTTP probing used to identify a device
+        |- stats.rs       <- Long-term statistics: period arithmetic and bucketing
         |- devices/       <- Talking to devices
             |- mod.rs             <- Network scanning, and the behaviour every
             |                        device module shares

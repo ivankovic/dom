@@ -155,6 +155,91 @@ It passes no fingerprint. The local machine is re-derived from this host's own i
 discovery cycle, so it has no identity to preserve across an address change — and our own
 address never appears in our own ARP cache, which is where fingerprints come from.
 
+## Long-term statistics: daily energy rollup (2026-08-17)
+
+### Problem
+
+The weekly/monthly/yearly statistics view cannot be served from the `Energy` table. That table holds
+one row per metric per 2 seconds and nothing prunes it: 47 days of recording is 12.7 million rows and
+1.7 GB, and a bare `COUNT(*)` over it measured at 16 seconds. A month is millions of rows and a year
+would be a hundred million — far past what a view can aggregate while someone waits.
+
+### Decision: pre-aggregate by local day
+
+A `EnergyDaily` table holds one row per (device, local day, metric). Every window the view offers is
+then cheap: a week is 7 rows per metric, a month about 30, and a year is 12 monthly buckets folded
+from ~365 daily rows.
+
+Daily is the right granularity because it is the coarsest bucket all three windows can be built from.
+Storing 10-minute or hourly rollups instead — the `resolution` column in `Energy` anticipates them,
+though nothing has ever written one — would mean 50,000+ rows per metric per year for no benefit at
+these window sizes.
+
+The rollup keeps `device_id` even though the statistics view sums over devices. That keeps the table a
+faithful aggregation of its source, and leaves a per-device breakdown available without a migration.
+
+### Import and export are split at rollup time
+
+`Energy`'s `grid` series is signed: negative is drawn from the grid, positive is fed back. A daily sum
+of the signed values gives only the net, which cannot be separated afterwards. So the rollup writes
+`grid_import` and `grid_export` as distinct derived metrics, using the same sign split that
+`query_today_energy` already used for its daily figures. `EnergyDaily.metric` is therefore *not* a
+copy of `Energy.metric`.
+
+The per-device `power` metric is excluded from the house totals, as it already is in
+`query_today_energy`: a switch's or wallbox's own draw is part of the battery's whole-house
+`consumption` figure, so adding it would double-count.
+
+### Local days, expressed as UTC ranges
+
+`Energy.timestamp` is naive UTC, so a local calendar day has to become a UTC half-open range before it
+can be compared against an indexed column. `date(timestamp, 'localtime')` is correct but not
+indexable, and without the index a single day's aggregation reads every row that device ever wrote.
+
+The upper bound is the *next local midnight* rather than the start plus 24 hours, which is what makes
+a 23- or 25-hour DST day come out right. Verified against the live database: the explicit-bounds query
+and the `date(..., 'localtime')` query return byte-identical totals over the same day (41,628 rows,
+matching to five decimal places).
+
+### One device at a time
+
+The aggregation is issued per device, not once across all of them, because that is the shape
+`idx_energy_metric_res_time` can serve — its leading column is `device_id`, so with a bounded
+timestamp range the query is an index range scan. Measured at ~0.16s per device-day against 12.7M
+rows, against ~1.6s for the same range without the device prefix.
+
+### Re-rolling, and not trusting a row's existence
+
+A day that already has rows is skipped, except for the two most recent days with data, which are
+always re-rolled. Re-rolling only the current day would leave a permanent gap: with the app not
+running at the moment a day ends — closed at 23:50, opened at 00:10 — that day's final minutes would
+never be aggregated, and because rows already existed it would look complete forever. Two days closes
+that without having to persist a watermark.
+
+Rollup is idempotent (`ON CONFLICT ... DO UPDATE`), so re-rolling replaces rather than accumulates.
+
+A day with no samples writes nothing at all rather than writing zeros, so a device that was offline
+stays distinguishable from one that genuinely used nothing. The view carries that distinction through
+to the screen: a bucket with no data is labelled as such instead of drawn as a zero bar, and the
+self-sufficiency ratios read as a dash rather than 0% when there is no denominator — 0% would claim
+everything was bought from the grid.
+
+### Backfill is throttled
+
+The first run after this shipped has the entire recorded history to aggregate, against a database the
+device poll loops are reading at the same time. The rollup sleeps 200ms between days so that work
+spreads out instead of competing for disk. Steady state is two device-days per pass, every 15 minutes.
+
+### Calendar periods, not rolling windows
+
+Weeks are Monday to Sunday, months are the 1st to the last, years are January to December — so
+browsing back with Left lands on periods a person recognizes rather than arbitrary 30-day slices. The
+current period is clamped to end at today, so a partial week reports what has actually happened rather
+than implying a full one.
+
+Browsing back stops once a period would end before the oldest day that has any data, rather than
+walking indefinitely through empty periods.
+
 ## Colour theming (2026-08-17)
 
 ### Problem

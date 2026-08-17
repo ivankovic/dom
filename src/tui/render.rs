@@ -51,10 +51,225 @@ pub(super) fn render(f: &mut Frame, app: &App) {
         View::Energy => render_energy_view(f, rows[1], app),
         View::Network => render_network_view(f, rows[1], app),
         View::Devices => render_devices_view(f, rows[1], app),
+        View::Statistics => render_statistics_view(f, rows[1], app),
     }
     if app.timer_dialog.is_some() {
         render_timer_dialog(f, app);
     }
+}
+
+// ── Statistics view ───────────────────────────────────────────────────────────
+
+/// Formats a kWh figure at a fixed width so columns line up.
+fn kwh(v: f64) -> String {
+    format!("{v:>7.1}")
+}
+
+/// A percentage, or an em dash when the ratio has no denominator — see
+/// `stats::Totals::self_sufficiency_pct`. Never prints 0% for "unknown".
+fn pct(v: Option<f64>) -> String {
+    match v {
+        Some(p) => format!("{p:>5.1} %"),
+        None => "    — ".to_string(),
+    }
+}
+
+fn render_statistics_view(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let st = &app.stats;
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(8),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    // Header: which window, which period, and how to move.
+    let browsing = if st.offset == 0 {
+        Span::from("  (current)").style(Style::default().fg(theme.inactive))
+    } else {
+        Span::from(format!("  ({} back)", st.offset)).style(Style::default().fg(theme.input_active))
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::from(format!(" {} · ", st.window.label()))
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            Span::from(st.title.clone()).style(Style::default().fg(theme.focus_border)),
+            browsing,
+            Span::from("   w/m/y window · ←/→ period").style(Style::default().fg(theme.inactive)),
+        ])),
+        rows[0],
+    );
+
+    render_stats_totals(f, rows[1], app, &theme);
+    render_stats_buckets(f, rows[2], app, &theme);
+}
+
+fn render_stats_totals(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let t = &app.stats.totals;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let totals = vec![
+        Line::from(vec![
+            Span::from("  Consumption   "),
+            Span::from(kwh(t.consumption_kwh)).style(Style::default().fg(theme.consumption)),
+            Span::from(" kWh"),
+        ]),
+        Line::from(vec![
+            Span::from("  Production    "),
+            Span::from(kwh(t.production_kwh)).style(Style::default().fg(theme.production)),
+            Span::from(" kWh"),
+        ]),
+        Line::from(vec![
+            Span::from("  Grid import   "),
+            Span::from(kwh(t.grid_import_kwh)).style(Style::default().fg(theme.grid_import)),
+            Span::from(" kWh"),
+        ]),
+        Line::from(vec![
+            Span::from("  Grid export   "),
+            Span::from(kwh(t.grid_export_kwh)).style(Style::default().fg(theme.grid_export)),
+            Span::from(" kWh"),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(totals).block(Block::default().borders(Borders::ALL).title(" Totals ")),
+        cols[0],
+    );
+
+    // Self-sufficiency: how much of what was used did not have to be bought.
+    // Self-consumption: how much of what was made was used rather than sold.
+    let ss = t.self_sufficiency_pct();
+    let sc = t.self_consumption_pct();
+    let own = t.self_consumed_kwh();
+    let ratios = vec![
+        Line::from(vec![
+            Span::from("  Self-sufficiency  "),
+            Span::from(pct(ss)).style(
+                Style::default()
+                    .fg(theme.production)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(
+            Span::from(format!(
+                "    {:.1} of {:.1} kWh used was own",
+                own, t.consumption_kwh
+            ))
+            .style(Style::default().fg(theme.inactive)),
+        ),
+        Line::from(vec![
+            Span::from("  Self-consumption  "),
+            Span::from(pct(sc)).style(
+                Style::default()
+                    .fg(theme.battery_charge)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(
+            Span::from(format!(
+                "    {:.1} of {:.1} kWh made was kept",
+                own, t.production_kwh
+            ))
+            .style(Style::default().fg(theme.inactive)),
+        ),
+    ];
+    f.render_widget(
+        Paragraph::new(ratios).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Self-sufficiency "),
+        ),
+        cols[1],
+    );
+}
+
+/// One row per bucket: a bar scaled against the period's largest consumption,
+/// split into the part covered by own production and the part bought from the
+/// grid, so the self-sufficiency of each day is visible at a glance.
+fn render_stats_buckets(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let st = &app.stats;
+    let title = match st.window {
+        crate::stats::StatsWindow::Year => " By month ",
+        _ => " By day ",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    if st.buckets.is_empty() || !st.buckets.iter().any(|b| b.has_data) {
+        f.render_widget(
+            Paragraph::new(Line::from(
+                Span::from("  No energy data recorded for this period.")
+                    .style(Style::default().fg(theme.inactive)),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    let max = st
+        .buckets
+        .iter()
+        .map(|b| b.totals.consumption_kwh.max(b.totals.production_kwh))
+        .fold(0.0f64, f64::max);
+    // Bar width: the inner area minus the label and numeric columns.
+    let bar_w = (area.width as usize).saturating_sub(46).max(8);
+
+    let lines: Vec<Line> = st
+        .buckets
+        .iter()
+        .map(|b| {
+            if !b.has_data {
+                return Line::from(vec![
+                    Span::from(format!("  {:<4}", b.label)),
+                    Span::from("no data").style(Style::default().fg(theme.inactive)),
+                ]);
+            }
+            let cells = if max > 0.0 {
+                ((b.totals.consumption_kwh / max) * bar_w as f64).round() as usize
+            } else {
+                0
+            };
+            let cells = cells.min(bar_w);
+            // Split the consumption bar: what came from own generation, and
+            // what was imported.
+            let own_cells = if b.totals.consumption_kwh > 0.0 {
+                ((b.totals.self_consumed_kwh() / b.totals.consumption_kwh) * cells as f64).round()
+                    as usize
+            } else {
+                0
+            };
+            let own_cells = own_cells.min(cells);
+
+            Line::from(vec![
+                Span::from(format!("  {:<4}", b.label)),
+                Span::styled(
+                    "\u{2588}".repeat(own_cells),
+                    Style::default().fg(theme.production),
+                ),
+                Span::styled(
+                    "\u{2588}".repeat(cells - own_cells),
+                    Style::default().fg(theme.grid_import),
+                ),
+                Span::styled(
+                    "\u{2591}".repeat(bar_w - cells),
+                    Style::default().fg(theme.gauge_track),
+                ),
+                Span::from(format!("{} kWh", kwh(b.totals.consumption_kwh))),
+                Span::from(format!("  prod{}", kwh(b.totals.production_kwh)))
+                    .style(Style::default().fg(theme.production)),
+                Span::from(format!("  {}", pct(b.totals.self_sufficiency_pct())))
+                    .style(Style::default().fg(theme.inactive)),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_current_view(f: &mut Frame, area: Rect, app: &App) {
@@ -374,13 +589,15 @@ fn gauge_row_ratio(f: &mut Frame, area: Rect, theme: &Theme, g: Gauge, ratio: f6
 
 fn render_statusbar(f: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
-    let nav = "[c] current  [e] energy  [n] network  [d] devices  [s] rescan";
+    let nav = "[c] current  [e] energy  [n] network  [d] devices  [w/m/y] stats  [s] rescan";
     let focus_hints = if app.timer_dialog.is_some() {
         "[Tab] switch field  [Enter] save  [Esc] cancel  [Ctrl+C] quit".to_string()
     } else if app.rename_input.is_some() {
         "[Enter] save name  [Esc] cancel  [Ctrl+C] quit".to_string()
     } else if app.view == View::Energy {
         "[↑↓] select device  [Enter] toggle switch  [q] quit".to_string()
+    } else if app.view == View::Statistics {
+        "[←→] period  [w] weekly  [m] monthly  [y] yearly  [t] theme  [q] quit".to_string()
     } else if app.view == View::Network || app.view == View::Current {
         "[q] quit".to_string()
     } else if app.focus == Focus::Detail {
@@ -1335,6 +1552,136 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::net::{IpAddr, Ipv4Addr};
+
+    use crate::stats::{Bucket, Stats, StatsWindow, Totals};
+
+    fn draw(app: &App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn bucket(label: &str, consumption: f64, production: f64, import: f64) -> Bucket {
+        Bucket {
+            label: label.to_string(),
+            totals: Totals {
+                consumption_kwh: consumption,
+                production_kwh: production,
+                grid_import_kwh: import,
+                grid_export_kwh: 0.0,
+            },
+            has_data: true,
+        }
+    }
+
+    fn stats_app(buckets: Vec<Bucket>, window: StatsWindow) -> App {
+        let totals = crate::stats::total(&buckets);
+        App {
+            view: View::Statistics,
+            stats: Stats {
+                window,
+                offset: 0,
+                title: "August 2026".to_string(),
+                buckets,
+                totals,
+                oldest_day: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn statistics_view_shows_totals_and_self_sufficiency() {
+        let app = stats_app(
+            vec![bucket("1", 10.0, 8.0, 4.0), bucket("2", 20.0, 10.0, 6.0)],
+            StatsWindow::Month,
+        );
+        let out = draw(&app, 120, 24);
+
+        assert!(out.contains("Monthly"), "{out}");
+        assert!(out.contains("August 2026"), "{out}");
+        // 30 kWh consumed, 18 produced, 10 imported -> 20/30 = 66.7% self-sufficient.
+        assert!(out.contains("30.0"), "consumption total missing:\n{out}");
+        assert!(out.contains("18.0"), "production total missing:\n{out}");
+        assert!(out.contains("66.7"), "self-sufficiency missing:\n{out}");
+        // 20 of 18 made was kept -> clamped to 100%.
+        assert!(out.contains("Self-consumption"), "{out}");
+    }
+
+    #[test]
+    fn statistics_view_marks_days_without_data_rather_than_drawing_zero_bars() {
+        let mut buckets = vec![bucket("1", 10.0, 8.0, 4.0)];
+        buckets.push(Bucket {
+            label: "2".to_string(),
+            totals: Totals::default(),
+            has_data: false,
+        });
+        let app = stats_app(buckets, StatsWindow::Month);
+        let out = draw(&app, 120, 24);
+        assert!(out.contains("no data"), "gap should be labelled:\n{out}");
+    }
+
+    #[test]
+    fn statistics_view_says_so_when_a_period_is_entirely_empty() {
+        let app = stats_app(
+            vec![Bucket {
+                label: "1".to_string(),
+                totals: Totals::default(),
+                has_data: false,
+            }],
+            StatsWindow::Week,
+        );
+        let out = draw(&app, 120, 24);
+        assert!(
+            out.contains("No energy data recorded"),
+            "empty period needs an explanation:\n{out}"
+        );
+        // With nothing to divide by, the ratios must read as unknown, never 0%.
+        assert!(!out.contains("0.0 %"), "must not claim 0%:\n{out}");
+    }
+
+    #[test]
+    fn statistics_view_shows_month_labels_for_the_yearly_window() {
+        let app = stats_app(
+            vec![
+                bucket("Jan", 100.0, 20.0, 80.0),
+                bucket("Feb", 90.0, 40.0, 50.0),
+            ],
+            StatsWindow::Year,
+        );
+        let out = draw(&app, 120, 24);
+        assert!(out.contains("Yearly"), "{out}");
+        assert!(out.contains("By month"), "{out}");
+        assert!(out.contains("Jan"), "{out}");
+        assert!(out.contains("Feb"), "{out}");
+    }
+
+    #[test]
+    fn statistics_view_marks_that_it_is_showing_a_past_period() {
+        let mut app = stats_app(vec![bucket("1", 10.0, 8.0, 4.0)], StatsWindow::Month);
+        app.stats.offset = 3;
+        let out = draw(&app, 120, 24);
+        assert!(
+            out.contains("3 back"),
+            "browsing state should be visible:\n{out}"
+        );
+    }
+
+    #[test]
+    fn statusbar_advertises_the_statistics_keys() {
+        let app = stats_app(vec![bucket("1", 1.0, 1.0, 0.0)], StatsWindow::Week);
+        let out = draw(&app, 160, 10);
+        assert!(out.contains("stats"), "{out}");
+        assert!(out.contains("period"), "{out}");
+    }
 
     /// Regression test: the Device Power / Device Energy panel heights must
     /// account for KEBA devices, not just batteries and switches, or a KEBA

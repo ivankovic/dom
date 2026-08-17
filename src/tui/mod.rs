@@ -359,6 +359,9 @@ async fn event_loop(
                     // be written to the DB after the write guard is dropped —
                     // never hold the lock across an await.
                     let mut theme_chosen: Option<theme::ThemeMode> = None;
+                    // Set when the selected statistics window or period changes,
+                    // so the new range is queried after the guard is released.
+                    let mut stats_reload = false;
 
                     // Synchronous write-lock branch. Scoped so the guard is
                     // provably released before the await below.
@@ -463,6 +466,36 @@ async fn event_loop(
                             // Switches between the dark and light palettes. Recorded
                             // as an explicit choice, which from now on overrides
                             // terminal auto-detection on every startup.
+                            // Each of w/m/y opens the statistics view directly on
+                            // that window; pressing the same one again returns to
+                            // the current period after browsing.
+                            Event::Key(KeyEvent { code: KeyCode::Char('w' | 'W'), .. }) => {
+                                app.view = View::Statistics;
+                                app.stats.set_window(crate::stats::StatsWindow::Week);
+                                stats_reload = true;
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Char('m' | 'M'), .. }) => {
+                                app.view = View::Statistics;
+                                app.stats.set_window(crate::stats::StatsWindow::Month);
+                                stats_reload = true;
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Char('y' | 'Y'), .. }) => {
+                                app.view = View::Statistics;
+                                app.stats.set_window(crate::stats::StatsWindow::Year);
+                                stats_reload = true;
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Left, .. })
+                                if app.view == View::Statistics =>
+                            {
+                                app.stats.back(chrono::Local::now().date_naive());
+                                stats_reload = true;
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Right, .. })
+                                if app.view == View::Statistics =>
+                            {
+                                app.stats.forward();
+                                stats_reload = true;
+                            }
                             Event::Key(KeyEvent { code: KeyCode::Char('t' | 'T'), .. }) => {
                                 app.theme_mode = app.theme_mode.toggled();
                                 theme_chosen = Some(app.theme_mode);
@@ -542,6 +575,10 @@ async fn event_loop(
                             _ => {}
                         }
                     }
+                    }
+
+                    if stats_reload {
+                        crate::stats::refresh(pool, state).await;
                     }
 
                     if let Some(mode) = theme_chosen {
