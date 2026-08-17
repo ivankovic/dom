@@ -1,0 +1,58 @@
+[package]
+name = "dom"
+version = "0.1.0"
+edition = "2024"
+# Prosperity Public License 3.0.0 has no SPDX identifier, so point at the file
+# rather than the `license` field, which only accepts valid SPDX expressions.
+license-file = "LICENSE"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync", "net", "io-util", "signal"] }
+anyhow = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+ctrlc = "3.4"
+dirs = "5.0"
+
+# SQLite database
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "chrono"] }
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde", "clock"] }
+
+# Random number generation
+rand = "0.8"
+
+# Local IP address detection
+if-addrs = "0.10"
+
+# Serialization/Deserialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# TUI
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Network device discovery
+surge-ping = "0.9.0"
+futures = "0.3.32"
+
+[dev-dependencies]
+# Temporary file creation for tests
+tempfile = "3"
+# Snapshot testing
+insta = "1.39"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
