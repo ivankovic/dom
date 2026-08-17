@@ -172,7 +172,42 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Application settings that outlive a run, e.g. the chosen colour theme.
+    // A key/value table rather than a column per setting so adding a setting
+    // needs no migration.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS Config (
+            key    TEXT PRIMARY KEY,
+            value  TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
+}
+
+/// Reads a setting, or `None` if it was never set. Callers are expected to have
+/// a default rather than treating absence as an error — a fresh database has no
+/// settings at all.
+pub async fn get_config(pool: &SqlitePool, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(sqlx::query_scalar("SELECT value FROM Config WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// Writes a setting, replacing any previous value for the same key.
+pub async fn set_config(pool: &SqlitePool, key: &str, value: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO Config (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Queries today's Energy table and returns per-minute kW averages for each metric.
@@ -828,6 +863,53 @@ mod tests {
     // These exercise the raw (non-macro) SQL in the new network-history/traffic
     // queries against a real in-memory schema, since sqlx::query isn't
     // compile-time checked the way sqlx::query! would be.
+
+    #[tokio::test]
+    async fn config_returns_none_for_a_setting_never_written() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        // A fresh DB has no settings; absence must be readable, not an error,
+        // because callers fall back to a default on None.
+        assert_eq!(get_config(&pool, "theme").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn config_round_trips_and_replaces_on_rewrite() {
+        let pool = init("sqlite::memory:").await.unwrap();
+
+        set_config(&pool, "theme", "light").await.unwrap();
+        assert_eq!(
+            get_config(&pool, "theme").await.unwrap().as_deref(),
+            Some("light")
+        );
+
+        // Writing the same key again replaces rather than failing the PK or
+        // leaving two rows — this is what toggling the theme twice does.
+        set_config(&pool, "theme", "dark").await.unwrap();
+        assert_eq!(
+            get_config(&pool, "theme").await.unwrap().as_deref(),
+            Some("dark")
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Config WHERE key = 'theme'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn config_keys_are_independent() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        set_config(&pool, "theme", "light").await.unwrap();
+        set_config(&pool, "other", "x").await.unwrap();
+        assert_eq!(
+            get_config(&pool, "theme").await.unwrap().as_deref(),
+            Some("light")
+        );
+        assert_eq!(
+            get_config(&pool, "other").await.unwrap().as_deref(),
+            Some("x")
+        );
+    }
 
     #[tokio::test]
     async fn network_status_event_round_trip_is_newest_first() {

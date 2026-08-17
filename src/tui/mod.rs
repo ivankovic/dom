@@ -32,6 +32,7 @@ use crate::app::{App, Focus, ScannedDevice, SharedState, SwitchAutoMode, TimerDi
 use crate::devices;
 
 mod render;
+pub mod theme;
 use render::render;
 
 // ── Detail-panel slot model ───────────────────────────────────────────────────
@@ -354,7 +355,14 @@ async fn event_loop(
                         }
                     }
                 } else {
-                    // Synchronous write-lock branch.
+                    // Set when the user toggles the theme, so the new choice can
+                    // be written to the DB after the write guard is dropped —
+                    // never hold the lock across an await.
+                    let mut theme_chosen: Option<theme::ThemeMode> = None;
+
+                    // Synchronous write-lock branch. Scoped so the guard is
+                    // provably released before the await below.
+                    {
                     let mut app = state.write().unwrap();
 
                     if app.timer_dialog.is_some() {
@@ -452,6 +460,13 @@ async fn event_loop(
                             Event::Key(KeyEvent { code: KeyCode::Char('s' | 'S'), .. }) => {
                                 rescan.notify_waiters();
                             }
+                            // Switches between the dark and light palettes. Recorded
+                            // as an explicit choice, which from now on overrides
+                            // terminal auto-detection on every startup.
+                            Event::Key(KeyEvent { code: KeyCode::Char('t' | 'T'), .. }) => {
+                                app.theme_mode = app.theme_mode.toggled();
+                                theme_chosen = Some(app.theme_mode);
+                            }
                             Event::Key(KeyEvent { code: KeyCode::Up, .. })
                                 if app.view == View::Energy =>
                             {
@@ -526,6 +541,12 @@ async fn event_loop(
                             }
                             _ => {}
                         }
+                    }
+                    }
+
+                    if let Some(mode) = theme_chosen {
+                        let _ =
+                            crate::db::set_config(pool, theme::CONFIG_KEY, mode.as_str()).await;
                     }
                 }
             }

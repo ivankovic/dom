@@ -71,6 +71,58 @@ pub struct Device {
     pub latency_ms: f64,
 }
 
+/// A device type discovery can recognize from a fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceType {
+    SonnenBatterie,
+    MystromSwitch,
+    Mikrotik,
+    Keba,
+}
+
+impl DeviceType {
+    /// Human-readable model name shown in the UI. The matching `Devices.type`
+    /// column value is not mirrored here — each device module already owns its
+    /// own type string, and a second copy would be one more thing to keep in
+    /// step.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            DeviceType::SonnenBatterie => sonnen_batterie::NAME,
+            DeviceType::MystromSwitch => mystrom_switch::NAME,
+            DeviceType::Mikrotik => mikrotik::NAME,
+            DeviceType::Keba => keba::NAME,
+        }
+    }
+}
+
+/// Identifies a fingerprinted device, or `None` if no detector claims it.
+///
+/// Detectors are tried in a fixed order and the **first match wins**. That
+/// matters because three of the four key off port 80 plus a substring of the
+/// HTTP response body, so an unusual device could in principle satisfy two of
+/// them. Discovery previously answered this question twice in two different
+/// shapes — independent `if`s when persisting (which saved such a device as two
+/// types and started two poll loops) and an `else if` chain when naming it for
+/// the UI — so the stored type and the displayed type could disagree. There is
+/// now one answer.
+///
+/// The local machine is deliberately absent: it is identified by comparing
+/// against this host's own interface addresses (`dom_local::is_local_ip`), which
+/// needs no fingerprint and cannot be mistaken.
+pub fn detect_type(fp: &crate::fingerprint::Fingerprint) -> Option<DeviceType> {
+    if sonnen_batterie::detect(fp) {
+        Some(DeviceType::SonnenBatterie)
+    } else if mystrom_switch::detect(fp) {
+        Some(DeviceType::MystromSwitch)
+    } else if mikrotik::detect(fp) {
+        Some(DeviceType::Mikrotik)
+    } else if keba::detect(fp) {
+        Some(DeviceType::Keba)
+    } else {
+        None
+    }
+}
+
 /// Format for every value written to a DB `timestamp` column.
 ///
 /// Shared rather than repeated per device type because `db::load_*` parses
@@ -384,6 +436,91 @@ mod tests {
     fn parse_arp_cache_handles_empty_input() {
         assert!(parse_arp_cache("").is_empty());
         assert!(parse_arp_cache("IP address HW type Flags HW address Mask Device\n").is_empty());
+    }
+
+    // ── detect_type ───────────────────────────────────────────────────────────
+
+    use crate::fingerprint::{Fingerprint, HttpProbe};
+
+    fn fp(ports: Vec<u16>, probes: Vec<(&str, &str)>) -> Fingerprint {
+        Fingerprint {
+            ip: IpAddr::V4(Ipv4Addr::new(172, 16, 20, 30)),
+            open_ports: ports,
+            http: probes
+                .into_iter()
+                .map(|(url, raw)| HttpProbe {
+                    port: 80,
+                    url: url.to_string(),
+                    raw: raw.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn detect_type_identifies_each_device_type() {
+        assert_eq!(
+            detect_type(&fp(vec![8080, 8883], vec![("/", "sonnenbatterie.de")])),
+            Some(DeviceType::SonnenBatterie)
+        );
+        assert_eq!(
+            detect_type(&fp(vec![80], vec![("/report", r#"{"relay":true}"#)])),
+            Some(DeviceType::MystromSwitch)
+        );
+        assert_eq!(
+            detect_type(&fp(vec![80], vec![("/", "<h1>MikroTik</h1>")])),
+            Some(DeviceType::Mikrotik)
+        );
+        assert_eq!(
+            detect_type(&fp(vec![80], vec![("/", "lwIP Wallbox")])),
+            Some(DeviceType::Keba)
+        );
+    }
+
+    #[test]
+    fn detect_type_is_none_for_an_unrecognized_device() {
+        assert_eq!(detect_type(&fp(vec![22, 443], vec![])), None);
+        assert_eq!(
+            detect_type(&fp(vec![80], vec![("/", "<h1>hello</h1>")])),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_type_returns_a_single_answer_when_detectors_overlap() {
+        // Three detectors key off port 80 plus a substring, so a contrived
+        // response can satisfy more than one. The point of detect_type is that
+        // exactly one type comes back — the earlier in precedence order —
+        // rather than the device being persisted as two types with two poll
+        // loops while the UI displayed only the first.
+        let both = fp(
+            vec![80],
+            vec![
+                ("/report", r#"{"relay":true}"#),
+                ("/", "MikroTik lwIP Wallbox"),
+            ],
+        );
+        assert!(mystrom_switch::detect(&both));
+        assert!(mikrotik::detect(&both));
+        assert!(keba::detect(&both));
+        assert_eq!(detect_type(&both), Some(DeviceType::MystromSwitch));
+    }
+
+    #[test]
+    fn device_type_display_names_are_distinct() {
+        let all = [
+            DeviceType::SonnenBatterie,
+            DeviceType::MystromSwitch,
+            DeviceType::Mikrotik,
+            DeviceType::Keba,
+        ];
+        // Two types sharing a display name would be indistinguishable in the
+        // device list.
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.display_name(), b.display_name());
+            }
+        }
     }
 
     // ── handle_poll_failure ───────────────────────────────────────────────────

@@ -54,6 +54,16 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::init("sqlite://db.sqlite").await?;
     let state = app::new_shared();
 
+    // Colour theme: an explicit choice the user made with 't' in a previous run
+    // wins outright. Failing that, guess from the terminal, which frequently
+    // tells us nothing (tmux, most modern terminals) and then falls back to the
+    // dark palette — see tui::theme::detect_mode.
+    let stored_theme = db::get_config(&pool, tui::theme::CONFIG_KEY)
+        .await
+        .ok()
+        .flatten();
+    state.write().unwrap().theme_mode = tui::theme::resolve_mode_from_env(stored_theme.as_deref());
+
     // Pre-populate device list and start poll loops for devices known from a prior run.
     bootstrap_known_devices(&state, &pool).await;
 
@@ -346,48 +356,47 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
             }
         };
 
-        // Persist newly discovered devices and start poll loops.
+        // Persist newly discovered devices and start poll loops. Each device is
+        // classified once, by `devices::detect_type`, so the type stored here is
+        // necessarily the same one shown in the UI below.
         for fp in &fps {
+            let Some(device_type) = devices::detect_type(fp) else {
+                continue;
+            };
             let fingerprint = fingerprint_for(fp.ip);
-            if devices::sonnen_batterie::detect(fp) {
-                let _ = devices::sonnen_batterie::save_device(
-                    &pool,
-                    fp.ip,
-                    devices::sonnen_batterie::NAME,
-                    fingerprint.as_deref(),
-                )
-                .await;
-                maybe_spawn_poll_loop(fp.ip, &pool, &state).await;
-            }
-            if devices::mystrom_switch::detect(fp) {
-                let _ = devices::mystrom_switch::save_device(
-                    &pool,
-                    fp.ip,
-                    devices::mystrom_switch::NAME,
-                    fingerprint.as_deref(),
-                )
-                .await;
-                maybe_spawn_switch_poll_loop(fp.ip, &pool, &state).await;
-            }
-            if devices::mikrotik::detect(fp) {
-                let _ = devices::mikrotik::save_device(
-                    &pool,
-                    fp.ip,
-                    devices::mikrotik::NAME,
-                    fingerprint.as_deref(),
-                )
-                .await;
-                maybe_spawn_mikrotik_poll_loop(fp.ip, &pool, &state).await;
-            }
-            if devices::keba::detect(fp) {
-                let _ = devices::keba::save_device(
-                    &pool,
-                    fp.ip,
-                    devices::keba::NAME,
-                    fingerprint.as_deref(),
-                )
-                .await;
-                maybe_spawn_keba_poll_loop(fp.ip, &pool, &state).await;
+            let name = device_type.display_name();
+            match device_type {
+                devices::DeviceType::SonnenBatterie => {
+                    let _ = devices::sonnen_batterie::save_device(
+                        &pool,
+                        fp.ip,
+                        name,
+                        fingerprint.as_deref(),
+                    )
+                    .await;
+                    maybe_spawn_poll_loop(fp.ip, &pool, &state).await;
+                }
+                devices::DeviceType::MystromSwitch => {
+                    let _ = devices::mystrom_switch::save_device(
+                        &pool,
+                        fp.ip,
+                        name,
+                        fingerprint.as_deref(),
+                    )
+                    .await;
+                    maybe_spawn_switch_poll_loop(fp.ip, &pool, &state).await;
+                }
+                devices::DeviceType::Mikrotik => {
+                    let _ =
+                        devices::mikrotik::save_device(&pool, fp.ip, name, fingerprint.as_deref())
+                            .await;
+                    maybe_spawn_mikrotik_poll_loop(fp.ip, &pool, &state).await;
+                }
+                devices::DeviceType::Keba => {
+                    let _ = devices::keba::save_device(&pool, fp.ip, name, fingerprint.as_deref())
+                        .await;
+                    maybe_spawn_keba_poll_loop(fp.ip, &pool, &state).await;
+                }
             }
         }
 
@@ -437,19 +446,14 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
                         ip: fp.ip,
                         latency_ms,
                         open_ports: fp.open_ports.clone(),
-                        name: if devices::sonnen_batterie::detect(fp) {
-                            Some(devices::sonnen_batterie::NAME)
-                        } else if devices::mystrom_switch::detect(fp) {
-                            Some(devices::mystrom_switch::NAME)
-                        } else if devices::mikrotik::detect(fp) {
-                            Some(devices::mikrotik::NAME)
-                        } else if devices::keba::detect(fp) {
-                            Some(devices::keba::NAME)
-                        } else if devices::dom_local::is_local_ip(fp.ip) {
-                            Some(devices::dom_local::NAME)
-                        } else {
-                            None
-                        },
+                        // Same classification used when persisting above, so the
+                        // displayed model can't disagree with the stored type.
+                        name: devices::detect_type(fp)
+                            .map(|t| t.display_name())
+                            .or_else(|| {
+                                devices::dom_local::is_local_ip(fp.ip)
+                                    .then_some(devices::dom_local::NAME)
+                            }),
                         label,
                     }
                 })
@@ -490,6 +494,18 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
                 at: Utc::now(),
                 next_at,
             };
+        }
+
+        // Re-read the switch auto-modes and timers every cycle, not just at
+        // startup. These are keyed by IP but stored against a device id, so a
+        // device that changes address loses its in-memory entry when the stale
+        // poll loop clears it (`App::forget_device`) — the rows survive the
+        // migration, and this is what puts them back under the new address
+        // rather than leaving them missing from the UI until a restart.
+        if let Ok((modes, timers)) = db::load_switch_configs(&pool).await {
+            let mut app = state.write().unwrap();
+            app.switch_auto_modes = modes;
+            app.switch_timers = timers;
         }
 
         record_network_status_transitions(&state, &pool).await;

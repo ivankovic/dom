@@ -75,7 +75,8 @@ pub async fn fingerprint(ip: IpAddr) -> Fingerprint {
 
 const MAX_REDIRECTS: usize = 5;
 
-/// Fetches `path` on `ip:port`, stores the probe, then follows up to MAX_REDIRECTS 301s.
+/// Fetches `path` on `ip:port`, stores the probe, then follows up to
+/// `MAX_REDIRECTS` redirects — see `is_redirect` for which codes count.
 async fn probe_http(ip: IpAddr, port: u16, initial_path: &str, probes: &mut Vec<HttpProbe>) {
     let mut cur_ip = ip;
     let mut cur_port = port;
@@ -86,7 +87,7 @@ async fn probe_http(ip: IpAddr, port: u16, initial_path: &str, probes: &mut Vec<
             break;
         };
 
-        let location = if status_code(&raw) == Some(301) {
+        let location = if is_redirect(status_code(&raw)) {
             extract_location(&raw)
         } else {
             None
@@ -114,6 +115,20 @@ async fn probe_http(ip: IpAddr, port: u16, initial_path: &str, probes: &mut Vec<
         cur_port = next_port;
         cur_path = next_path;
     }
+}
+
+/// Whether a status code is a redirect worth following.
+///
+/// Covers all four of the redirect codes that carry a `Location`, not just 301:
+/// a device sending a device-specific login page behind a 302 (much the most
+/// common form) was previously recorded as its bare redirect response, so any
+/// identifying markup on the real page was never fetched and detection could
+/// miss the device entirely.
+///
+/// 300 (Multiple Choices) and 304 (Not Modified) are deliberately excluded —
+/// neither names a single resource to follow.
+fn is_redirect(status: Option<u16>) -> bool {
+    matches!(status, Some(301 | 302 | 307 | 308))
 }
 
 fn status_code(raw: &str) -> Option<u16> {
@@ -228,6 +243,22 @@ mod tests {
     use super::*;
 
     const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 20, 5));
+
+    #[test]
+    fn is_redirect_covers_every_location_bearing_code() {
+        for code in [301, 302, 307, 308] {
+            assert!(is_redirect(Some(code)), "{code} should be followed");
+        }
+    }
+
+    #[test]
+    fn is_redirect_rejects_codes_that_name_no_single_target() {
+        // 300 offers a choice and 304 says "unchanged"; neither is a hop.
+        for code in [200, 300, 304, 400, 404, 500] {
+            assert!(!is_redirect(Some(code)), "{code} should not be followed");
+        }
+        assert!(!is_redirect(None));
+    }
 
     #[test]
     fn status_code_reads_the_status_line() {

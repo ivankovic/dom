@@ -198,16 +198,6 @@ impl NetworkDeviceStatus {
             NetworkDeviceStatus::Unknown => "UNKNOWN",
         }
     }
-
-    pub fn color(&self) -> ratatui::style::Color {
-        match self {
-            NetworkDeviceStatus::Ok => ratatui::style::Color::Green,
-            NetworkDeviceStatus::Slow => ratatui::style::Color::Yellow,
-            NetworkDeviceStatus::Degraded => ratatui::style::Color::Magenta,
-            NetworkDeviceStatus::Lost => ratatui::style::Color::Red,
-            NetworkDeviceStatus::Unknown => ratatui::style::Color::DarkGray,
-        }
-    }
 }
 
 /// Grouping of scanned devices into the network-infrastructure roles shown in
@@ -369,9 +359,20 @@ pub struct App {
     pub network_status_events: Vec<NetworkStatusEvent>,
     /// 2-minute-resolution chart of the modem's Internet-facing (lte1) traffic.
     pub internet_traffic_chart: InternetTrafficChartData,
+    /// Which colour palette to draw with. Auto-detected from the terminal at
+    /// startup unless the user has stored an explicit choice, and toggled with
+    /// 't' — see `tui::theme`. Stored as the mode rather than a built `Theme`
+    /// so there is a single source of truth; `theme()` builds the palette.
+    pub theme_mode: crate::tui::theme::ThemeMode,
 }
 
 impl App {
+    /// The colour palette for the active mode. Cheap to call per widget — a
+    /// `Theme` is `Copy` and building one is a struct literal.
+    pub fn theme(&self) -> crate::tui::theme::Theme {
+        crate::tui::theme::Theme::for_mode(self.theme_mode)
+    }
+
     /// Drops every trace of the device at `ip` from the live in-memory state.
     ///
     /// Called by a poll loop that has discovered its device migrated to a new
@@ -379,11 +380,13 @@ impl App {
     /// already running, so the old address must disappear from the UI rather
     /// than linger as a permanently-`Lost` row.
     ///
-    /// Clears *every* per-IP readings map, not just the one belonging to the
-    /// calling device's type. An IP hosts exactly one device, so the other
-    /// removals are no-ops — and doing it uniformly means a readings map added
+    /// Clears *every* map keyed by IP, not just the readings map belonging to
+    /// the calling device's type. An IP hosts exactly one device, so removals
+    /// for other types are no-ops — and doing it uniformly means a map added
     /// later can't be forgotten in one of the callers and leave a stale row on
-    /// screen.
+    /// screen. Every `HashMap<IpAddr, _>` and `HashSet<IpAddr>` field below
+    /// should be listed here; the address is gone, so nothing keyed by it is
+    /// still meaningful.
     pub fn forget_device(&mut self, ip: &IpAddr) {
         self.conn_status.remove(ip);
         self.last_error.remove(ip);
@@ -393,6 +396,12 @@ impl App {
         self.keba_readings.remove(ip);
         self.keba_modes.remove(ip);
         self.polled_ips.remove(ip);
+        self.ping_history.remove(ip);
+        self.ping_configs.remove(ip);
+        self.device_energy_today.remove(ip);
+        self.switch_auto_modes.remove(ip);
+        self.switch_timers.remove(ip);
+        self.last_network_status.remove(ip);
     }
 
     /// Live status for a network-infrastructure device: prefers ping-history

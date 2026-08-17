@@ -23,6 +23,8 @@ use std::net::IpAddr;
 use sqlx::{Row, SqlitePool};
 
 pub const NAME: &str = "Dom";
+/// Matches the interval the previous hand-written INSERT used.
+const DEFAULT_POLL_SECS: i64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct DomLocalDevice {
@@ -59,27 +61,22 @@ pub fn detect_local_ips() -> Vec<IpAddr> {
     local_ips
 }
 
-/// Save the local machine as a device with the name "Dom"
-pub async fn save_device(pool: &SqlitePool, ip: IpAddr) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT OR IGNORE INTO Devices (type, name, ip, poll_interval_secs) VALUES (?, ?, ?, ?)",
-    )
-    .bind("dom_local")
-    .bind(NAME)
-    .bind(ip.to_string())
-    .bind(10)
-    .execute(pool)
-    .await?;
-
-    // Also update the name to "Dom" in case it already exists with a different name
-    sqlx::query("UPDATE Devices SET name = ?, type = ? WHERE ip = ?")
-        .bind(NAME)
-        .bind("dom_local")
-        .bind(ip.to_string())
-        .execute(pool)
-        .await?;
-
-    Ok(())
+/// Save the local machine as a device named "Dom".
+///
+/// Goes through `db::upsert_device` like every other device type rather than
+/// issuing its own SQL. The previous implementation followed an
+/// `INSERT OR IGNORE` with an unconditional
+/// `UPDATE Devices SET name = ?, type = ? WHERE ip = ?`, which rewrote whatever
+/// row happened to sit at that address — so if one of this host's interface
+/// addresses ever coincided with a row discovered as another device type, that
+/// row's type and name were silently overwritten to `dom_local`.
+///
+/// Passes no fingerprint: the local machine is found by reading this host's own
+/// interface addresses every discovery cycle, so it has no identity to preserve
+/// across an IP change the way a remote device does. (Our own address is also
+/// absent from our ARP cache, which is where fingerprints come from.)
+pub async fn save_device(pool: &SqlitePool, ip: IpAddr) -> anyhow::Result<()> {
+    crate::db::upsert_device(pool, "dom_local", NAME, ip, DEFAULT_POLL_SECS, None).await
 }
 
 /// Load all configured local devices
@@ -103,13 +100,6 @@ pub async fn load_all(pool: &SqlitePool) -> Result<Vec<DomLocalDevice>, sqlx::Er
 pub fn is_local_ip(ip: IpAddr) -> bool {
     let local_ips = detect_local_ips();
     local_ips.contains(&ip)
-}
-
-/// Check if the given fingerprint represents the local machine
-pub fn detect(_fp: &crate::fingerprint::Fingerprint) -> bool {
-    // The local machine detection is handled separately via IP detection
-    // rather than fingerprinting, since we know our own IPs
-    false
 }
 
 #[cfg(test)]

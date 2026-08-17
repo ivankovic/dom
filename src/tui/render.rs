@@ -34,6 +34,7 @@ use crate::app::{
     ScannedDevice, SwitchAutoMode, SwitchReading, TimerDialogField, View,
 };
 use crate::devices;
+use crate::tui::theme::Theme;
 
 use super::{DetailSlot, detail_slot, energy_active_devices, is_valid_hhmm};
 
@@ -178,6 +179,7 @@ fn compute_totals(app: &App) -> Totals {
 }
 
 fn render_energy_overview(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Energy Overview ");
@@ -197,65 +199,77 @@ fn render_energy_overview(f: &mut Frame, area: Rect, app: &App) {
     gauge_row(
         f,
         rows[0],
-        "Consumption",
+        &theme,
+        Gauge {
+            label: "Consumption",
+            color: theme.consumption,
+            value: &format!("{:>6.2} kW", t.consumption_kw),
+            dir: "",
+        },
         (t.consumption_kw.abs(), max_kw),
-        Color::Red,
-        &format!("{:>6.2} kW", t.consumption_kw),
-        "",
     );
     gauge_row(
         f,
         rows[1],
-        "Production",
+        &theme,
+        Gauge {
+            label: "Production",
+            color: theme.production,
+            value: &format!("{:>6.2} kW", t.production_kw),
+            dir: "",
+        },
         (t.production_kw.abs(), max_kw),
-        Color::Green,
-        &format!("{:>6.2} kW", t.production_kw),
-        "",
     );
 
     let (grid_color, grid_dir) = if t.grid_kw >= 0.0 {
-        (Color::Blue, "→ Exporting")
+        (theme.grid_export, "→ Exporting")
     } else {
-        (Color::Yellow, "← Importing")
+        (theme.grid_import, "← Importing")
     };
     gauge_row(
         f,
         rows[2],
-        "Grid",
+        &theme,
+        Gauge {
+            label: "Grid",
+            color: grid_color,
+            value: &format!("{:>6.2} kW", t.grid_kw.abs()),
+            dir: grid_dir,
+        },
         (t.grid_kw.abs(), max_kw),
-        grid_color,
-        &format!("{:>6.2} kW", t.grid_kw.abs()),
-        grid_dir,
     );
 
     let (bat_color, bat_dir) = if t.pac_kw >= 0.0 {
-        (Color::Yellow, "↓ Discharging")
+        (theme.battery_discharge, "↓ Discharging")
     } else {
-        (Color::Cyan, "↑ Charging")
+        (theme.battery_charge, "↑ Charging")
     };
     gauge_row(
         f,
         rows[3],
-        "Battery Power",
+        &theme,
+        Gauge {
+            label: "Battery Power",
+            color: bat_color,
+            value: &format!("{:>6.2} kW", t.pac_kw.abs()),
+            dir: bat_dir,
+        },
         (t.pac_kw.abs(), max_kw),
-        bat_color,
-        &format!("{:>6.2} kW", t.pac_kw.abs()),
-        bat_dir,
     );
 
     // Battery remaining uses kWh scale; color shifts by fill level.
     let (rem_ratio, rem_color) = if t.capacity_kwh > 0.0 {
         let ratio = (t.remaining_kwh / t.capacity_kwh).clamp(0.0, 1.0);
         let color = if ratio > 0.5 {
-            Color::Green
+            theme.level_good
         } else if ratio > 0.2 {
-            Color::Yellow
+            theme.level_warn
         } else {
-            Color::Red
+            theme.level_critical
         };
         (ratio, color)
     } else {
-        (0.0, Color::DarkGray)
+        (0.0, theme.inactive)
     };
     let rem_value = if t.capacity_kwh > 0.0 {
         format!("{:.2}/{:.2} kWh", t.remaining_kwh, t.capacity_kwh)
@@ -265,11 +279,14 @@ fn render_energy_overview(f: &mut Frame, area: Rect, app: &App) {
     gauge_row_ratio(
         f,
         rows[4],
-        "Battery Energy",
+        &theme,
+        Gauge {
+            label: "Battery Energy",
+            color: rem_color,
+            value: &rem_value,
+            dir: "",
+        },
         rem_ratio,
-        rem_color,
-        &rem_value,
-        "",
     );
 
     let ec = &app.energy_chart;
@@ -283,33 +300,40 @@ fn render_energy_overview(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render one gauge row: label | █ bar ░ | value  direction
-fn gauge_row(
-    f: &mut Frame,
-    area: Rect,
-    label: &str,
-    value_max: (f64, f64),
+/// The parts of a gauge row that describe *what* is being shown, as opposed to
+/// where it is drawn. Grouped into a struct because passing five of these
+/// positionally — three of them `&str` — made call sites hard to read and
+/// trivial to transpose.
+struct Gauge<'a> {
+    label: &'a str,
+    /// Colour of the filled part of the bar; comes from the active `Theme`.
     color: Color,
-    value_str: &str,
-    dir_str: &str,
-) {
+    /// Right-aligned reading, e.g. `"  1.23 kW"`.
+    value: &'a str,
+    /// Trailing annotation, e.g. `"→ Exporting"`. Empty for none.
+    dir: &'a str,
+}
+
+/// Draws a gauge whose fill is `value / max`. A non-positive `max` renders empty
+/// rather than dividing by zero.
+fn gauge_row(f: &mut Frame, area: Rect, theme: &Theme, g: Gauge, value_max: (f64, f64)) {
     let (value, max) = value_max;
     let ratio = if max > 0.0 {
         (value / max).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    gauge_row_ratio(f, area, label, ratio, color, value_str, dir_str);
+    gauge_row_ratio(f, area, theme, g, ratio);
 }
 
-fn gauge_row_ratio(
-    f: &mut Frame,
-    area: Rect,
-    label: &str,
-    ratio: f64,
-    color: Color,
-    value_str: &str,
-    dir_str: &str,
-) {
+/// Draws a gauge from an already-computed fill ratio, clamped 0.0..=1.0.
+fn gauge_row_ratio(f: &mut Frame, area: Rect, theme: &Theme, g: Gauge, ratio: f64) {
+    let Gauge {
+        label,
+        color,
+        value: value_str,
+        dir: dir_str,
+    } = g;
     const LABEL_W: u16 = 20;
     const DIR_W: u16 = 12;
     const VALUE_W: u16 = 20;
@@ -335,7 +359,7 @@ fn gauge_row_ratio(
     let unfilled = bar_w - filled;
     let bar_line = Line::from(vec![
         Span::styled("█".repeat(filled), Style::default().fg(color)),
-        Span::styled("░".repeat(unfilled), Style::default().fg(Color::DarkGray)),
+        Span::styled("░".repeat(unfilled), Style::default().fg(theme.gauge_track)),
     ]);
     f.render_widget(Paragraph::new(bar_line), cols[1]);
 
@@ -349,6 +373,7 @@ fn gauge_row_ratio(
 // ── Status bar ────────────────────────────────────────────────────────────────
 
 fn render_statusbar(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
     let nav = "[c] current  [e] energy  [n] network  [d] devices  [s] rescan";
     let focus_hints = if app.timer_dialog.is_some() {
         "[Tab] switch field  [Enter] save  [Esc] cancel  [Ctrl+C] quit".to_string()
@@ -386,7 +411,11 @@ fn render_statusbar(f: &mut Frame, area: Rect, app: &App) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let msg = format!("  {now}  ·  {hints}");
     f.render_widget(
-        Paragraph::new(msg).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Paragraph::new(msg).style(
+            Style::default()
+                .bg(theme.status_bar_bg)
+                .fg(theme.status_bar_fg),
+        ),
         area,
     );
 }
@@ -403,7 +432,7 @@ fn render_device_list(f: &mut Frame, area: Rect, app: &App) {
     let mut list_state = ListState::default().with_selected(selected);
 
     let list_border = if app.focus == Focus::DeviceList {
-        Style::default().fg(Color::Blue)
+        Style::default().fg(app.theme().focus_border)
     } else {
         Style::default()
     };
@@ -418,7 +447,8 @@ fn render_device_list(f: &mut Frame, area: Rect, app: &App) {
             )
             .highlight_style(
                 Style::default()
-                    .bg(Color::Blue)
+                    .bg(app.theme().selection_bg)
+                    .fg(app.theme().selection_fg)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▶"),
@@ -448,7 +478,7 @@ fn device_list_item<'a>(d: &ScannedDevice, app: &App) -> ListItem<'a> {
 
 fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     let detail_border = if app.focus == Focus::Detail {
-        Style::default().fg(Color::Blue)
+        Style::default().fg(app.theme().focus_border)
     } else {
         Style::default()
     };
@@ -479,7 +509,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 format!("{buf}│"),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(app.theme().input_active)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("]"),
@@ -544,13 +574,13 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn highlighted_line(text: String, active: bool) -> Line<'static> {
+fn highlighted_line(text: String, active: bool, theme: &Theme) -> Line<'static> {
     if active {
         Line::from(Span::styled(
             text,
             Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
+                .bg(theme.selection_bg)
+                .fg(theme.selection_fg)
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
@@ -559,6 +589,7 @@ fn highlighted_line(text: String, active: bool) -> Line<'static> {
 }
 
 fn switch_reading_lines(lines: &mut Vec<Line>, r: &SwitchReading, app: &App, ip: IpAddr) {
+    let theme = app.theme();
     let focused = app.focus == Focus::Detail;
     let row = app.detail_row;
     let is_time = matches!(app.switch_auto_modes.get(&ip), Some(SwitchAutoMode::Time));
@@ -568,12 +599,14 @@ fn switch_reading_lines(lines: &mut Vec<Line>, r: &SwitchReading, app: &App, ip:
     lines.push(highlighted_line(
         format!("  Relay    {relay}"),
         focused && row == 0,
+        &theme,
     ));
 
     let mode_str = if is_time { "Time" } else { "Disabled" };
     lines.push(highlighted_line(
         format!("  Auto     {mode_str}"),
         focused && row == 1,
+        &theme,
     ));
 
     if is_time {
@@ -583,17 +616,20 @@ fn switch_reading_lines(lines: &mut Vec<Line>, r: &SwitchReading, app: &App, ip:
                 lines.push(highlighted_line(
                     format!("  {}  {}  [d] delete", t.time_hhmm, action),
                     focused && row == 2 + i,
+                    &theme,
                 ));
             }
             let add_row = 2 + ts.len();
             lines.push(highlighted_line(
                 "  + Add timer".to_string(),
                 focused && row == add_row,
+                &theme,
             ));
         } else {
             lines.push(highlighted_line(
                 "  + Add timer".to_string(),
                 focused && row == 2,
+                &theme,
             ));
         }
     }
@@ -608,6 +644,7 @@ fn switch_reading_lines(lines: &mut Vec<Line>, r: &SwitchReading, app: &App, ip:
 }
 
 fn keba_reading_lines(lines: &mut Vec<Line>, r: &KebaReading, app: &App, ip: IpAddr) {
+    let theme = app.theme();
     let focused = app.focus == Focus::Detail;
     let row = app.detail_row;
 
@@ -619,6 +656,7 @@ fn keba_reading_lines(lines: &mut Vec<Line>, r: &KebaReading, app: &App, ip: IpA
     lines.push(highlighted_line(
         format!("  Mode     {}", mode.label()),
         focused && row == 0,
+        &theme,
     ));
 
     lines.extend([
@@ -654,14 +692,14 @@ fn render_timer_dialog(f: &mut Frame, app: &App) {
 
     let time_style = if dlg.field == TimerDialogField::Time {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(app.theme().input_active)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
     let action_style = if dlg.field == TimerDialogField::Action {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(app.theme().input_active)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -693,7 +731,7 @@ fn render_timer_dialog(f: &mut Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Add Timer ")
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(app.theme().input_active)),
         ),
         popup_area,
     );
@@ -810,6 +848,7 @@ fn render_energy_view(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_per_device_power(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Device Power ");
@@ -857,13 +896,14 @@ fn render_per_device_power(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!("  {}   no reading", dev.display_name())
             };
-            highlighted_line(text, i == idx)
+            highlighted_line(text, i == idx, &theme)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_device_energy_gauges(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Device Energy Today ");
@@ -919,11 +959,14 @@ fn render_device_energy_gauges(f: &mut Frame, area: Rect, app: &App) {
                 gauge_row(
                     f,
                     gauge_rows[ri],
-                    &label,
+                    &theme,
+                    Gauge {
+                        label: &label,
+                        color: theme.battery_charge,
+                        value: &format!("{:>6.3} kWh", charged),
+                        dir: "↑ Charged",
+                    },
                     (charged, max_kwh),
-                    Color::Cyan,
-                    &format!("{:>6.3} kWh", charged),
-                    "↑ Charged",
                 );
                 ri += 1;
             }
@@ -931,11 +974,14 @@ fn render_device_energy_gauges(f: &mut Frame, area: Rect, app: &App) {
                 gauge_row(
                     f,
                     gauge_rows[ri],
-                    &label,
+                    &theme,
+                    Gauge {
+                        label: &label,
+                        color: theme.battery_discharge,
+                        value: &format!("{:>6.3} kWh", discharged),
+                        dir: "↓ Discharged",
+                    },
                     (discharged, max_kwh),
-                    Color::Yellow,
-                    &format!("{:>6.3} kWh", discharged),
-                    "↓ Discharged",
                 );
                 ri += 1;
             }
@@ -950,11 +996,14 @@ fn render_device_energy_gauges(f: &mut Frame, area: Rect, app: &App) {
                 gauge_row(
                     f,
                     gauge_rows[ri],
-                    &label,
+                    &theme,
+                    Gauge {
+                        label: &label,
+                        color: theme.battery_charge,
+                        value: &format!("{:>6.3} kWh", kwh),
+                        dir: "",
+                    },
                     (kwh, max_kwh),
-                    Color::Cyan,
-                    &format!("{:>6.3} kWh", kwh),
-                    "",
                 );
                 ri += 1;
             }
@@ -963,6 +1012,7 @@ fn render_device_energy_gauges(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_energy_line_charts(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
     let data = &app.energy_chart;
 
     // Split area into 4 equal vertical sections for the 4 line charts
@@ -1043,7 +1093,7 @@ fn render_energy_line_charts(f: &mut Frame, area: Rect, app: &App) {
         f,
         chart_areas[0],
         "Consumption (kW)",
-        Color::Red,
+        theme.consumption,
         &data.consumption,
         y_max,
     );
@@ -1051,7 +1101,7 @@ fn render_energy_line_charts(f: &mut Frame, area: Rect, app: &App) {
         f,
         chart_areas[1],
         "Production (kW)",
-        Color::Green,
+        theme.production,
         &data.production,
         y_max,
     );
@@ -1059,7 +1109,7 @@ fn render_energy_line_charts(f: &mut Frame, area: Rect, app: &App) {
         f,
         chart_areas[2],
         "Grid (kW)",
-        Color::Blue,
+        theme.grid_export,
         &data.grid,
         y_max,
     );
@@ -1067,7 +1117,7 @@ fn render_energy_line_charts(f: &mut Frame, area: Rect, app: &App) {
         f,
         chart_areas[3],
         "Battery (kW)",
-        Color::Yellow,
+        theme.battery_discharge,
         &data.battery,
         y_max,
     );
@@ -1121,6 +1171,7 @@ fn render_network_infrastructure_health(
     modems: &[&ScannedDevice],
     access_points: &[&ScannedDevice],
 ) {
+    let theme = app.theme();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Network Infrastructure Health ");
@@ -1159,7 +1210,11 @@ fn render_network_infrastructure_health(
     if !all_devices.is_empty() {
         for (device, status) in all_devices {
             let display_name = get_device_display_name(device);
-            lines.push(render_network_device_line_static(display_name, status));
+            lines.push(render_network_device_line_static(
+                display_name,
+                status,
+                &theme,
+            ));
         }
     } else {
         lines.push(Line::from(
@@ -1171,10 +1226,14 @@ fn render_network_infrastructure_health(
 }
 
 /// Render a line for a network infrastructure device with colored status (static lifetime)
-fn render_network_device_line_static(name: String, status: NetworkDeviceStatus) -> Line<'static> {
+fn render_network_device_line_static(
+    name: String,
+    status: NetworkDeviceStatus,
+    theme: &Theme,
+) -> Line<'static> {
     use ratatui::style::Style;
-    let status_span =
-        Span::from(format!(" [{}] ", status.display())).style(Style::default().fg(status.color()));
+    let status_span = Span::from(format!(" [{}] ", status.display()))
+        .style(Style::default().fg(theme.status_color(&status)));
 
     Line::from(vec![Span::from(format!("  {:<20} ", name)), status_span])
 }
@@ -1183,6 +1242,7 @@ fn render_network_device_line_static(name: String, status: NetworkDeviceStatus) 
 /// Router OK → LOST). Startup and each device's first observation are never
 /// logged — see `app::status_transition`.
 fn render_network_status_history(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Network Status History ");
@@ -1204,10 +1264,10 @@ fn render_network_status_history(f: &mut Frame, area: Rect, app: &App) {
                 Span::from(format!("  {} ", event.at.format("%H:%M:%S"))),
                 Span::from(format!("{name:<20} ")),
                 Span::from(event.previous.display().to_string())
-                    .style(Style::default().fg(event.previous.color())),
+                    .style(Style::default().fg(theme.status_color(&event.previous))),
                 Span::from(" \u{2192} "),
                 Span::from(event.current.display().to_string())
-                    .style(Style::default().fg(event.current.color())),
+                    .style(Style::default().fg(theme.status_color(&event.current))),
             ])
         })
         .collect();
@@ -1243,13 +1303,13 @@ fn render_internet_traffic_chart(f: &mut Frame, area: Rect, app: &App) {
             .name("Download (kbps)")
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Cyan))
+            .style(Style::default().fg(app.theme().traffic_rx))
             .data(&data.rx_kbps),
         Dataset::default()
             .name("Upload (kbps)")
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Magenta))
+            .style(Style::default().fg(app.theme().traffic_tx))
             .data(&data.tx_kbps),
     ];
 

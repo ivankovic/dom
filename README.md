@@ -8,130 +8,105 @@ Robust. Efficient. Old school.
 
 A Terminal User Interface is available. Simply run the app.
 
-You can exit the app at any time by hitting 'q'.
+You can exit the app at any time by hitting 'q', or Ctrl-C.
 
-You can exit any popup or submenu by hitting the Escape key. Hitting Escape in the main screen will
-also exit the app.
+Escape closes whichever dialog is open — the add-timer popup, or a rename in progress — and cancels
+it. It does not exit the app.
 
 ## Theme
 
-You can switch between the dark and light theme with 'c'. The app will try to auto-detect the theme,
-but for some terminal and multiplexer combinations there isn't enough information available to make
-the correct choice.
+You can switch between the dark and light theme with 't'. Your choice is remembered, and from then
+on it takes precedence over auto-detection on every start.
 
-## Main screen
+Until you pick one, the app tries to auto-detect the theme from the terminal's `COLORFGBG`
+variable. For many terminal and multiplexer combinations — tmux among them — there isn't enough
+information available to make the correct choice, and the dark theme is used.
 
-The main UI screen is an overview of your home.
+## Views
 
-The systems are split into 5 categories:
+There are four views:
 
-- Energy: Power usage, power production, etc.
-- Security: Alarm systems, cameras, smoke detectors, etc.
-- Environment: Temperature, humidity, air quality, etc.
-- Communication: LAN, WLAN, Meshtastic etc.
-- Household: Robot vacuums, laundry, calendar, etc.
+- **Current** ('c'): the overview — energy gauges plus the state of your network infrastructure.
+- **Energy** ('e'): consumption, production, grid and battery in detail.
+- **Network** ('n'): routers, modems and access points, their health, and Internet traffic.
+- **Devices** ('d'): every device discovered on the network, configured or not, with a detail panel.
 
-The main UI screen gives a summary of each category and a list of most important information for
-this moment:
-
-- Energy: Total consumption, production, storage and import gauge
-- Security: Alarm state (Enabled/Disabled etc.) and "All clear" or "ALERT!" states
-- Environment: A temperature, humidity and air quality gauges
-- Communication: "Operational" if everything is ok, or "Issue detected" if not
-- Household: Todays calendar events, last automated cleaning for each robot
-
-Using 'e', 's', 'v' and 'h' you can navigate to detailed views for Energy, Security, Environment and
-Household respectively. 'm' will take you back to the main view from any detailed view.
-
-In each view, 'c' will take you to a configuration panel. In the main screen, you can configure
-application wide settings. In detailed views, you can configure settings for each subsystem.
+Security, Environment and Household are intended categories that are not implemented yet — no
+sensors of those kinds are supported, and there are no views for them.
 
 ### Keyboard shortcuts
 
 | Key | Action |
 |-----|--------|
-| q | Quit the app |
-| Esc | Close popup or exit to previous screen (or quit if on main screen) |
+| q, Ctrl-C | Quit the app |
+| Esc | Close the open dialog |
 | t | Toggle theme (dark/light) |
-| c | Communication view |
-| g | Configuration panel |
-| a | Start device discovery |
+| c | Current view (the overview) |
 | e | Energy view |
-| s | Security view |
-| v | Environment view |
-| h | Household view |
-| m | Main screen |
+| n | Network view |
+| d | Devices view |
+| s | Rescan now (wakes the ping scan and discovery immediately) |
+| r | Rename the selected device |
+| Tab | Move between the device list and the detail panel |
+| Up, Down | Move within the focused list |
+
+While a dialog is open — the add-timer popup, or a rename in progress — keys go to the dialog, so
+the shortcuts above are inactive until you close it with Escape.
 
 ## Energy view
 
-On top is the summary gauge of total energy production, consumption, storage and import.
+Four sections, top to bottom:
 
-Followed by itemized lists for each:
+1. Summary gauges: consumption, production, grid (marked importing or exporting) and battery
+   (charging or discharging), plus the battery's stored energy. The battery gauge changes colour by
+   fill level.
+2. Per-device power: the current draw of each device reporting one, selectable with Up/Down.
+3. Per-device energy for today, in kWh.
+4. Line charts of today's consumption, production, grid and battery, in kW.
 
-- Consumption
-- Production
-- Storage
-- Import
+There is no manual sensor-configuration popup. Devices are found by scanning — press 's' to scan
+immediately instead of waiting for the next cycle.
 
-Each list has a list of entities and their individual gauges. E.g. if you have multiple batteries,
-each will be listed separately under storage. Or if you import both electricity and natural gas,
-both will be listed under import. For production, you could have either multiple solar panel arrays,
-wind turbines, hydro or a mix of them.
+## Network view
 
-For consumption, production and import, each list row has 3 items:
+The health of your network infrastructure: routers first, then 5G modems, then access points. Roles
+are assigned from device labels where they say "router", "modem"/"5g" or "ap", and any remaining
+MikroTik devices fill whichever roles are still empty.
 
-1. The last observed value, in kW
-2. The daily total for this day, in kWh
-3. A histogram of observed values for the last 4 hours, auto-scaled to fit the rest of the screen.
+Each device shows a status derived from its last five pings:
 
-For storage, each list row has 3 items:
+| Status | Meaning |
+|--------|---------|
+| OK | All five pings answered, all under 50 ms |
+| SLOW | All answered, but at least one took 50 ms or more |
+| DEGRADED | At least one ping was lost |
+| LOST | No successful pings |
+| UNKNOWN | Ping scanning itself is broken (e.g. missing `CAP_NET_RAW`), so health is genuinely unknown rather than assumed fine |
 
-1. The current input or output value, in kW
-2. The current stored energy, in kWh
-3. A histogram of observed charge/discharge values, for the last 4 hours, auto-scaled to fit the
-   remaining screen width
+Alongside is a log of recent status changes, kept across restarts, and a chart of the modem's
+Internet-facing traffic for today.
 
-### Keyboard shortcuts
+## Devices view
 
-Pressing '+' will bring up a popup allowing you to configure a new energy sensor. Note that
-Dom tries to auto-detect as many sensors and devices as possible, so before completely manually
-adding one, try the auto-detect feature first (using 'a' from any screen).
+Every device the scanner has found, whether or not Dom knows how to poll it, with a detail panel for
+the selected one. Press 'r' to give a device your own label, which takes precedence over the name
+learned from DHCP.
 
-Pressing 'c' will open up the energy configuration panel.
+For a myStrom switch the detail panel also allows toggling the relay, switching auto-mode between
+disabled and time-based, and adding or deleting scheduled timers. For a KEBA wallbox it allows
+switching the charging mode between disabled and full power — the new mode is only shown as fact once
+the wallbox confirms it.
 
-## Security view
+## Supported devices
 
-At the top of the screen is the summary of the current security system mode and a summary of the
-current state. The state can be "All clear", "Warning" or "**ALERT**" depending on if any security
-sensors are reporting any events.
+- Sonnen Eco 8 battery
+- KEBA wallbox
+- MikroTik routers and access points
+- myStrom WiFi switches
+- The machine Dom itself runs on
 
-The rest of the screen is a list of security sensors, grouped by sensor types. For each sensor, the
-last time the sensor information was updated is displayed.
-
-### Keyboard shortcuts
-
-Pressing '+' will bring up a popup allowing you to configure a new security sensor. Note that
-Dom tries to auto-detect as many sensors and devices as possible, so before completely manually
-adding one, try the auto-detect feature first (using 'a' from any screen).
-
-Pressing 'c' will open up the security configuration panel.
-
-## Environment view
-
-A simple list of sensors, with the reported temperature, humidity, air quality and any other extra
-information is displayed. At the end of each row is the timestamp of the last time the sensor
-information was updated.
-
-## Communication view
-
-Lists the routers, modems, access points and software defined switches and their general status,
-ping latency, last bandwidth test results, including bandwidth in mbps and lost packets.
-
-## Household view
-
-A list of household automation objects, e.g. robot vacuums, robot lawnmovers, followed by the last
-time the object was connected to and then a plain-text
-status that each object reports.
+Anything else on the network still appears in the Devices view with its open ports and ping health;
+it just isn't polled.
 
 # Installation
 
@@ -139,23 +114,13 @@ Use cargo install.
 
 There are no packages currently available.
 
-## Headless Mode
+Dom takes no command-line arguments. Running it starts the TUI.
 
-Dom can also run in headless mode for server/automation use:
+Device discovery, polling and storage all run as background tasks alongside the TUI, so simply
+leaving the app running is what collects data. There is no separate headless mode.
 
-```bash
-dom --headless
-# or
-dom -h
-```
-
-In headless mode, Dom:
-- Connects to all configured devices
-- Collects sensor readings periodically
-- Stores data in the time series database
-- Runs controllers to make decisions
-
-Configuration is read from the SQLite database (config table).
+State lives in `db.sqlite` in the working directory: discovered devices and their credentials,
+measurement history, and application settings such as the chosen theme (in the `Config` table).
 
 ## Platform Support
 
@@ -225,87 +190,73 @@ off of the real world. Sensors have latency, and we don't have sensors in every 
 The most important decision is to timestamp every event and use the timestamps to estimate the drift
 between realiy and the model.
 
-## Object oriented model, separation of concerns
+## Structure: shared state, background tasks, one renderer
 
-Dom has the following design:
+Dom is a set of background tokio tasks and a TUI, all reading and writing one shared `App` struct
+behind an `RwLock` (`Arc<RwLock<App>>`, aliased `SharedState`).
 
-1.  The World Model - The digital twin of the world. It represents what Dom _believes_ the real
-    world is. It also knows what the real world _should be_.
-2.  The Device Manager - Discovers, configures, manages the Sensors and Actions and connects them
-    with the World Model.
-3.  Devices - Specific types of devices, e.g. a Sonnen v6 Battery, a Tesla Model X. Knows how to
-    talk to the device. Provides any number of Sensors and Actions to the World Model.
-4.  Sensor - Reports to the Model what the real world is.
-5.  Action - Allows the Model to do something in the real world.
+There is no separate world-model layer. `App` *is* the model: it holds the latest reading from each
+device, connection status, ping history, the device list and the UI's own state. Anything that wants
+to know something about the house reads it from `App`; anything that learns something writes it
+there. This is deliberately flat — the app is small enough that a layer of indirection between
+"what the battery just reported" and "what the screen shows" would cost more than it saves.
 
-### The World Model
+The tasks, all spawned from `main`:
 
-The world model uses object oriented design patterns to keep a digital twin of the real world. As an
-explicit choice, the object oriented desing is NOT used to make the system more modular. Instead, we
-prioritize robusntess and fail-safe behaviour.
+- **Ping scan** — ICMP-sweeps the local subnets and the ARP cache. Runs at startup, again after five
+  minutes to catch devices that were down at t=0, then every four hours. A failure here (typically a
+  missing `CAP_NET_RAW`) is recorded for display and must never block discovery, which needs only TCP.
+- **Discovery** — every five minutes, fingerprints the union of the last ping scan's results and the
+  router's DHCP leases, identifies device types, persists them, and starts a poll loop for each new
+  one.
+- **One poll loop per device** — talks to its own device on its own interval and writes readings into
+  `App` and the DB.
+- **Infrastructure ping** — per-device health checks at role-dependent intervals.
+- **Pruning** and **chart refresh** — hourly and every 60 seconds respectively.
+- **Timer job** — fires scheduled switch timers every 30 seconds.
 
-The World Model keeps three states: the state of the world as last observed, the current state of
-the world as best estimated and the desired state of the world.
+Both the ping scan and discovery can be woken early; that is what 's' does.
 
-The center of the world is the Home object. The Home is mostly a container for other objects,
-although it does directly hold some information like the name.
+### Device modules
 
-The Home holds Energy, Security, Communication, Environment and Household objects. Each object holds
-the respective model.
+One module per device type under `src/devices/`, each with the same shape: a `detect` that recognizes
+the device from a fingerprint, functions to talk its protocol, a `save_device`/`load_all` pair, and a
+`poll_loop`. Shared behaviour that would otherwise be copied per module lives in `src/devices/mod.rs`
+— network scanning, the DB timestamp format, and the poll-failure/IP-migration handling every loop
+needs.
 
-As an example, to get the estimated total current energy usage, the following code would be used
-`home.energy.usage.total.estimated`. If the latest measured energy usage is needed,
-`home.energy.usage.total.measured` can be used. Note however here there is a chance that the return
-value is None. This can happen if there are more than one energy measurement device and their last
-measure timestamp diverges. In that case, individual measurements can be found using
-`home.energy.sensor[0].usage` which will return a (Wh, timestamp) result for the first energy sensor,
-or None if the measurement was never recieved.
+Device identity is the MAC address from the kernel ARP cache, not the IP, so a device that gets a new
+DHCP lease is recognized as the same device rather than appearing twice. See SPECS.md.
 
-To prevent the README from diverging from the code, we don't list details of each object here. The
-source code is the source of truth.
+### Who talks to the DB?
 
-### Device manager
-
-Scans the networks continously to discover devices and performs health check on configured devices.
-
-### Devices
-
-Individual implementation for specific device _types_. For example, a IKEA smart plug, or a
-Gardena gateway. For every actual physical devices, one instance of the class is instantiated.
-
-### Actions
-
-Actions that the model can ask the devices to do.
-
-### Sensors
-
-Measurements the devices give to the model. The model always expects sensors to _push_ data. If a
-device protocol is based on pulling the data from the sensor, the device code should
-periodically pull the data and push it to the model.
-
-### Who is allowed to talk to whom?
-
-The World Model and the Device Manager are the only objects allowed to talk to the DB.
-
-The device manager instantiates device instances and connects them to the model.
-
-The model calls Actions, and the Senors update the Model.
+Everything that needs to, through `src/db.rs`. Device modules write their own measurements. This is a
+departure from stricter layering, chosen because every alternative meant passing rows through `App`
+for no benefit.
 
 ## Technology
 
 The project is completely written in Rust.
 
-SQLite is used to store user configuration and other runtime data.
-
-tsink is used to store time series data, e.g. the electricity usage time series.
+SQLite is the only datastore, via `sqlx`. It holds configuration, device records and the measurement
+time series alike — `RawDeviceMeasurements` for point readings, `Energy` and `EnergyStorage` for
+integrated energy, `NetworkStatusEvents` for infrastructure history, and `Config` for settings. A
+dedicated time-series database was considered unnecessary at this data rate.
 
 The UI is a Terminal UI written using the excellent Ratatui and Crossterm libraries.
 
-### UI design patterns
+### UI structure
 
-The UI uses the [Component architecture](https://ratatui.rs/concepts/application-patterns/component-architecture/).
+`src/tui/mod.rs` owns the event loop: it reads crossterm events, mutates `App` under the write lock,
+and asks `render` to draw. `src/tui/render.rs` is a flat sequence of `render_*` functions that read
+`App` and draw — they hold no state of their own.
 
-Each component encapsulates its own state, event handlers, and rendering logic.
+This is not the Ratatui component architecture. Components own their state and handle their own
+events; here all state lives in `App` and all event handling in one loop, which keeps every state
+transition in a single readable place.
+
+Colours come from `src/tui/theme.rs` rather than being written inline, so both the dark and light
+palettes work. Fields are named for meaning (`consumption`, `focus_border`), not for a colour.
 
 ## Code quality
 
@@ -339,80 +290,56 @@ be happy-path tests, they should not test errors unless the error is a general u
 Ideally, the real implementation is used.
 
 When necessary, e.g. for filesystem or database access, fake in-memory implementations should be used.
+For the database that means `db::init("sqlite://:memory:")`, which applies the real schema — the
+queries under test are `sqlx::query` rather than the compile-time-checked `sqlx::query!`, so only a
+real database exercises them.
 
-The src/test/harness.rs test harness should provide convenience functions for faking network
-devices and the file system.
+`tests/common/mod.rs` holds the shared integration-test helpers: an in-memory pool, and `MockHttp`, a
+raw-TCP server that answers with a canned response so device protocol code can be driven end to end
+over a real socket.
 
 ## Code structure
 
-Rust's project structure must be followed.
+Rust's project structure is followed.
 
+```
 <root of the repository>
-    |- /src             <- The implementation
-        |- main.rs      <- The main entry point, spawns the background threads and the UI
-        |- lib.rs       <- Library exports
-        |- app.rs       <- The app controller, responds to events and controls the UI
-        |- headless.rs   <- Headless mode entry point
-        |- path.rs       <- Shared path utilities for database files
-        |- model/       <- The world model (digital twin)
-            |- SPECS.md
-            |- mod.rs
-            |- home.rs
-            |- energy.rs
-            |- security.rs
-            |- environment.rs
-            |- communication.rs
-            |- household.rs
-            |- value.rs
-            |- sensor.rs
-        |- actions.rs
-        |- sensors.rs
-        |- devices/     <- The communication layer (talking to devices)
-            |- SPECS.md
-            |- mod.rs
-            |- discovery.rs
-            |- protocol.rs
-            |- manager.rs
-            |- device/   <- Device-specific implementations
-                |- device_sonnen.rs
-        |- tui/         <- All TUI components go in this directory
-            |- SPECS.md <- TUI specs
-            |- mod.rs
-            |- app.rs
-            |- event.rs
-            |- theme.rs
-            |- components/
-                |- mod.rs
-                |- gauge.rs
-                |- histogram.rs
-                |- list.rs
-                |- popup.rs
-            |- screens/
-                |- mod.rs
-                |- main_screen.rs
-                |- energy_screen.rs
-                |- security_screen.rs
-                |- environment_screen.rs
-                |- communication_screen.rs
-                |- household_screen.rs
-                |- config_screen.rs
-        |- db/          <- The db components and specs
-            |- SPECS.md <- Database specs
-            |- mod.rs
-            |- sqlite.rs
-            |- tsink.rs
-       |- test/        <- Helper functions for testing
-            |- harness.rs
-    |- /tests          <- Integration and end-to-end automated tests
-        |- gauge_test.rs
-        |- network_scanning_test.rs
-        |- discovery_test.rs
-    |- /benches         <- Benchmarks
-    |- README.md        <- This file. Only very high level information goes here
-    |- AGENTS.md        <- AI-only instructions
-    |- SPECS.md         <- Detailed specifications and all decisions that were taken
-    |- TODO.md          <- List of small to  mid size TODO items that need to be fixed in the future
-    |- REVIEW.md        <- Comments about the codebase that need to be improved upon
+    |- /src               <- The implementation
+        |- main.rs        <- Entry point; spawns every background task, then the TUI
+        |- lib.rs         <- Library exports (so tests/ can reach the internals)
+        |- app.rs         <- The shared state every task reads and writes, and the
+        |                    types it holds. This is the model.
+        |- db.rs          <- Schema, migrations and every query
+        |- fingerprint.rs <- Port scan + HTTP probing used to identify a device
+        |- devices/       <- Talking to devices
+            |- mod.rs             <- Network scanning, and the behaviour every
+            |                        device module shares
+            |- sonnen_batterie.rs
+            |- keba.rs
+            |- mikrotik.rs
+            |- mystrom_switch.rs
+            |- dom_local.rs       <- The machine Dom runs on
+        |- tui/           <- Everything terminal
+            |- mod.rs     <- The event loop
+            |- render.rs  <- Drawing; flat render_* functions, no state
+            |- theme.rs   <- Dark/light palettes and terminal detection
+    |- /tests             <- Integration tests, one binary per file
+        |- common/mod.rs  <- In-memory DB and MockHttp helpers
+        |- db.rs
+        |- keba.rs
+        |- mikrotik.rs
+        |- mystrom_switch.rs
+        |- sonnen_batterie.rs
+        |- dom_local_test.rs
+    |- README.md          <- This file. Only very high level information goes here
+    |- AGENTS.md          <- AI-only instructions
+    |- SPECS.md           <- Detailed specifications and all decisions that were taken
+    |- TODO.md            <- Small to mid size TODO items to be fixed in the future
+    |- REVIEW.md          <- Comments about the codebase that need improving
+```
+
+Directories are added only once they hold more than a file or two; `db.rs` and `app.rs` are single
+files today and stay that way until there is a reason to split them.
 
 The SPECS.md and README.md files can exist in any subdirectory, and they always serve the same
 purpose:
