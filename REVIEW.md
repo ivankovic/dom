@@ -15,6 +15,40 @@ unit test, which is why it was not done as part of a health pass. Everything the
 *decides* is currently untested: which key maps to which view, that Escape cancels
 rather than commits a rename, that the theme toggle persists.
 
+## The today-queries still read the 2-second tier
+
+`query_today_energy` reads roughly 43,000 raw rows to produce 1,440 per-minute buckets. Against
+`EnergyMinute` the same output would come from 1,440 rows, roughly thirty times cheaper, and that
+query runs every 60 seconds in the background.
+
+Not done, because it needs a boundary: the minute tier deliberately excludes the minute in progress,
+so a query spanning both tiers must know exactly where one ends and the other begins, or it
+double-counts. The mechanism is straightforward — take `MAX(minute)` for today, add 60 seconds, read
+minute rows below it and 2s rows above — but it adds a correctness-critical invariant to a query that
+already completes in a couple of seconds.
+
+Note also that the sign-split queries (grid import/export in `query_today_energy`, charge/discharge in
+`query_device_energy_today`) cannot naively move to the minute tier: they must read `energy_ws_pos`
+and `energy_ws_neg` rather than re-splitting an aggregated value, since a minute that both imported
+and exported nets out.
+
+## `Energy.resolution` is now vestigial
+
+Every row in `Energy` has `resolution = '2s'`, and the coarser tiers live in their own tables — for
+the reasons recorded in SPECS.md. The column and its `CHECK (resolution IN ('2s','1min','10min'))`
+constraint remain, and every query still filters on it. Harmless, but it reads as though the table
+holds multiple resolutions when it does not, and it costs a repeated TEXT value per row in both the
+table and the 914 MB index.
+
+## The `Energy` index is larger than the table
+
+`idx_energy_metric_res_time` was 914 MB against a 555 MB table, or 75 bytes per row against 46,
+because it carries `metric` and `resolution` as TEXT for every row. Interning both as small integers
+would shrink it substantially.
+
+Independent of retention: pruning fixed the *growth*, this would fix the *density*. It needs a rewrite
+of the table, so it is worth doing only alongside some other migration that already has to.
+
 ## Poll intervals are read once at spawn time
 
 A poll loop reads `poll_interval_secs` from its `DeviceRecord` when it starts and builds

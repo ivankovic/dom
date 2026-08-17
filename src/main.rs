@@ -56,6 +56,11 @@ const ROLLUP_INTERVAL_SECS: u64 = 15 * 60;
 /// work through against a database that the poll loops are reading at the same
 /// time; spreading the work out keeps it from starving them of I/O.
 const ROLLUP_THROTTLE: Duration = Duration::from_millis(200);
+/// Delete batches per pruning pass. The first prune after the rollup tiers
+/// shipped has millions of rows to clear; capping the work per pass keeps each
+/// one short, and the backlog drains over the following passes rather than
+/// monopolising the database in one go.
+const PRUNE_BATCHES_PER_PASS: usize = 25;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -140,24 +145,63 @@ async fn main() -> anyhow::Result<()> {
 
 // ── Long-term statistics ──────────────────────────────────────────────────────
 
-/// Keeps `EnergyDaily` up to date and reloads the statistics view from it.
+/// Maintains the energy history: advances the rollup tiers, refreshes the
+/// statistics view from them, and prunes raw data the tiers have superseded.
 ///
-/// The statistics view reads only the daily rollup, never the 2s `Energy` rows —
-/// at 2s resolution even a single month is millions of rows. This task is what
-/// makes that rollup exist.
+/// The tiers are `2s -> per-minute -> daily`, each retained for progressively
+/// longer (four days, ninety days, forever). Nothing in the UI renders finer than
+/// per-minute, and only for today, so keeping the 2s series indefinitely stored
+/// roughly thirty times the resolution anything consumes — which is what made the
+/// database grow about a gigabyte a month.
 ///
-/// Refreshes the view before rolling up as well as after, so an existing rollup
-/// is on screen immediately rather than after the first pass completes: the very
-/// first run has the entire recorded history to aggregate.
+/// Order matters: roll up, then prune. Each prune additionally refuses on its own
+/// to drop a day the next tier up has not processed, so a rollup failure cannot
+/// turn into data loss.
+///
+/// Refreshes the view before rolling up as well as after, so existing figures are
+/// on screen immediately rather than after the first pass completes: the very first
+/// run has the entire recorded history to aggregate.
 async fn statistics_task(state: SharedState, pool: SqlitePool) {
     stats::refresh(&pool, &state).await;
     loop {
-        match db::rollup_history(&pool, ROLLUP_THROTTLE).await {
+        let rolled = db::rollup_history(&pool, ROLLUP_THROTTLE).await;
+        match &rolled {
             Ok(0) => {}
-            Ok(n) => log::info!("rolled up {n} device-days of energy"),
+            Ok(n) => log::info!("rolled up {n} days of energy history"),
             Err(e) => log::warn!("energy rollup failed: {e:#}"),
         }
         stats::refresh(&pool, &state).await;
+
+        // Prune only when the rollup pass that just ran was healthy.
+        // `prune_energy_2s` independently refuses to delete days the minute tier
+        // has not processed, so this is belt and braces rather than the only
+        // safeguard — but there is no reason to spend I/O deleting while the tier
+        // that has to outlive the raw samples is failing to advance.
+        if rolled.is_ok() {
+            for (what, result) in [
+                (
+                    "energy",
+                    db::prune_energy_2s(&pool, PRUNE_BATCHES_PER_PASS).await,
+                ),
+                (
+                    "storage",
+                    db::prune_energy_storage_2s(&pool, PRUNE_BATCHES_PER_PASS).await,
+                ),
+                (
+                    "per-minute",
+                    db::prune_energy_minute(&pool, PRUNE_BATCHES_PER_PASS).await,
+                ),
+            ] {
+                match result {
+                    Ok(0) => {}
+                    Ok(n) => log::info!("pruned {n} raw {what} samples"),
+                    Err(e) => log::warn!("pruning raw {what} samples failed: {e:#}"),
+                }
+            }
+        } else {
+            log::warn!("skipping prune: the rollup pass did not complete");
+        }
+
         tokio::time::sleep(Duration::from_secs(ROLLUP_INTERVAL_SECS)).await;
     }
 }

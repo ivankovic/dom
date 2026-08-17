@@ -155,6 +155,67 @@ It passes no fingerprint. The local machine is re-derived from this host's own i
 discovery cycle, so it has no identity to preserve across an address change — and our own
 address never appears in our own ARP cache, which is where fingerprints come from.
 
+## Tiered measurement retention (2026-08-17)
+
+### Problem
+
+The 2-second series was kept forever. `Energy` alone was 12.7M rows over 47 days, and with
+`EnergyStorage` and their indexes it accounted for essentially the entire 1.7 GB database, growing
+about a gigabyte a month. The single largest object was `idx_energy_metric_res_time` at 914 MB
+against a 555 MB table, because it carries TEXT `metric` and `resolution` for every row.
+
+The decisive observation is that **nothing renders 2-second data**. Every read of `Energy` is scoped
+to the current local day, and the finest thing any of them produces is a per-minute bucket. Live
+gauges come from in-memory state, not the database. So the series was retained at roughly thirty
+times the resolution anything consumes.
+
+### Decision: three tiers, each retained longer than the last
+
+`2s` for 4 days, `EnergyMinute` for 90 days, `EnergyDaily` forever. `EnergyStorage` follows the same
+shape, summarised into `StorageDaily`.
+
+Downsampling is sound here in a way it would not be for a sampled series: `energy_ws` is an
+*integral* over each interval, so summing thirty 2-second rows into a minute preserves the total
+exactly. Confirmed on real data — aggregating a day in two stages matched one stage to seven decimal
+places, and a full rollup-then-prune of 3.4M real rows left twelve closed days bit-identical.
+
+What downsampling does lose is intra-minute shape, and with it peak draw. `peak_w` is therefore
+captured per minute at rollup time, since it is the one figure a coarser tier cannot reconstruct. A
+2-second energy divided by its interval is already a 2-second average power, which is the right
+quantity for the questions peaks answer — fuse and grid-connection limits are thermal.
+
+### Retention is bounded by its consumers, not by taste
+
+4 days of raw data is not a preference. It must cover the "today" queries, which look no further back
+than the current local day, and it must cover `DAYS_ALWAYS_REROLLED`, because re-rolling a day whose
+source rows were partly deleted would replace a complete total with a partial one. Four days leaves
+two days of margin over the two-day re-roll window.
+
+That constraint is also why the today-queries were left reading the 2s tier. Pointing them at the
+finest *available* resolution was considered and rejected: retention already guarantees the raw rows
+for today exist, mixing tiers in one query would double-count minutes present at both, and the
+sign-split queries (grid import/export, battery charge/discharge) are not tier-invariant unless they
+read the split columns. The refactor would have added a correctness-critical invariant for a
+background query that already completes in a couple of seconds. Recorded in REVIEW.md instead.
+
+### Pruning cannot outrun rolling up
+
+Each prune refuses, in SQL, to delete a day the next tier up has not recorded in `RollupProgress` —
+raw energy needs the minute tier, raw storage needs the storage tier, minutes need the daily tier.
+This is an interlock rather than a matter of call ordering: a rollup failure followed by a prune
+would otherwise destroy data permanently, and the caller cannot be relied on to remember.
+
+Deletion is batched at 20,000 rows per statement, capped per pass. The first prune has millions of
+rows to clear; one statement would mean a multi-gigabyte WAL and a write lock held for minutes
+against a database the poll loops write to every two seconds.
+
+### Reclaiming the space is deliberately not automatic
+
+SQLite's `DELETE` returns pages to the free list rather than shrinking the file, so the file does not
+get smaller — briefly it gets larger. Reclaiming needs `VACUUM`, which rewrites the whole database
+under an exclusive lock; on a measured 13-day sample, 338 MB became 108 MB in about 7 seconds. That
+is an operator action with Dom stopped, not something the app should do to itself while running.
+
 ## Long-term statistics: daily energy rollup (2026-08-17)
 
 ### Problem

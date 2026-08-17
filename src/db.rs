@@ -499,13 +499,15 @@ pub async fn rollup_storage_day(
     Ok(())
 }
 
-/// Aggregates one local day of one device's 2s rows into `EnergyDaily`.
+/// Aggregates one local day of one device's minute rows into `EnergyDaily`.
 ///
-/// Scoped to a single device because that is what the existing
-/// `idx_energy_metric_res_time` index can serve: with `device_id` as its leading
-/// column plus a bounded timestamp range this is an index range scan (measured
-/// at ~0.16s per device-day against 12.7M rows), where the same aggregation
-/// across all devices at once degrades to scanning the range for every device.
+/// Reads `EnergyMinute`, not the 2s series. Two reasons: the minute tier is the
+/// one that outlives pruning, so daily totals must be reproducible from it; and
+/// it is ~28x fewer rows for identical output, since summing an integral in two
+/// stages is exactly lossless.
+///
+/// This depends on the minute tier being current for `day` — `rollup_history`
+/// runs the tiers in order for exactly that reason.
 ///
 /// Idempotent: re-rolling a day replaces its totals rather than adding to them,
 /// so a partially-elapsed day can be refreshed as often as needed.
@@ -523,19 +525,17 @@ pub async fn rollup_energy_day(
         "SELECT
              SUM(CASE WHEN metric = 'consumption' THEN energy_ws ELSE 0 END) / 3600.0 AS consumption,
              SUM(CASE WHEN metric = 'production'  THEN energy_ws ELSE 0 END) / 3600.0 AS production,
-             -- The signed grid series: negative is drawn from the grid,
-             -- positive is fed back into it. Split here; a daily sum of the
-             -- signed values could never be separated again.
-             SUM(CASE WHEN metric = 'grid' AND energy_ws < 0 THEN -energy_ws ELSE 0 END) / 3600.0
-                 AS grid_import,
-             SUM(CASE WHEN metric = 'grid' AND energy_ws > 0 THEN  energy_ws ELSE 0 END) / 3600.0
-                 AS grid_export,
+             -- The already-split directional parts, summed. Splitting here from a
+             -- signed daily sum would be wrong: a minute that both imported and
+             -- exported nets out, so the split has to happen at the finest tier
+             -- and be carried upwards, which is what energy_ws_pos/neg are for.
+             SUM(CASE WHEN metric = 'grid' THEN energy_ws_neg ELSE 0 END) / 3600.0 AS grid_import,
+             SUM(CASE WHEN metric = 'grid' THEN energy_ws_pos ELSE 0 END) / 3600.0 AS grid_export,
              COUNT(*) AS samples
-         FROM Energy
+         FROM EnergyMinute
          WHERE device_id = ?
-           AND resolution = '2s'
-           AND timestamp >= ?
-           AND timestamp < ?",
+           AND minute >= ?
+           AND minute < ?",
     )
     .bind(device_id)
     .bind(&start)
@@ -1303,6 +1303,135 @@ pub async fn set_device_api_key(
 }
 
 /// Deletes RawDeviceMeasurements rows older than 24 hours. Returns rows deleted.
+/// How many local days of 2-second samples are kept, counting today.
+///
+/// Must comfortably exceed both consumers of the raw series: the "today" queries
+/// (which never look further back than the current local day) and
+/// `DAYS_ALWAYS_REROLLED`, since a day still inside the re-roll window must still
+/// have its source data or re-rolling would replace a complete total with a
+/// partial one. Four days leaves two days of margin over the two-day re-roll
+/// window.
+pub const RAW_ENERGY_RETENTION_DAYS: i64 = 4;
+
+/// Rows deleted per statement while pruning.
+///
+/// The first prune after this shipped has ~11M rows to remove. Doing that in one
+/// statement would be a single enormous transaction: a multi-gigabyte WAL, and a
+/// write lock held for minutes against a database the poll loops are writing to
+/// every two seconds. Batching keeps each transaction short.
+const PRUNE_BATCH: i64 = 20_000;
+
+/// Deletes 2s rows older than `RAW_ENERGY_RETENTION_DAYS`, but only for local days
+/// the minute tier has already processed.
+///
+/// The `RollupProgress` check is the safety interlock: it makes it impossible to
+/// delete raw samples that were never rolled up, independently of whether the
+/// caller remembered to roll up first. Without it, a rollup failure followed by a
+/// prune would silently lose data permanently.
+///
+/// Deletes at most `PRUNE_BATCH * max_batches` rows per call so one pass cannot
+/// monopolise the database; the remainder goes on the next pass.
+pub async fn prune_energy_2s(pool: &SqlitePool, max_batches: usize) -> anyhow::Result<u64> {
+    prune_raw_series(pool, "Energy", max_batches).await
+}
+
+/// As `prune_energy_2s`, for the RSOC series rolled up into `StorageDaily`.
+pub async fn prune_energy_storage_2s(pool: &SqlitePool, max_batches: usize) -> anyhow::Result<u64> {
+    prune_raw_series(pool, "EnergyStorage", max_batches).await
+}
+
+/// How many local days of per-minute rows are kept, counting today.
+///
+/// The minute tier is what makes per-minute history available beyond the few days
+/// of raw samples; past this window the daily tier, which is kept forever, is the
+/// record. Chosen so that "the last three months at minute resolution" is
+/// available while the tier stays bounded — it grows about 1.2 MB a day, so
+/// keeping it forever would add roughly half a gigabyte a year for detail nothing
+/// currently displays.
+pub const MINUTE_RETENTION_DAYS: i64 = 90;
+
+/// Deletes minute rows older than `MINUTE_RETENTION_DAYS`, for local days the
+/// daily tier has already processed.
+///
+/// Same interlock as the raw prune, one tier up: the daily tier is what has to
+/// outlive these rows, so a day it has not summarised cannot be dropped.
+pub async fn prune_energy_minute(pool: &SqlitePool, max_batches: usize) -> anyhow::Result<u64> {
+    let cutoff = (chrono::Local::now().date_naive()
+        - chrono::Duration::days(MINUTE_RETENTION_DAYS - 1))
+    .format("%Y-%m-%d")
+    .to_string();
+
+    let mut removed = 0u64;
+    for _ in 0..max_batches {
+        let n = sqlx::query(
+            "DELETE FROM EnergyMinute WHERE rowid IN (
+                 SELECT rowid FROM EnergyMinute
+                 WHERE date(minute, 'localtime') < ?
+                   AND date(minute, 'localtime') IN
+                       (SELECT day FROM RollupProgress WHERE tier = 'daily')
+                 LIMIT ?
+             )",
+        )
+        .bind(&cutoff)
+        .bind(PRUNE_BATCH)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        removed += n;
+        if n < PRUNE_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(removed)
+}
+
+async fn prune_raw_series(
+    pool: &SqlitePool,
+    table: &str,
+    max_batches: usize,
+) -> anyhow::Result<u64> {
+    // The tier whose coverage gates deletion. Energy's raw rows are the minute
+    // tier's source; EnergyStorage's are the storage tier's.
+    let tier = if table == "Energy" {
+        "minute"
+    } else {
+        "storage"
+    };
+    // Retention counts today, so the oldest day kept is today - (N - 1) and
+    // anything strictly before that goes.
+    let cutoff = (chrono::Local::now().date_naive()
+        - chrono::Duration::days(RAW_ENERGY_RETENTION_DAYS - 1))
+    .format("%Y-%m-%d")
+    .to_string();
+
+    let sql = format!(
+        "DELETE FROM {table} WHERE rowid IN (
+             SELECT rowid FROM {table}
+             WHERE resolution = '2s'
+               AND date(timestamp, 'localtime') < ?
+               AND date(timestamp, 'localtime') IN
+                   (SELECT day FROM RollupProgress WHERE tier = ?)
+             LIMIT ?
+         )"
+    );
+
+    let mut removed = 0u64;
+    for _ in 0..max_batches {
+        let n = sqlx::query(&sql)
+            .bind(&cutoff)
+            .bind(tier)
+            .bind(PRUNE_BATCH)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        removed += n;
+        if n < PRUNE_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(removed)
+}
+
 pub async fn prune_raw_measurements(pool: &SqlitePool) -> anyhow::Result<u64> {
     let result = sqlx::query(
         "DELETE FROM RawDeviceMeasurements WHERE timestamp < datetime('now', '-1 day')",
@@ -1458,6 +1587,13 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// Rolls one device-day through the tiers in the order `rollup_history` uses.
+    /// The daily tier reads the minute tier, so the two cannot be run out of order.
+    async fn roll_day(pool: &SqlitePool, id: i64, d: NaiveDate) {
+        rollup_energy_minute(pool, id, d, NO_CUTOFF).await.unwrap();
+        rollup_energy_day(pool, id, d).await.unwrap();
     }
 
     async fn device(pool: &SqlitePool, ip: &str) -> i64 {
@@ -1692,9 +1828,7 @@ mod tests {
         rollup_energy_minute(&pool, id, day("2026-05-10"), NO_CUTOFF)
             .await
             .unwrap();
-        rollup_energy_day(&pool, id, day("2026-05-10"))
-            .await
-            .unwrap();
+        roll_day(&pool, id, day("2026-05-10")).await;
 
         // From the daily tier.
         let daily = query_daily_energy(&pool, day("2026-05-10"), day("2026-05-10"))
@@ -1800,8 +1934,14 @@ mod tests {
                 3600.0,
             )
             .await;
-            // Pretend the daily tier already covered this day.
+            // Pretend the daily tier already covered this day, as it would have
+            // before the minute tier existed.
+            rollup_energy_minute(&pool, id, d, NO_CUTOFF).await.unwrap();
             rollup_energy_day(&pool, id, d).await.unwrap();
+            sqlx::query("DELETE FROM EnergyMinute")
+                .execute(&pool)
+                .await
+                .unwrap();
         }
         let minutes_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM EnergyMinute")
             .fetch_one(&pool)
@@ -1824,6 +1964,251 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second, DAYS_ALWAYS_REROLLED);
+    }
+
+    // ── Pruning the raw series ────────────────────────────────────────────────
+
+    /// Seeds one 2s sample per day for `days` days back from today.
+    async fn seed_days(pool: &SqlitePool, id: i64, days: i64, metric: &str) {
+        let today = chrono::Local::now().date_naive();
+        for back in 0..days {
+            let d = today - chrono::Duration::days(back);
+            sample(
+                pool,
+                id,
+                &format!("{} 09:00:00", d.format("%Y-%m-%d")),
+                metric,
+                3600.0,
+            )
+            .await;
+        }
+    }
+
+    async fn count(pool: &SqlitePool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn pruning_refuses_to_touch_days_the_minute_tier_has_not_processed() {
+        // The interlock that makes pruning safe. Old raw rows exist, but nothing
+        // has been rolled up, so nothing may be deleted — otherwise a rollup
+        // failure followed by a prune would destroy the data permanently.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.2.0.1").await;
+        seed_days(&pool, id, 20, "consumption").await;
+        let before = count(&pool, "SELECT COUNT(*) FROM Energy").await;
+
+        let removed = prune_energy_2s(&pool, 10).await.unwrap();
+
+        assert_eq!(removed, 0, "must not delete unrolled data");
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM Energy").await, before);
+    }
+
+    #[tokio::test]
+    async fn pruning_removes_rolled_up_days_beyond_the_retention_window() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.2.0.2").await;
+        seed_days(&pool, id, 20, "consumption").await;
+
+        rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let rolled_total = count(&pool, "SELECT COUNT(*) FROM EnergyMinute").await;
+        assert_eq!(rolled_total, 20, "every day rolled up before pruning");
+
+        let removed = prune_energy_2s(&pool, 10).await.unwrap();
+        assert!(removed > 0, "old rolled-up days should go");
+
+        // What survives is exactly the retention window.
+        let remaining = count(&pool, "SELECT COUNT(*) FROM Energy").await;
+        assert_eq!(remaining as i64, RAW_ENERGY_RETENTION_DAYS);
+
+        // And nothing was lost from the tiers that have to outlive the raw rows.
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM EnergyMinute").await,
+            rolled_total
+        );
+        // One row per metric per day, so check the day coverage rather than rows.
+        assert_eq!(
+            count(&pool, "SELECT COUNT(DISTINCT day) FROM EnergyDaily").await,
+            20
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_everything_inside_the_reroll_window() {
+        // A day still subject to re-rolling must still have its source rows, or
+        // the re-roll would overwrite a complete total with a partial one.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.2.0.3").await;
+        seed_days(&pool, id, 20, "consumption").await;
+        rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        prune_energy_2s(&pool, 10).await.unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        for back in 0..DAYS_ALWAYS_REROLLED as i64 {
+            let d = today - chrono::Duration::days(back);
+            let (start, end) = local_day_bounds_utc(d).unwrap();
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM Energy WHERE timestamp >= ? AND timestamp < ?",
+            )
+            .bind(&start)
+            .bind(&end)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                n, 1,
+                "{d} is inside the re-roll window and must keep its rows"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn totals_survive_pruning_unchanged() {
+        // The whole point: after the raw rows are gone, the reported history is
+        // still exactly what it was.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.2.0.4").await;
+        let today = chrono::Local::now().date_naive();
+        for back in 0..15 {
+            let d = today - chrono::Duration::days(back);
+            for (h, metric, ws) in [
+                (7, "grid", -3600.0),
+                (9, "consumption", 7200.0),
+                (12, "production", 18000.0),
+                (13, "grid", 10800.0),
+            ] {
+                sample(
+                    &pool,
+                    id,
+                    &format!("{} {h:02}:00:00", d.format("%Y-%m-%d")),
+                    metric,
+                    ws,
+                )
+                .await;
+            }
+        }
+        rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let before = query_daily_energy(&pool, today - chrono::Duration::days(14), today)
+            .await
+            .unwrap();
+
+        let removed = prune_energy_2s(&pool, 20).await.unwrap();
+        assert!(removed > 0);
+        // Re-roll after pruning: this is where a naive implementation would
+        // overwrite good totals with partial ones from the surviving rows.
+        rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let after = query_daily_energy(&pool, today - chrono::Duration::days(14), today)
+            .await
+            .unwrap();
+        assert_eq!(before, after, "history must be unchanged by pruning");
+    }
+
+    #[tokio::test]
+    async fn storage_pruning_is_gated_on_its_own_tier() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.2.0.5").await;
+        // Energy rows drive the day enumeration; storage rows are what get pruned.
+        seed_days(&pool, id, 20, "consumption").await;
+        let today = chrono::Local::now().date_naive();
+        for back in 0..20 {
+            let d = today - chrono::Duration::days(back);
+            storage_sample(
+                &pool,
+                id,
+                &format!("{} 09:00:00", d.format("%Y-%m-%d")),
+                55.0,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            prune_energy_storage_2s(&pool, 10).await.unwrap(),
+            0,
+            "nothing rolled up yet"
+        );
+
+        rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let removed = prune_energy_storage_2s(&pool, 10).await.unwrap();
+        assert!(removed > 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM EnergyStorage").await,
+            RAW_ENERGY_RETENTION_DAYS
+        );
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM StorageDaily").await, 20);
+    }
+
+    #[tokio::test]
+    async fn pruning_respects_its_batch_cap() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.2.0.6").await;
+        seed_days(&pool, id, 20, "consumption").await;
+        rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        // One batch is far larger than this dataset, so a single batch clears the
+        // backlog; the point is that max_batches = 0 does nothing at all.
+        assert_eq!(prune_energy_2s(&pool, 0).await.unwrap(), 0);
+        assert!(prune_energy_2s(&pool, 1).await.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn minute_pruning_is_gated_on_the_daily_tier_and_respects_its_window() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.2.0.7").await;
+        let today = chrono::Local::now().date_naive();
+        // A day inside the minute window and one well outside it.
+        for back in [1_i64, MINUTE_RETENTION_DAYS + 10] {
+            let d = today - chrono::Duration::days(back);
+            sample(
+                &pool,
+                id,
+                &format!("{} 09:00:00", d.format("%Y-%m-%d")),
+                "consumption",
+                3600.0,
+            )
+            .await;
+        }
+
+        // Minute rows exist but the daily tier has not run: nothing may go.
+        rollup_energy_minute(
+            &pool,
+            id,
+            today - chrono::Duration::days(MINUTE_RETENTION_DAYS + 10),
+            NO_CUTOFF,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prune_energy_minute(&pool, 5).await.unwrap(), 0);
+
+        // With the whole pipeline run, the out-of-window day goes and the recent
+        // one stays.
+        rollup_history(&pool, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let before = count(&pool, "SELECT COUNT(*) FROM EnergyMinute").await;
+        let removed = prune_energy_minute(&pool, 5).await.unwrap();
+        assert!(removed > 0, "the old day should be dropped");
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM EnergyMinute").await,
+            before - removed as i64
+        );
+        // The daily total for the pruned day survives — that is the point.
+        let old_day = today - chrono::Duration::days(MINUTE_RETENTION_DAYS + 10);
+        let got = query_daily_energy(&pool, old_day, old_day).await.unwrap();
+        assert_eq!(got.len(), 1, "daily history must outlive the minute rows");
+        assert!((got[0].consumption_kwh - 0.001).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -1879,9 +2264,7 @@ mod tests {
         sample(&pool, id, "2026-05-10 08:00:00", "grid", -7200.0).await;
         sample(&pool, id, "2026-05-10 13:00:00", "grid", 10800.0).await;
 
-        rollup_energy_day(&pool, id, day("2026-05-10"))
-            .await
-            .unwrap();
+        roll_day(&pool, id, day("2026-05-10")).await;
 
         let got = query_daily_energy(&pool, day("2026-05-10"), day("2026-05-10"))
             .await
@@ -1902,9 +2285,7 @@ mod tests {
         sample(&pool, id, "2026-05-10 09:00:00", "consumption", 3600.0).await;
 
         for _ in 0..3 {
-            rollup_energy_day(&pool, id, day("2026-05-10"))
-                .await
-                .unwrap();
+            roll_day(&pool, id, day("2026-05-10")).await;
         }
 
         let got = query_daily_energy(&pool, day("2026-05-10"), day("2026-05-10"))
@@ -1928,12 +2309,8 @@ mod tests {
         sample(&pool, id, "2026-05-10 23:59:00", "consumption", 3600.0).await;
         sample(&pool, id, "2026-05-11 00:01:00", "consumption", 7200.0).await;
 
-        rollup_energy_day(&pool, id, day("2026-05-10"))
-            .await
-            .unwrap();
-        rollup_energy_day(&pool, id, day("2026-05-11"))
-            .await
-            .unwrap();
+        roll_day(&pool, id, day("2026-05-10")).await;
+        roll_day(&pool, id, day("2026-05-11")).await;
 
         let got = query_daily_energy(&pool, day("2026-05-10"), day("2026-05-11"))
             .await
@@ -1949,9 +2326,7 @@ mod tests {
         let id = device(&pool, "10.0.0.4").await;
         sample(&pool, id, "2026-05-10 09:00:00", "consumption", 3600.0).await;
 
-        rollup_energy_day(&pool, id, day("2026-05-09"))
-            .await
-            .unwrap();
+        roll_day(&pool, id, day("2026-05-09")).await;
 
         // A day the device was offline stays absent, rather than being recorded
         // as a day of zero usage.
@@ -1972,8 +2347,8 @@ mod tests {
         sample(&pool, a, "2026-05-12 09:00:00", "consumption", 3600.0).await;
 
         for d in ["2026-05-10", "2026-05-11", "2026-05-12"] {
-            rollup_energy_day(&pool, a, day(d)).await.unwrap();
-            rollup_energy_day(&pool, b, day(d)).await.unwrap();
+            roll_day(&pool, a, day(d)).await;
+            roll_day(&pool, b, day(d)).await;
         }
 
         let got = query_daily_energy(&pool, day("2026-05-10"), day("2026-05-12"))

@@ -159,11 +159,41 @@ Device discovery, polling and storage all run as background tasks alongside the 
 leaving the app running is what collects data. There is no separate headless mode.
 
 State lives in `db.sqlite` in the working directory: discovered devices and their credentials,
-measurement history, per-day energy rollups, and application settings such as the chosen theme (in
+measurement history at several resolutions, and application settings such as the chosen theme (in
 the `Config` table).
 
-Note that the measurement series is never pruned, so the database grows steadily — roughly a
-gigabyte per month of continuous recording with a battery and a few switches.
+### How long measurements are kept
+
+Energy is stored at three resolutions, each retained for progressively longer:
+
+| Resolution | Retained | Why |
+|---|---|---|
+| 2 seconds | 4 days | What devices actually report. Serves the "today" views, and is the source the coarser tiers are built from. |
+| 1 minute | 90 days | The finest resolution anything displays. Summing 2-second energies into a minute is exactly lossless for totals. |
+| 1 day | forever | What the Statistics view reads. Tiny — a few thousand rows a year. |
+
+Battery state of charge is summarised to a daily min/max/average on the same schedule.
+
+This matters because the 2-second series is large: a month of it is millions of rows, and keeping it
+indefinitely grew the database by roughly a gigabyte a month while storing about thirty times the
+resolution anything renders. Rolled up and pruned, the database settles at a few hundred megabytes
+and stays roughly flat.
+
+Rolling up and pruning happen in the background, and pruning refuses to drop any day the next tier
+up has not yet summarised — so a rollup problem can never turn into lost history. Peak power per
+minute is recorded before the raw samples go, since that is the one figure a coarser tier cannot
+reconstruct.
+
+**Reclaiming the space is a manual step.** SQLite's `DELETE` returns pages to an internal free list
+rather than shrinking the file, so after the first prune the file will be no smaller (briefly
+larger). To actually reclaim it, stop Dom and run:
+
+```bash
+sqlite3 db.sqlite "PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"
+```
+
+On a measured 13-day sample this took the file from 338 MB to 108 MB in about 7 seconds. `VACUUM`
+rewrites the whole database under an exclusive lock, which is why Dom has to be stopped for it.
 
 ## Platform Support
 
