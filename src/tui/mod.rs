@@ -512,11 +512,13 @@ async fn event_loop(
                             Event::Key(KeyEvent { code: KeyCode::Char('r' | 'R'), .. })
                                 if is_device_list_view(&app.view) =>
                             {
-                                if app.selected_device().is_some() {
-                                    let current = app
-                                        .selected_device()
-                                        .and_then(|d| d.label.clone())
-                                        .unwrap_or_default();
+                                // Cloned out of the immutable borrow before the
+                                // mutable writes below; also looks the selected
+                                // device up once rather than twice.
+                                if let Some(current) = app
+                                    .selected_device()
+                                    .map(|d| d.label.clone().unwrap_or_default())
+                                {
                                     app.rename_input = Some(current);
                                     app.focus = Focus::Detail;
                                     app.detail_row = 0;

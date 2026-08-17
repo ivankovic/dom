@@ -381,7 +381,7 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
                 // Skip a sample straddling a counter reset/reboot (new < old)
                 // rather than recording a bogus huge delta from wraparound.
                 if traffic.rx_byte >= prev.rx_byte && traffic.tx_byte >= prev.tx_byte {
-                    let t = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    let t = crate::devices::ts(chrono::Utc::now());
                     let _ = save_traffic_delta(
                         &pool,
                         device.id,
@@ -439,30 +439,13 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
             }
             PollOutcome::Disconnected { error } => {
                 failures = failures.saturating_add(1);
-                // First tick gone Lost: check whether a fingerprint match moved
-                // this device to a new address (see db::upsert_device). If so, a
-                // fresh loop is already running there — stop chasing the old one
-                // rather than failing forever and leaving a dead entry in the UI.
-                if failures == 4
-                    && crate::db::device_moved(&pool, device.id, device.ip)
-                        .await
-                        .unwrap_or(false)
+                if crate::devices::handle_poll_failure(
+                    &pool, &state, device.id, device.ip, failures, error,
+                )
+                .await
                 {
-                    let mut app = state.write().unwrap();
-                    app.conn_status.remove(&device.ip);
-                    app.last_error.remove(&device.ip);
-                    app.mikrotik_readings.remove(&device.ip);
-                    app.polled_ips.remove(&device.ip);
                     return;
                 }
-                let status = if failures <= 3 {
-                    ConnStatus::Connecting
-                } else {
-                    ConnStatus::Lost
-                };
-                let mut app = state.write().unwrap();
-                app.conn_status.insert(device.ip, status);
-                app.last_error.insert(device.ip, error);
             }
         }
     }

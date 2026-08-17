@@ -331,9 +331,10 @@ pub async fn query_recent_network_status_events(
             continue;
         };
         let ts_str: String = row.get("timestamp");
-        let Some(at) = chrono::NaiveDateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S")
-            .ok()
-            .map(|ndt| ndt.and_utc())
+        let Some(at) =
+            chrono::NaiveDateTime::parse_from_str(&ts_str, crate::devices::DB_TIMESTAMP_FMT)
+                .ok()
+                .map(|ndt| ndt.and_utc())
         else {
             continue;
         };

@@ -417,7 +417,7 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
                         .clone()
                         .or_else(|| lease.host_name.clone())
                         .filter(|s| !s.is_empty());
-                    label.and_then(|l| lease.address.parse().ok().map(|ip| (ip, l)))
+                    lease.address.parse().ok().zip(label)
                 })
                 .collect()
         };
@@ -431,19 +431,8 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
             let mut new_devices: Vec<app::ScannedDevice> = fps
                 .iter()
                 .map(|fp| {
-                    let latency_ms = devs
-                        .iter()
-                        .find(|d| d.ip == fp.ip)
-                        .map(|d| d.latency_ms)
-                        .unwrap_or(0.0);
-                    // Preserve label from any existing device (polled or not), or from DB,
-                    // or from DHCP lease comment/host-name
-                    let label = all_existing_devices
-                        .iter()
-                        .find(|d| d.ip == fp.ip)
-                        .and_then(|d| d.label.clone())
-                        .or_else(|| db_labels.get(&fp.ip).and_then(|l| l.clone()))
-                        .or_else(|| dhcp_info.get(&fp.ip).cloned());
+                    let latency_ms = latency_for(fp.ip, &devs);
+                    let label = resolve_label(fp.ip, &all_existing_devices, &db_labels, &dhcp_info);
                     app::ScannedDevice {
                         ip: fp.ip,
                         latency_ms,
@@ -470,19 +459,9 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
             let local_ips = devices::dom_local::detect_local_ips();
             for local_ip in local_ips {
                 if !new_devices.iter().any(|d| d.ip == local_ip) {
-                    let latency_ms = devs
-                        .iter()
-                        .find(|d| d.ip == local_ip)
-                        .map(|d| d.latency_ms)
-                        .unwrap_or(0.0);
-                    // Preserve label from any existing device (polled or not), or from DB,
-                    // or from DHCP lease comment/host-name
-                    let label = all_existing_devices
-                        .iter()
-                        .find(|d| d.ip == local_ip)
-                        .and_then(|d| d.label.clone())
-                        .or_else(|| db_labels.get(&local_ip).and_then(|l| l.clone()))
-                        .or_else(|| dhcp_info.get(&local_ip).cloned());
+                    let latency_ms = latency_for(local_ip, &devs);
+                    let label =
+                        resolve_label(local_ip, &all_existing_devices, &db_labels, &dhcp_info);
                     new_devices.push(app::ScannedDevice {
                         ip: local_ip,
                         latency_ms,
@@ -515,6 +494,35 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
 
         record_network_status_transitions(&state, &pool).await;
     }
+}
+
+/// Best-known display label for `ip`, in precedence order: a label already
+/// attached to the device in memory (which is where a user's own rename lands),
+/// then one persisted in the DB, then the router's DHCP lease comment or
+/// host-name. A user-assigned label therefore always wins over anything
+/// auto-derived from the network.
+fn resolve_label(
+    ip: IpAddr,
+    existing: &[app::ScannedDevice],
+    db_labels: &HashMap<IpAddr, Option<String>>,
+    dhcp_info: &HashMap<IpAddr, String>,
+) -> Option<String> {
+    existing
+        .iter()
+        .find(|d| d.ip == ip)
+        .and_then(|d| d.label.clone())
+        .or_else(|| db_labels.get(&ip).and_then(|l| l.clone()))
+        .or_else(|| dhcp_info.get(&ip).cloned())
+}
+
+/// Latency measured for `ip` in the most recent ping scan, or 0.0 when this
+/// scan has none — a device discovered only through a DHCP lease (e.g. one
+/// behind AP client isolation that never answers ICMP) has no measurement.
+fn latency_for(ip: IpAddr, devs: &[devices::Device]) -> f64 {
+    devs.iter()
+        .find(|d| d.ip == ip)
+        .map(|d| d.latency_ms)
+        .unwrap_or(0.0)
 }
 
 /// Compares each network-infrastructure device's current status against its

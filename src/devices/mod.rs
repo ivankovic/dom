@@ -29,10 +29,14 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use if_addrs::{IfAddr, get_if_addrs};
 use rand::random;
+use sqlx::SqlitePool;
 use surge_ping::{Client, Config, IcmpPacket, PingIdentifier, PingSequence};
 use tokio::task::JoinSet;
+
+use crate::app::{ConnStatus, SharedState};
 
 // surge-ping's Client::clone shares an `alive` flag; when any clone is dropped
 // it marks the client destroyed, killing all in-flight pings. Use Arc<Client>
@@ -65,6 +69,67 @@ const TIMEOUT: Duration = Duration::from_millis(500);
 pub struct Device {
     pub ip: IpAddr,
     pub latency_ms: f64,
+}
+
+/// Format for every value written to a DB `timestamp` column.
+///
+/// Shared rather than repeated per device type because `db::load_*` parses
+/// these strings back with this same format: a device type formatting its
+/// timestamps even slightly differently would not fail at write time, it would
+/// silently fail to parse on read.
+pub const DB_TIMESTAMP_FMT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// Formats an instant for a DB `timestamp` column. See `DB_TIMESTAMP_FMT`.
+pub fn ts(dt: DateTime<Utc>) -> String {
+    dt.format(DB_TIMESTAMP_FMT).to_string()
+}
+
+/// Consecutive poll failures tolerated before a device is reported `Lost`.
+/// Up to and including this many failures the device shows as `Connecting`,
+/// which keeps a single dropped packet or a device rebooting from flapping the
+/// UI. Mirrored in `ConnStatus::Lost`'s documentation.
+const LOST_AFTER_FAILURES: u8 = 3;
+
+/// Shared failure handling for every device poll loop.
+///
+/// Returns `true` when the caller should stop polling and return: its device
+/// has moved to a different address and a loop for the new address is already
+/// running. Returns `false` when the caller should keep polling, having
+/// recorded the failure for display.
+///
+/// Every device type's poll loop had its own byte-identical copy of this,
+/// differing only in which readings map it cleared — now handled uniformly by
+/// `App::forget_device`.
+pub async fn handle_poll_failure(
+    pool: &SqlitePool,
+    state: &SharedState,
+    device_id: i64,
+    ip: IpAddr,
+    failures: u8,
+    error: String,
+) -> bool {
+    // Checked only on the single tick the device transitions to Lost, not on
+    // every failed tick: whether a fingerprint match moved this device to a
+    // new address (see db::upsert_device). Re-checking every tick would cost
+    // one extra query per device per poll interval for no benefit.
+    if failures == LOST_AFTER_FAILURES + 1
+        && crate::db::device_moved(pool, device_id, ip)
+            .await
+            .unwrap_or(false)
+    {
+        state.write().unwrap().forget_device(&ip);
+        return true;
+    }
+
+    let status = if failures <= LOST_AFTER_FAILURES {
+        ConnStatus::Connecting
+    } else {
+        ConnStatus::Lost
+    };
+    let mut app = state.write().unwrap();
+    app.conn_status.insert(ip, status);
+    app.last_error.insert(ip, error);
+    false
 }
 
 /// Result of a ping scan - includes both successful and failed attempts.
@@ -102,12 +167,6 @@ pub async fn scan_all_networks() -> Result<PingScanResult, std::io::Error> {
     result.failed.extend(phase2_result.failed);
 
     Ok(result)
-}
-
-/// Legacy wrapper for backwards compatibility
-pub async fn scan_all_networks_legacy() -> Result<Vec<Device>, std::io::Error> {
-    let result = scan_all_networks().await?;
-    Ok(result.successful)
 }
 
 async fn ping_batch_with_failures(ips: Vec<Ipv4Addr>) -> Result<PingScanResult, std::io::Error> {
@@ -258,8 +317,6 @@ pub async fn ping_device_multi(
     ip: IpAddr,
     count: u8,
 ) -> Option<(f64, usize, usize)> {
-    use std::time::Duration;
-
     let count = count.max(1) as usize;
     let mut latencies: Vec<f64> = Vec::with_capacity(count);
     let mut successes: usize = 0;
@@ -327,5 +384,163 @@ mod tests {
     fn parse_arp_cache_handles_empty_input() {
         assert!(parse_arp_cache("").is_empty());
         assert!(parse_arp_cache("IP address HW type Flags HW address Mask Device\n").is_empty());
+    }
+
+    // ── handle_poll_failure ───────────────────────────────────────────────────
+    //
+    // All four device poll loops route their error path through this function,
+    // so its exit decision is what keeps a migrated device from lingering in
+    // the UI forever — and what keeps a merely-offline device from being
+    // abandoned. Exercised against a real in-memory SQLite schema rather than a
+    // fake, per the no-mocks rule.
+
+    use crate::app::{SwitchReading, new_shared};
+
+    const IP_A: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 16, 20, 21));
+    const IP_B: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 16, 20, 22));
+
+    /// In-memory DB holding one myStrom device at `ip`; returns (pool, id).
+    async fn db_with_device(ip: IpAddr) -> (SqlitePool, i64) {
+        let pool = crate::db::init("sqlite://:memory:").await.unwrap();
+        crate::db::upsert_device(&pool, "mystrom_switch", "test", ip, 2, None)
+            .await
+            .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM Devices WHERE ip = ?")
+            .bind(ip.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        (pool, id)
+    }
+
+    /// Live state as a poll loop would have left it after a successful poll.
+    fn state_polling(ip: IpAddr) -> SharedState {
+        let state = new_shared();
+        {
+            let mut app = state.write().unwrap();
+            app.polled_ips.insert(ip);
+            app.conn_status.insert(ip, ConnStatus::Online);
+            app.switch_readings.insert(
+                ip,
+                SwitchReading {
+                    power_w: 1.0,
+                    relay_on: true,
+                    temperature_c: 20.0,
+                    updated_at: Utc::now(),
+                },
+            );
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn poll_failure_below_the_threshold_reports_connecting_and_keeps_polling() {
+        let (pool, id) = db_with_device(IP_A).await;
+        let state = state_polling(IP_A);
+
+        let exit = handle_poll_failure(
+            &pool,
+            &state,
+            id,
+            IP_A,
+            LOST_AFTER_FAILURES,
+            "boom".to_string(),
+        )
+        .await;
+
+        assert!(!exit, "must keep polling below the Lost threshold");
+        let app = state.read().unwrap();
+        assert!(matches!(
+            app.conn_status.get(&IP_A),
+            Some(ConnStatus::Connecting)
+        ));
+        assert_eq!(app.last_error.get(&IP_A).map(String::as_str), Some("boom"));
+        // Still ours to poll, and the last good reading stays on screen.
+        assert!(app.polled_ips.contains(&IP_A));
+        assert!(app.switch_readings.contains_key(&IP_A));
+    }
+
+    #[tokio::test]
+    async fn poll_failure_past_the_threshold_reports_lost_when_the_device_has_not_moved() {
+        let (pool, id) = db_with_device(IP_A).await;
+        let state = state_polling(IP_A);
+
+        // The DB still has this device at the address we are polling: it is
+        // simply down, so the loop must stay alive waiting for it to return.
+        let exit = handle_poll_failure(
+            &pool,
+            &state,
+            id,
+            IP_A,
+            LOST_AFTER_FAILURES + 1,
+            "boom".to_string(),
+        )
+        .await;
+
+        assert!(!exit, "an offline device must not be abandoned");
+        let app = state.read().unwrap();
+        assert!(matches!(app.conn_status.get(&IP_A), Some(ConnStatus::Lost)));
+        assert!(app.polled_ips.contains(&IP_A));
+    }
+
+    #[tokio::test]
+    async fn poll_failure_exits_and_forgets_the_address_once_the_device_has_moved() {
+        let (pool, id) = db_with_device(IP_A).await;
+        let state = state_polling(IP_A);
+
+        // Discovery matched this device's fingerprint at a new address and
+        // migrated the row in place; a fresh loop is already running for IP_B.
+        sqlx::query("UPDATE Devices SET ip = ? WHERE id = ?")
+            .bind(IP_B.to_string())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let exit = handle_poll_failure(
+            &pool,
+            &state,
+            id,
+            IP_A,
+            LOST_AFTER_FAILURES + 1,
+            "boom".to_string(),
+        )
+        .await;
+
+        assert!(exit, "the loop for the stale address must exit");
+        let app = state.read().unwrap();
+        // The dead address disappears from the UI entirely rather than
+        // remaining as a permanently-Lost row.
+        assert!(!app.conn_status.contains_key(&IP_A));
+        assert!(!app.last_error.contains_key(&IP_A));
+        assert!(!app.switch_readings.contains_key(&IP_A));
+        assert!(!app.polled_ips.contains(&IP_A));
+    }
+
+    #[tokio::test]
+    async fn poll_failure_exits_when_the_device_row_is_gone() {
+        let (pool, id) = db_with_device(IP_A).await;
+        let state = state_polling(IP_A);
+
+        // A deleted device is "moved" as far as device_moved is concerned;
+        // either way there is nothing left to poll.
+        sqlx::query("DELETE FROM Devices WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let exit = handle_poll_failure(
+            &pool,
+            &state,
+            id,
+            IP_A,
+            LOST_AFTER_FAILURES + 1,
+            "boom".to_string(),
+        )
+        .await;
+
+        assert!(exit);
+        assert!(!state.read().unwrap().polled_ips.contains(&IP_A));
     }
 }

@@ -30,6 +30,7 @@ use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::app::{ConnStatus, SharedState, SwitchReading};
+use crate::devices::ts;
 use crate::fingerprint::Fingerprint;
 
 pub const NAME: &str = "myStrom WiFi Switch";
@@ -91,8 +92,15 @@ pub async fn fetch_report(ip: IpAddr, port: u16) -> anyhow::Result<Report> {
         .context("read timeout")?
         .context("read failed")?;
 
-    let raw = String::from_utf8_lossy(&buf);
-    let body = raw.split("\r\n\r\n").nth(1).unwrap_or(&raw);
+    parse_report(&String::from_utf8_lossy(&buf))
+}
+
+/// Splits an HTTP response at the header/body separator and parses the body as
+/// a `Report`. Kept separate from `fetch_report` so the response-shape handling
+/// is testable without a socket. A payload with no separator is treated as a
+/// bare body, so a device answering with just JSON still parses.
+fn parse_report(raw: &str) -> anyhow::Result<Report> {
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or(raw);
     serde_json::from_str(body.trim()).context("parse JSON")
 }
 
@@ -152,10 +160,6 @@ pub async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<DeviceRecord>> {
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
-
-fn ts(dt: DateTime<Utc>) -> String {
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
-}
 
 async fn save_raw(pool: &SqlitePool, device_id: i64, t: &str, r: &Report) -> anyhow::Result<()> {
     for (metric, value) in [("power", r.power), ("temperature", r.temperature)] {
@@ -238,31 +242,87 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
             }
             Err(e) => {
                 failures = failures.saturating_add(1);
-                // First tick gone Lost: check whether a fingerprint match moved
-                // this device to a new address (see db::upsert_device). If so, a
-                // fresh loop is already running there — stop chasing the old one
-                // rather than failing forever and leaving a dead entry in the UI.
-                if failures == 4
-                    && crate::db::device_moved(&pool, device.id, device.ip)
-                        .await
-                        .unwrap_or(false)
+                if crate::devices::handle_poll_failure(
+                    &pool,
+                    &state,
+                    device.id,
+                    device.ip,
+                    failures,
+                    format!("{e:#}"),
+                )
+                .await
                 {
-                    let mut app = state.write().unwrap();
-                    app.conn_status.remove(&device.ip);
-                    app.last_error.remove(&device.ip);
-                    app.switch_readings.remove(&device.ip);
-                    app.polled_ips.remove(&device.ip);
                     return;
                 }
-                let status = if failures <= 3 {
-                    ConnStatus::Connecting
-                } else {
-                    ConnStatus::Lost
-                };
-                let mut app = state.write().unwrap();
-                app.conn_status.insert(device.ip, status);
-                app.last_error.insert(device.ip, format!("{e:#}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprint::HttpProbe;
+
+    fn fp(ports: Vec<u16>, probes: Vec<(&str, &str)>) -> Fingerprint {
+        Fingerprint {
+            ip: IpAddr::from([172, 16, 20, 7]),
+            open_ports: ports,
+            http: probes
+                .into_iter()
+                .map(|(url, raw)| HttpProbe {
+                    port: 80,
+                    url: url.to_string(),
+                    raw: raw.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    const REPORT_BODY: &str = r#"{"power":42.5,"relay":true,"temperature":21.5}"#;
+
+    #[test]
+    fn detect_accepts_a_report_containing_the_relay_field() {
+        assert!(detect(&fp(vec![80], vec![("/report", REPORT_BODY)])));
+    }
+
+    #[test]
+    fn detect_requires_port_80() {
+        // Same telltale body, but the port isn't open: not a myStrom switch.
+        assert!(!detect(&fp(vec![8080], vec![("/report", REPORT_BODY)])));
+    }
+
+    #[test]
+    fn detect_requires_the_relay_field_on_the_report_path() {
+        // "relay" seen on some other path doesn't count.
+        assert!(!detect(&fp(vec![80], vec![("/", REPORT_BODY)])));
+        // /report present but without the telltale field (e.g. another
+        // device's 404 page, or a device exposing power only).
+        assert!(!detect(&fp(
+            vec![80],
+            vec![("/report", r#"{"power":1.0}"#)]
+        )));
+        assert!(!detect(&fp(vec![80], vec![])));
+    }
+
+    #[test]
+    fn parse_report_reads_the_body_after_the_header_separator() {
+        let raw = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{REPORT_BODY}");
+        let r = parse_report(&raw).unwrap();
+        assert_eq!(r.power, 42.5);
+        assert!(r.relay);
+        assert_eq!(r.temperature, 21.5);
+    }
+
+    #[test]
+    fn parse_report_accepts_a_bare_body_with_no_headers() {
+        let r = parse_report(REPORT_BODY).unwrap();
+        assert_eq!(r.power, 42.5);
+    }
+
+    #[test]
+    fn parse_report_errors_on_a_non_json_payload() {
+        assert!(parse_report("HTTP/1.1 404 Not Found\r\n\r\n<html>nope</html>").is_err());
+        assert!(parse_report("").is_err());
     }
 }

@@ -222,3 +222,96 @@ async fn http_get(ip: IpAddr, port: u16, path: &str) -> Option<String> {
 
     (!response.is_empty()).then(|| String::from_utf8_lossy(&response).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 20, 5));
+
+    #[test]
+    fn status_code_reads_the_status_line() {
+        assert_eq!(
+            status_code("HTTP/1.1 301 Moved Permanently\r\nLocation: /x\r\n\r\n"),
+            Some(301)
+        );
+        assert_eq!(status_code("HTTP/1.0 200 OK\r\n\r\nbody"), Some(200));
+    }
+
+    #[test]
+    fn status_code_is_none_for_non_http_payloads() {
+        // A device answering port 80 with something that isn't HTTP must not be
+        // mistaken for a redirect.
+        assert_eq!(status_code(""), None);
+        assert_eq!(status_code("garbage"), None);
+        assert_eq!(status_code("HTTP/1.1 notanumber OK"), None);
+    }
+
+    #[test]
+    fn extract_location_is_case_insensitive_and_trims() {
+        assert_eq!(
+            extract_location("HTTP/1.1 301\r\nLocation:  /admin/  \r\n\r\n").as_deref(),
+            Some("/admin/")
+        );
+        assert_eq!(
+            extract_location("HTTP/1.1 301\r\nlocation: /a\r\n\r\n").as_deref(),
+            Some("/a")
+        );
+        assert_eq!(
+            extract_location("HTTP/1.1 301\r\nLOCATION: /b\r\n\r\n").as_deref(),
+            Some("/b")
+        );
+    }
+
+    #[test]
+    fn extract_location_is_none_when_absent_or_empty() {
+        assert_eq!(extract_location("HTTP/1.1 200 OK\r\n\r\nbody"), None);
+        // Header present but with no value: nothing to redirect to.
+        assert_eq!(extract_location("HTTP/1.1 301\r\nLocation:\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn resolve_redirect_handles_relative_paths() {
+        assert_eq!(
+            resolve_redirect("/admin/login", IP, 8080),
+            Some((IP, 8080, "/admin/login".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_parses_absolute_urls_with_and_without_ports() {
+        assert_eq!(
+            resolve_redirect("http://172.16.20.9:8080/a", IP, 80),
+            Some(("172.16.20.9".parse().unwrap(), 8080, "/a".to_string()))
+        );
+        // No port given: HTTP default, not the port we were probing.
+        assert_eq!(
+            resolve_redirect("http://172.16.20.9/a", IP, 8080),
+            Some(("172.16.20.9".parse().unwrap(), 80, "/a".to_string()))
+        );
+        // Authority with no trailing slash still yields a root path.
+        assert_eq!(
+            resolve_redirect("http://172.16.20.9", IP, 8080),
+            Some(("172.16.20.9".parse().unwrap(), 80, "/".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_falls_back_to_the_probed_ip_for_hostnames() {
+        // Local devices commonly redirect to a .local/.lan name we can't
+        // resolve; we already know the address, so keep probing it.
+        assert_eq!(
+            resolve_redirect("http://router.local/login", IP, 80),
+            Some((IP, 80, "/login".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_rejects_https_and_unknown_schemes() {
+        // No TLS support, so an https redirect is a dead end rather than
+        // something to retry as plaintext.
+        assert_eq!(resolve_redirect("https://172.16.20.9/a", IP, 80), None);
+        assert_eq!(resolve_redirect("ftp://172.16.20.9/a", IP, 80), None);
+        assert_eq!(resolve_redirect("", IP, 80), None);
+    }
+}

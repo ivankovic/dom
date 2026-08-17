@@ -66,6 +66,45 @@ exits — a fresh loop for the new address is already running, spawned by the di
 performed the migration. This is what makes the dead IP actually disappear from the UI, rather
 than merely stopping it from accumulating new duplicate rows going forward.
 
+### Shared poll-failure handling (2026-08-17)
+
+The per-device poll-loop cleanup described above was originally implemented four
+times — once in each of the KEBA, MikroTik, Sonnen and myStrom poll loops — as
+blocks that were identical except for which readings map they cleared. Every
+change to the failure policy therefore had to be made in four places, and the
+KEBA copy had already drifted (it cleared two maps where the others cleared one).
+
+Consolidated into `devices::handle_poll_failure`, which owns the whole error
+path: increment-to-`Lost` transition, the one-shot `db::device_moved` check on
+the tick the device goes `Lost`, and recording the failure for display. It
+returns a bool rather than taking a callback, so each loop still decides
+literally whether to `return` — control flow stays visible at the call site.
+
+State cleanup moved to `App::forget_device`, which clears *all* per-type readings
+maps rather than only the caller's. An IP hosts exactly one device, so the extra
+removals are no-ops; doing it uniformly means adding a new device type cannot
+leave a stale row on screen by forgetting to extend one caller. (It deliberately
+does not clear every `HashMap<IpAddr, _>` on `App` — see REVIEW.md.)
+
+The `failures == 4` / `failures <= 3` literals became a single
+`LOST_AFTER_FAILURES` constant, which makes the relationship between the two
+explicit: the migration check fires on exactly the tick the device transitions
+to `Lost`, not before and not repeatedly.
+
+### Single DB timestamp format (2026-08-17)
+
+`"%Y-%m-%d %H:%M:%S"` was written out in five places: a private `ts` helper
+duplicated verbatim in three device modules, an inline `format` call in the
+MikroTik loop, and the `parse_from_str` in `db.rs` that reads those values back.
+
+A device type formatting its timestamps differently would not fail on write —
+the columns are `TEXT` — it would silently fail to parse on read. Write and read
+now share one `devices::DB_TIMESTAMP_FMT` constant and one `devices::ts` helper,
+so the two halves cannot drift apart.
+
+The display timestamp in `tui/render.rs` deliberately still formats its own
+string: it uses `Local::now()` for the user's benefit and is not a DB value.
+
 ### One-time backfill (2026-08-14)
 
 The KEBA duplicate already present in the live database (id 3256 at the old IP, holding

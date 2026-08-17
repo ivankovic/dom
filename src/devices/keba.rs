@@ -29,6 +29,7 @@ use tokio::net::UdpSocket;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::app::{ConnStatus, KebaReading, SharedState};
+use crate::devices::ts;
 use crate::fingerprint::Fingerprint;
 
 pub const NAME: &str = "KEBA Wallbox";
@@ -307,10 +308,6 @@ pub async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<DeviceRecord>> {
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
-fn ts(dt: DateTime<Utc>) -> String {
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
 async fn save_raw(pool: &SqlitePool, device_id: i64, t: &str, power_w: f64) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO RawDeviceMeasurements (device_id, timestamp, metric, value)
@@ -434,31 +431,18 @@ pub async fn poll_loop(
             }
             Err(e) => {
                 failures = failures.saturating_add(1);
-                // First tick gone Lost: check whether a fingerprint match moved
-                // this device to a new address (see db::upsert_device). If so, a
-                // fresh loop is already running there — stop chasing the old one
-                // rather than failing forever and leaving a dead entry in the UI.
-                if failures == 4
-                    && crate::db::device_moved(&pool, device.id, device.ip)
-                        .await
-                        .unwrap_or(false)
+                if crate::devices::handle_poll_failure(
+                    &pool,
+                    &state,
+                    device.id,
+                    device.ip,
+                    failures,
+                    format!("{e:#}"),
+                )
+                .await
                 {
-                    let mut app = state.write().unwrap();
-                    app.conn_status.remove(&device.ip);
-                    app.last_error.remove(&device.ip);
-                    app.keba_readings.remove(&device.ip);
-                    app.keba_modes.remove(&device.ip);
-                    app.polled_ips.remove(&device.ip);
                     return;
                 }
-                let status = if failures <= 3 {
-                    ConnStatus::Connecting
-                } else {
-                    ConnStatus::Lost
-                };
-                let mut app = state.write().unwrap();
-                app.conn_status.insert(device.ip, status);
-                app.last_error.insert(device.ip, format!("{e:#}"));
             }
         }
     }

@@ -30,6 +30,7 @@ use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::app::{ConnStatus, LiveReading, SharedState};
+use crate::devices::ts;
 use crate::fingerprint::Fingerprint;
 
 pub const NAME: &str = "Sonnen Eco 8 Battery";
@@ -151,10 +152,6 @@ pub async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<DeviceRecord>> {
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
-
-fn ts(dt: DateTime<Utc>) -> String {
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
-}
 
 async fn save_raw(pool: &SqlitePool, device_id: i64, t: &str, r: &Reading) -> anyhow::Result<()> {
     for (metric, value) in [
@@ -279,31 +276,62 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
             }
             Err(e) => {
                 failures = failures.saturating_add(1);
-                // First tick gone Lost: check whether a fingerprint match moved
-                // this device to a new address (see db::upsert_device). If so, a
-                // fresh loop is already running there — stop chasing the old one
-                // rather than failing forever and leaving a dead entry in the UI.
-                if failures == 4
-                    && crate::db::device_moved(&pool, device.id, device.ip)
-                        .await
-                        .unwrap_or(false)
+                if crate::devices::handle_poll_failure(
+                    &pool,
+                    &state,
+                    device.id,
+                    device.ip,
+                    failures,
+                    format!("{e:#}"),
+                )
+                .await
                 {
-                    let mut app = state.write().unwrap();
-                    app.conn_status.remove(&device.ip);
-                    app.last_error.remove(&device.ip);
-                    app.readings.remove(&device.ip);
-                    app.polled_ips.remove(&device.ip);
                     return;
                 }
-                let status = if failures <= 3 {
-                    ConnStatus::Connecting
-                } else {
-                    ConnStatus::Lost
-                };
-                let mut app = state.write().unwrap();
-                app.conn_status.insert(device.ip, status);
-                app.last_error.insert(device.ip, format!("{e:#}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprint::HttpProbe;
+
+    fn fp(ports: Vec<u16>, raws: Vec<&str>) -> Fingerprint {
+        Fingerprint {
+            ip: IpAddr::from([172, 16, 20, 8]),
+            open_ports: ports,
+            http: raws
+                .into_iter()
+                .map(|raw| HttpProbe {
+                    port: 8080,
+                    url: "/".to_string(),
+                    raw: raw.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    const VENDOR_PAGE: &str = "<html><a href=\"https://sonnenbatterie.de\">Sonnen</a></html>";
+
+    #[test]
+    fn detect_accepts_vendor_marker_with_both_ports_open() {
+        assert!(detect(&fp(vec![8080, 8883], vec![VENDOR_PAGE])));
+    }
+
+    #[test]
+    fn detect_requires_both_ports() {
+        // The MQTT port (8883) alongside the API port (8080) is what separates a
+        // Sonnen from any other device serving a page that mentions the vendor.
+        assert!(!detect(&fp(vec![8080], vec![VENDOR_PAGE])));
+        assert!(!detect(&fp(vec![8883], vec![VENDOR_PAGE])));
+        assert!(!detect(&fp(vec![], vec![VENDOR_PAGE])));
+    }
+
+    #[test]
+    fn detect_requires_the_vendor_marker() {
+        assert!(!detect(&fp(vec![8080, 8883], vec!["<html>generic</html>"])));
+        assert!(!detect(&fp(vec![8080, 8883], vec![])));
     }
 }

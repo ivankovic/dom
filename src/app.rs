@@ -372,6 +372,29 @@ pub struct App {
 }
 
 impl App {
+    /// Drops every trace of the device at `ip` from the live in-memory state.
+    ///
+    /// Called by a poll loop that has discovered its device migrated to a new
+    /// address (see `db::upsert_device`): a fresh loop for the new address is
+    /// already running, so the old address must disappear from the UI rather
+    /// than linger as a permanently-`Lost` row.
+    ///
+    /// Clears *every* per-IP readings map, not just the one belonging to the
+    /// calling device's type. An IP hosts exactly one device, so the other
+    /// removals are no-ops — and doing it uniformly means a readings map added
+    /// later can't be forgotten in one of the callers and leave a stale row on
+    /// screen.
+    pub fn forget_device(&mut self, ip: &IpAddr) {
+        self.conn_status.remove(ip);
+        self.last_error.remove(ip);
+        self.readings.remove(ip);
+        self.switch_readings.remove(ip);
+        self.mikrotik_readings.remove(ip);
+        self.keba_readings.remove(ip);
+        self.keba_modes.remove(ip);
+        self.polled_ips.remove(ip);
+    }
+
     /// Live status for a network-infrastructure device: prefers ping-history
     /// (covers latency/packet-loss). If this device has no ping-history entry
     /// because ping-scanning itself is currently broken (`last_scan_error` is
