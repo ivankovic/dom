@@ -1,0 +1,137 @@
+{
+ "crs": {
+  "type": "name",
+  "properties": {
+   "name": "EPSG:2056"
+  }
+ },
+ "license": "https://www.meteoswiss.admin.ch/about-us/legal-basis.html",
+ "mapname": "ch.meteoschweiz.messwerte-lufttemperatur-10min",
+ "map_long_name": "Measurement values air temperature 2 m, 10 min mean",
+ "map_short_name": "Temperature 2 m, 10 min",
+ "map_abstract": "Current measurement values of Temperature 2 m, 10 min [\u00b0C]. Data is updated every 10 minutes. The data set contains all weather stations of the SwissMetNet, the automatic monitoring network of MeteoSwiss, which comprises 160 automatic monitoring stations. These stations deliver a multitude of current data on the weather and climate in Switzerland every ten minutes.",
+ "creation_time": "18.08.2026 18:15",
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     2771032.3,
+     1184823.0
+    ]
+   },
+   "id": "ARO",
+   "properties": {
+    "station_name": "Arosa",
+    "station_symbol": 1,
+    "value": 15.6,
+    "unit": "\u00b0C",
+    "reference_ts": "2026-08-18T16:10:00Z",
+    "altitude": "1880.00",
+    "measurement_height": "2.00 m"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     2717859.07,
+     1095840.02
+    ]
+   },
+   "id": "LUG",
+   "properties": {
+    "station_name": "Lugano",
+    "station_symbol": 1,
+    "value": 29.0,
+    "unit": "\u00b0C",
+    "reference_ts": "2026-08-18T16:10:00Z",
+    "altitude": "274.56",
+    "measurement_height": "2.00 m"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     2498483.43,
+     1122750.94
+    ]
+   },
+   "id": "GVE",
+   "properties": {
+    "station_name": "Gen\u00e8ve / Cointrin",
+    "station_symbol": 1,
+    "value": 29.9,
+    "unit": "\u00b0C",
+    "reference_ts": "2026-08-18T16:10:00Z",
+    "altitude": "417.53",
+    "measurement_height": "2.00 m"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     2682706.56,
+     1259335.6
+    ]
+   },
+   "id": "KLO",
+   "properties": {
+    "station_name": "Z\u00fcrich / Kloten",
+    "station_symbol": 1,
+    "value": 27.7,
+    "unit": "\u00b0C",
+    "reference_ts": "2026-08-18T16:10:00Z",
+    "altitude": "428.23",
+    "measurement_height": "2.00 m"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     2685230.68,
+     1248405.37
+    ]
+   },
+   "id": "SMA",
+   "properties": {
+    "station_name": "Z\u00fcrich / Fluntern",
+    "station_symbol": 1,
+    "value": 26.3,
+    "unit": "\u00b0C",
+    "reference_ts": "2026-08-18T16:10:00Z",
+    "altitude": "605.54",
+    "measurement_height": "2.00 m"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     2601929.13,
+     1204409.39
+    ]
+   },
+   "id": "BER",
+   "properties": {
+    "station_name": "Bern / Zollikofen",
+    "station_symbol": 1,
+    "value": 28.2,
+    "unit": "\u00b0C",
+    "reference_ts": "2026-08-18T16:10:00Z",
+    "altitude": "554.93",
+    "measurement_height": "2.00 m"
+   }
+  }
+ ]
+}

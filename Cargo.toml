@@ -41,6 +41,12 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 surge-ping = "0.9.0"
 futures = "0.3.32"
 
+# TLS for the two public APIs in src/online/. Only a TLS transport is pulled in —
+# the HTTP on top of it is hand-written, as it already is for LAN devices. "ring"
+# rather than the default aws-lc-rs provider so the build needs no cmake/nasm.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+
 [dev-dependencies]
 # Temporary file creation for tests
 tempfile = "3"

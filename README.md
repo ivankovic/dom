@@ -31,7 +31,7 @@ There are five views:
 - **Network** ('n'): routers, modems and access points, their health, and Internet traffic.
 - **Devices** ('d'): every device discovered on the network, configured or not, with a detail panel.
 - **Statistics** ('m'/'y'): long-term energy totals and self-sufficiency, by month or year.
-- **Environment** ('v'): device temperatures, live and as a daily range history.
+- **Environment** ('v'): outdoor temperature for your location, plus device temperatures.
 
 Security and Household are intended categories that are not implemented yet — no alarm, camera,
 smoke, vacuum or mower devices are supported, so there is nothing for those views to show and they
@@ -51,6 +51,7 @@ do not exist.
 | m | Statistics, monthly |
 | y | Statistics, yearly |
 | v | Environment view |
+| a | In Environment: set your location by address |
 | Left, Right | In Statistics: previous/next period |
 | s | Rescan now (wakes the ping scan and discovery immediately) |
 | r | Rename the selected device |
@@ -140,10 +141,32 @@ again.
 
 ## Environment view
 
-Temperatures reported by your devices, with the sensor list on top and a history chart below it for
-whichever sensor is selected (Up/Down to change).
+Outdoor temperature for your location on top, then the temperatures your own devices report, then a
+history chart for whichever sensor is selected (Up/Down to change).
 
-**These are device temperatures, not room temperatures.** The only hardware Dom supports that
+### Outdoor temperature
+
+Press 'a' and type an address — "Bundesplatz 3 Bern", or just a town. Dom resolves it with
+[swisstopo](https://api3.geo.admin.ch)'s federal search service and shows you what it matched, so you
+can retype if it picked the wrong thing. The location is remembered.
+
+The reading itself is the current 10-minute mean from the nearest station in SwissMetNet, MeteoSwiss's
+automatic monitoring network, refreshed every ten minutes.
+
+It is shown with the station's **name, altitude and distance** — because that qualifies it. A
+measurement taken 20 km away and 900 m higher up is not the temperature outside your door, and the
+view should not imply that it is. For Bern the nearest station is 5 km away at a near-identical
+altitude; in a mountain valley it may be much less representative.
+
+Readings are kept indefinitely at their ten-minute resolution: 144 rows a day is a few megabytes a
+decade, so unlike the energy series this one needs no rollup or pruning.
+
+If a fetch fails, the view says so rather than continuing to show the last number as though it were
+current. With no location set, nothing is ever fetched.
+
+### Device temperatures
+
+**The sensor readings are device temperatures, not room temperatures.** The only hardware Dom supports that
 reports one is the myStrom switch, and what it reports is its own case temperature — which tracks
 the appliance plugged into it more than the room it sits in. The view says so rather than presenting
 the figure as ambient.
@@ -217,6 +240,23 @@ sqlite3 db.sqlite "PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"
 
 On a measured 13-day sample this took the file from 338 MB to 108 MB in about 7 seconds. `VACUUM`
 rewrites the whole database under an exclusive lock, which is why Dom has to be stopped for it.
+
+## Online services
+
+Dom talks only to your own network, with two optional exceptions — both used solely by the
+Environment view, and neither contacted at all until you set a location:
+
+| Service | Used for | Data sent |
+|---|---|---|
+| [swisstopo SearchServer](https://api3.geo.admin.ch) | Turning an address into coordinates | The address you type, once, when you set it |
+| [MeteoSwiss Open Data](https://www.meteoswiss.admin.ch/services-and-publications/service/open-data.html) | Outdoor temperature | Nothing — it is a fixed nationwide file, fetched whole |
+
+Note the second column of the second row: the temperature file covers all of Switzerland, so Dom
+downloads the same document everyone else does and picks the nearest station locally. Your location is
+never sent to MeteoSwiss.
+
+Both are free federal services needing no account or API key. Weather data is MeteoSwiss Open
+Government Data — free of charge and reusable, including commercially, with the source attributed.
 
 ## Platform Support
 

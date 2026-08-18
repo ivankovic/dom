@@ -146,6 +146,18 @@ async fn event_loop(
                     Event::Key(KeyEvent { code: KeyCode::Char('d' | 'D'), .. })
                 );
 
+                // Address entry is modal: while it is open, Enter looks the address
+                // up and every other key edits the buffer.
+                let address_save: Option<String> = if is_enter {
+                    let app = state.read().unwrap();
+                    app.address_input
+                        .as_ref()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                } else {
+                    None
+                };
+
                 let (
                     timer_dialog_save,
                     rename_save,
@@ -289,7 +301,44 @@ async fn event_loop(
                     )
                 }; // read lock dropped here
 
-                if let Some((ip, time, relay_on)) = timer_dialog_save {
+                if let Some(address) = address_save {
+                    match crate::online::geocode::lookup(&address).await {
+                        Ok(place) => {
+                            let loc = crate::db::Location {
+                                label: place.label,
+                                east: place.east,
+                                north: place.north,
+                                latitude: place.latitude,
+                                longitude: place.longitude,
+                            };
+                            if let Err(e) = crate::db::set_location(pool, &loc).await {
+                                state.write().unwrap().last_weather_error =
+                                    Some(format!("saving the location failed: {e:#}"));
+                            } else {
+                                {
+                                    let mut app = state.write().unwrap();
+                                    app.location = Some(loc);
+                                    app.address_input = None;
+                                    app.last_weather_error = None;
+                                    // The previous location's reading is not this
+                                    // location's; clear it rather than leave a
+                                    // number that now means somewhere else.
+                                    app.outdoor = None;
+                                    app.outdoor_today = None;
+                                }
+                                // Fetch straight away, so a new address shows a
+                                // reading instead of waiting for the next tick.
+                                crate::online::weather::refresh(pool, state).await;
+                            }
+                        }
+                        Err(e) => {
+                            // Keep the typed text so it can be corrected rather
+                            // than retyped.
+                            state.write().unwrap().last_weather_error =
+                                Some(format!("could not find \"{address}\": {e:#}"));
+                        }
+                    }
+                } else if let Some((ip, time, relay_on)) = timer_dialog_save {
                     if let Ok(id) = crate::db::add_switch_timer(pool, ip, &time, relay_on).await {
                         let mut app = state.write().unwrap();
                         let entry = app.switch_timers.entry(ip).or_default();
@@ -407,6 +456,33 @@ async fn event_loop(
                             }
                             _ => {}
                         }
+                    } else if app.address_input.is_some() {
+                        match event {
+                            Event::Key(KeyEvent {
+                                code: KeyCode::Char('c'),
+                                modifiers: KeyModifiers::CONTROL,
+                                ..
+                            }) => break,
+                            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
+                                app.address_input = None;
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+                                if let Some(buf) = app.address_input.as_mut() {
+                                    buf.pop();
+                                }
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Char(c), .. }) => {
+                                if let Some(buf) = app.address_input.as_mut() {
+                                    // Bounded so a stuck key cannot grow the
+                                    // buffer without limit; no real address is
+                                    // anywhere near this long.
+                                    if buf.chars().count() < 120 {
+                                        buf.push(c);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     } else if app.rename_input.is_some() {
                         match event {
                             Event::Key(KeyEvent {
@@ -490,6 +566,12 @@ async fn event_loop(
                             {
                                 app.stats.forward();
                                 stats_reload = true;
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Char('a' | 'A'), .. })
+                                if app.view == View::Environment =>
+                            {
+                                app.address_input =
+                                    Some(app.location.as_ref().map(|l| l.label.clone()).unwrap_or_default());
                             }
                             Event::Key(KeyEvent { code: KeyCode::Char('v' | 'V'), .. }) => {
                                 app.view = View::Environment;

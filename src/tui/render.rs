@@ -306,6 +306,7 @@ fn render_environment_view(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(outdoor_lines(app, &theme).len() as u16 + 2),
             Constraint::Length(sensors.len().max(1) as u16 + 2),
             Constraint::Min(0),
         ])
@@ -314,14 +315,106 @@ fn render_environment_view(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::from(" Environment").style(Style::default().add_modifier(Modifier::BOLD)),
-            Span::from("  ·  device temperature, not room temperature")
-                .style(Style::default().fg(theme.inactive)),
+            Span::from(
+                "  ·  outdoor from MeteoSwiss; sensor readings are device, not room, temperature",
+            )
+            .style(Style::default().fg(theme.inactive)),
         ])),
         rows[0],
     );
 
-    render_environment_sensors(f, rows[1], app, &theme, &sensors);
-    render_environment_history(f, rows[2], app, &theme, &sensors);
+    render_outdoor(f, rows[1], app, &theme);
+    render_environment_sensors(f, rows[2], app, &theme, &sensors);
+    render_environment_history(f, rows[3], app, &theme, &sensors);
+}
+
+/// Outdoor temperature, the station it came from, and the configured location.
+///
+/// While an address is being typed this becomes the input. Every state is
+/// distinguished explicitly — no location set, typing, a failed fetch, and a real
+/// reading all look different, because a stale number and a broken network must
+/// not be indistinguishable.
+fn render_outdoor(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let block = Block::default().borders(Borders::ALL).title(" Outdoor ");
+    f.render_widget(Paragraph::new(outdoor_lines(app, theme)).block(block), area);
+}
+
+/// The Outdoor panel's contents. Built separately from rendering so the layout can
+/// size the panel to what it actually has to say — the number of lines varies with
+/// whether a location is set, a fetch failed, or the user is typing.
+fn outdoor_lines<'a>(app: &'a App, theme: &Theme) -> Vec<Line<'a>> {
+    if let Some(buf) = &app.address_input {
+        return vec![
+            Line::from(vec![
+                Span::from("  Address  ["),
+                Span::styled(
+                    format!("{buf}│"),
+                    Style::default()
+                        .fg(theme.input_active)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::from("]"),
+            ]),
+            Line::from(
+                Span::from("  Enter to look up · Esc to cancel")
+                    .style(Style::default().fg(theme.inactive)),
+            ),
+        ];
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    match (&app.outdoor, &app.location) {
+        (Some(o), _) => {
+            lines.push(Line::from(vec![
+                Span::from("  "),
+                Span::from(format!("{:5.1} °C", o.temperature_c)).style(
+                    Style::default()
+                        .fg(theme.battery_charge)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::from(format!("   {}", o.station_name))
+                    .style(Style::default().fg(theme.focus_border)),
+                Span::from(format!(
+                    "  ·  {:.0} m  ·  {:.1} km away",
+                    o.altitude_m, o.distance_km
+                ))
+                .style(Style::default().fg(theme.inactive)),
+            ]));
+            let range = match app.outdoor_today {
+                Some((lo, hi)) => format!("today {lo:.1} – {hi:.1} °C"),
+                None => "today —".to_string(),
+            };
+            lines.push(Line::from(
+                Span::from(format!(
+                    "  {range}   measured {}",
+                    o.measured_at.with_timezone(&chrono::Local).format("%H:%M")
+                ))
+                .style(Style::default().fg(theme.inactive)),
+            ));
+        }
+        (None, Some(loc)) => lines.push(Line::from(
+            Span::from(format!("  Waiting for the first reading for {}", loc.label))
+                .style(Style::default().fg(theme.inactive)),
+        )),
+        (None, None) => lines.push(Line::from(
+            Span::from("  No location set — press 'a' to enter an address.")
+                .style(Style::default().fg(theme.inactive)),
+        )),
+    }
+
+    if let Some(loc) = &app.location {
+        lines.push(Line::from(
+            Span::from(format!("  {}   ['a' to change]", loc.label))
+                .style(Style::default().fg(theme.inactive)),
+        ));
+    }
+    if let Some(err) = &app.last_weather_error {
+        lines.push(Line::from(
+            Span::from(format!("  last fetch failed: {err}"))
+                .style(Style::default().fg(theme.status_lost)),
+        ));
+    }
+    lines
 }
 
 fn render_environment_sensors(
@@ -800,7 +893,11 @@ fn render_statusbar(f: &mut Frame, area: Rect, app: &App) {
     } else if app.view == View::Energy {
         "[↑↓] select device  [Enter] toggle switch  [q] quit".to_string()
     } else if app.view == View::Environment {
-        "[↑↓] select sensor  [t] theme  [q] quit".to_string()
+        if app.address_input.is_some() {
+            "[Enter] look up address  [Esc] cancel  [Ctrl+C] quit".to_string()
+        } else {
+            "[↑↓] select sensor  [a] set address  [t] theme  [q] quit".to_string()
+        }
     } else if app.view == View::Statistics {
         "[←→] period  [m] monthly  [y] yearly  [t] theme  [q] quit".to_string()
     } else if app.view == View::Network || app.view == View::Current {
@@ -1840,6 +1937,86 @@ mod tests {
         app
     }
 
+    fn with_outdoor(mut app: App) -> App {
+        app.location = Some(crate::db::Location {
+            label: "Bundesplatz 3 3011 Bern".to_string(),
+            east: 2_600_423.0,
+            north: 1_199_521.0,
+            latitude: 46.9468,
+            longitude: 7.4442,
+        });
+        app.outdoor = Some(crate::app::OutdoorReading {
+            station_name: "Bern / Zollikofen".to_string(),
+            temperature_c: 28.2,
+            altitude_m: 555.0,
+            distance_km: 5.1,
+            measured_at: chrono::Utc::now(),
+        });
+        app.outdoor_today = Some((14.6, 29.3));
+        app
+    }
+
+    #[test]
+    fn outdoor_panel_qualifies_the_reading_with_station_distance_and_altitude() {
+        let app = with_outdoor(env_app(vec![("192.168.1.10", 21.5)], vec![]));
+        let out = draw(&app, 130, 24);
+        assert!(out.contains("28.2"), "{out}");
+        assert!(out.contains("Bern / Zollikofen"), "{out}");
+        // Distance and altitude are what stop the figure reading as "the
+        // temperature outside the house".
+        assert!(out.contains("5.1 km"), "{out}");
+        assert!(out.contains("555 m"), "{out}");
+        assert!(out.contains("14.6"), "today's range missing:\n{out}");
+    }
+
+    #[test]
+    fn outdoor_panel_asks_for_an_address_when_no_location_is_set() {
+        let app = env_app(vec![("192.168.1.10", 21.5)], vec![]);
+        let out = draw(&app, 130, 24);
+        assert!(out.contains("No location set"), "{out}");
+        assert!(
+            out.contains("'a'"),
+            "the way to fix it should be stated:\n{out}"
+        );
+    }
+
+    #[test]
+    fn outdoor_panel_distinguishes_waiting_from_having_no_location() {
+        let mut app = with_outdoor(env_app(vec![("192.168.1.10", 21.5)], vec![]));
+        app.outdoor = None;
+        app.outdoor_today = None;
+        let out = draw(&app, 130, 24);
+        assert!(out.contains("Waiting for the first reading"), "{out}");
+        assert!(!out.contains("No location set"), "{out}");
+    }
+
+    #[test]
+    fn outdoor_panel_surfaces_a_failed_fetch_rather_than_showing_a_stale_number_silently() {
+        let mut app = with_outdoor(env_app(vec![("192.168.1.10", 21.5)], vec![]));
+        app.last_weather_error = Some("connecting to data.geo.admin.ch:443".to_string());
+        let out = draw(&app, 130, 24);
+        assert!(out.contains("last fetch failed"), "{out}");
+        assert!(out.contains("data.geo.admin.ch"), "{out}");
+    }
+
+    #[test]
+    fn outdoor_panel_becomes_the_address_input_while_typing() {
+        let mut app = with_outdoor(env_app(vec![("192.168.1.10", 21.5)], vec![]));
+        app.address_input = Some("Bahnhofstrasse 1 Zür".to_string());
+        let out = draw(&app, 130, 24);
+        assert!(out.contains("Bahnhofstrasse 1 Zür"), "{out}");
+        assert!(out.contains("Esc to cancel"), "{out}");
+        // While typing, the reading is out of the way.
+        assert!(!out.contains("28.2"), "{out}");
+    }
+
+    #[test]
+    fn statusbar_offers_the_address_key_in_the_environment_view() {
+        let app = env_app(vec![("192.168.1.10", 21.5)], vec![]);
+        let out = draw(&app, 170, 10);
+        assert!(out.contains("set address"), "{out}");
+    }
+
     #[test]
     fn environment_view_lists_sensors_with_live_temperature() {
         let app = env_app(vec![("192.168.1.10", 21.5), ("192.168.1.11", 30.2)], vec![]);
@@ -1847,9 +2024,9 @@ mod tests {
         assert!(out.contains("Environment"), "{out}");
         assert!(out.contains("21.5"), "{out}");
         assert!(out.contains("30.2"), "{out}");
-        // The reading is a device's own temperature; saying otherwise would
-        // misrepresent it as an ambient measurement.
-        assert!(out.contains("device temperature"), "{out}");
+        // The sensor readings are devices' own temperatures; presenting them as
+        // ambient would misrepresent them.
+        assert!(out.contains("not room"), "{out}");
     }
 
     #[test]

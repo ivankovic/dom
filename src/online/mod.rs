@@ -18,10 +18,18 @@
  *  claim.
  */
 
-pub mod app;
-pub mod db;
-pub mod devices;
-pub mod fingerprint;
-pub mod online;
-pub mod stats;
-pub mod tui;
+//! Outbound calls to public online services.
+//!
+//! Everything else Dom talks to is on the LAN. These two are not, which makes
+//! them the only places the app reaches the internet:
+//!
+//! - [`geocode`] turns an address into coordinates, via swisstopo's federal
+//!   search API.
+//! - [`weather`] reads outdoor temperature from MeteoSwiss open data.
+//!
+//! Both are plain unauthenticated GETs over TLS, and both are optional: with no
+//! location configured, nothing here is ever called.
+
+pub mod geocode;
+pub mod https;
+pub mod weather;

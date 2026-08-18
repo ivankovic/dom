@@ -29,7 +29,7 @@ use surge_ping::{Client, Config};
 use tokio::sync::Notify;
 
 use dom::app::{SharedState, SwitchAutoMode};
-use dom::{app, db, devices, fingerprint, stats, tui};
+use dom::{app, db, devices, fingerprint, online, stats, tui};
 
 /// How long after startup the ICMP ping scan's one-time early follow-up runs,
 /// to catch devices that weren't up yet at the very first (t=0) scan.
@@ -65,6 +65,10 @@ const PRUNE_BATCHES_PER_PASS: usize = 25;
 /// so the range chart stays readable in a terminal rather than by what is stored —
 /// `TemperatureDaily` is kept indefinitely.
 const ENVIRONMENT_HISTORY_DAYS: i64 = 21;
+/// How often the outdoor temperature is fetched. MeteoSwiss republishes its
+/// 10-minute means on the same cadence, so polling faster only re-reads the same
+/// figure — and the insert ignores a repeat anyway.
+const WEATHER_INTERVAL_SECS: u64 = 10 * 60;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -151,6 +155,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Background: outdoor temperature, if a location has been configured.
+    tokio::spawn(weather_task(state.clone(), pool.clone()));
+
     // Background: keeps the daily energy rollup and the statistics view current.
     tokio::spawn(statistics_task(state.clone(), pool.clone()));
 
@@ -158,6 +165,28 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(timer_job(state.clone()));
 
     tui::run(state, pool, rescan_notify).await
+}
+
+// ── Outdoor temperature ───────────────────────────────────────────────────────
+
+/// Fetches the outdoor temperature from the nearest MeteoSwiss station and records
+/// it, on `WEATHER_INTERVAL_SECS`.
+///
+/// Does nothing at all until the user configures a location — this is the only
+/// part of Dom that talks to the internet, and it stays silent unless asked for.
+/// It re-reads the location every tick rather than capturing it once, so setting
+/// an address takes effect without a restart.
+///
+/// A failure is recorded for display rather than logged and forgotten: an outdoor
+/// reading that silently stops updating would otherwise look like a stable
+/// temperature.
+async fn weather_task(state: SharedState, pool: SqlitePool) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(WEATHER_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        online::weather::refresh(&pool, &state).await;
+    }
 }
 
 // ── Long-term statistics ──────────────────────────────────────────────────────

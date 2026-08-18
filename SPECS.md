@@ -155,6 +155,72 @@ It passes no fingerprint. The local machine is re-derived from this host's own i
 discovery cycle, so it has no identity to preserve across an address change — and our own
 address never appears in our own ARP cache, which is where fingerprints come from.
 
+## Online services: geocoding and outdoor temperature (2026-08-18)
+
+### First outbound dependency
+
+Everything Dom talked to before this was on the LAN. Outdoor temperature cannot be, so this adds the
+first two calls that leave the house. Both are optional and neither is made until a location is set:
+with no address configured the weather task returns immediately.
+
+### Decision: MeteoSwiss open data over Open-Meteo
+
+Both were tested against the live services. Open-Meteo serves MeteoSwiss's own ICON-CH1 model
+interpolated to exact coordinates and elevation, in a 450-byte response — arguably closer to the
+temperature at a specific house than any station reading. It was rejected because its free tier is
+explicitly non-commercial only ("You may only use the free API services for non-commercial
+purposes"), and Dom is sold under paid commercial licences: shipping it as the default would embed a
+term our own commercial licensees could not satisfy.
+
+MeteoSwiss open data is Open Government Data — free of charge, reusable including commercially, with
+attribution. It is also a real measurement rather than a model output. The costs are that the nearest
+station may be far away and at a very different altitude, and that the published file covers the whole
+country (~170 KB) to obtain one number.
+
+That distance and altitude are surfaced in the UI rather than hidden. A reading from 20 km away and
+900 m higher is not the temperature outside the house, and presenting a bare number would imply
+otherwise.
+
+An incidental privacy benefit: because the file is nationwide and the nearest station is chosen
+locally, the location is never sent to MeteoSwiss. Only the geocoder ever sees the address.
+
+### Decision: a TLS transport, not an HTTP client
+
+Both services are HTTPS-only and the project had no TLS at all. Measured as crates actually added to
+this dependency graph: `reqwest` + rustls was +59, `ureq` +17, and `tokio-rustls` + `webpki-roots` +8
+as it turned out (more overlap with the existing tokio and ring than an isolated measurement showed).
+
+Chose the transport and hand-wrote the HTTP, which is what the codebase already does for LAN devices
+(`fingerprint::http_get`, `devices::*::fetch_report`). `ring` rather than the default `aws-lc-rs`
+provider so the build needs no cmake or nasm.
+
+### HTTP/1.0 on purpose
+
+The requests ask for HTTP/1.0. Over 1.1, swisstopo answers with `Transfer-Encoding: chunked`, which
+would mean implementing de-chunking; over 1.0 it sends the body and closes, so read-to-EOF is correct.
+Verified against both endpoints. This is noted in the module so it is not "modernised" to 1.1 without
+chunked decoding being added first.
+
+### LV95 throughout, and the transposition trap
+
+MeteoSwiss publishes station positions in LV95 (EPSG:2056), so the geocoder is asked for LV95 too
+(`sr=2056`). LV95 is metric, so nearest-station is Pythagoras in metres — no great-circle arithmetic,
+no reprojection.
+
+The trap: swisstopo reports LV95 as `(x = northing, y = easting)`, the reverse of the
+`[easting, northing]` ordering in the MeteoSwiss document. Transposing them still parses, still yields
+coordinates inside Switzerland, and still returns a confident answer — just the wrong station. Two
+tests pin it: the nearest station to Bern's coordinates must be Bern, and to Lugano's must be Lugano.
+A range assertion also guards it, since a Swiss easting (~2.5-2.8M) and northing (~1.07-1.3M) cannot
+be confused numerically.
+
+### Storage
+
+Readings go to `OutdoorTemperature`, keyed by the station's own measurement instant so re-fetching an
+unrefreshed reading is ignored — the publication cadence and the poll interval are both ten minutes
+and will not stay in step. At 144 rows a day the series is kept indefinitely at full resolution: a
+rollup would save a few megabytes a decade and cost the accuracy of daily extremes.
+
 ## Environment view, and incremental temperature rollup (2026-08-18)
 
 ### Which of the three unbuilt views could be built

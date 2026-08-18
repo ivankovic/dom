@@ -98,6 +98,20 @@ pub enum ConnStatus {
     Lost,
 }
 
+/// The most recent outdoor temperature, and where it came from.
+///
+/// Carries the station's distance and altitude because they qualify the reading:
+/// a measurement from 20 km away and 900 m higher is not the temperature outside
+/// the house, and the view says so rather than implying otherwise.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutdoorReading {
+    pub station_name: String,
+    pub temperature_c: f64,
+    pub altitude_m: f64,
+    pub distance_km: f64,
+    pub measured_at: DateTime<Utc>,
+}
+
 /// Result of a single ping to a device.
 #[derive(Clone, Debug)]
 pub struct PingResult {
@@ -367,6 +381,19 @@ pub struct App {
     /// Long-term statistics: the selected window and period, and the buckets
     /// loaded for it. Populated by `stats::refresh`, not computed during render.
     pub stats: crate::stats::Stats,
+    /// Latest outdoor reading from the nearest MeteoSwiss station, once a
+    /// location has been configured and a fetch has succeeded.
+    pub outdoor: Option<OutdoorReading>,
+    /// Today's lowest and highest recorded outdoor temperature.
+    pub outdoor_today: Option<(f64, f64)>,
+    /// The configured location, or `None` until the user sets an address.
+    pub location: Option<crate::db::Location>,
+    /// Why the last outdoor fetch failed, if it did. Shown rather than swallowed:
+    /// this is the one part of Dom that depends on the internet, so a failure
+    /// should look different from "no data yet".
+    pub last_weather_error: Option<String>,
+    /// When `Some`, the user is typing an address; holds the in-progress text.
+    pub address_input: Option<String>,
     /// Daily temperature summaries for the Environment view's history chart,
     /// newest last. Loaded in the background; the live readings it sits under
     /// come from `switch_readings`.

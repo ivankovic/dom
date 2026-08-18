@@ -277,6 +277,28 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Outdoor temperature readings from the nearest MeteoSwiss station.
+    //
+    // The station's own measurement time is the primary key, so re-fetching a
+    // reading that has not been refreshed yet is a no-op rather than a duplicate —
+    // the published data updates every ten minutes and the poll runs on the same
+    // cadence, which will not stay in step.
+    //
+    // Deliberately not rolled up or pruned: at 144 rows a day this is a few
+    // megabytes a decade, so the raw series is already coarse enough to keep.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS OutdoorTemperature (
+            timestamp     TEXT PRIMARY KEY,
+            station_id    TEXT NOT NULL,
+            station_name  TEXT NOT NULL,
+            value_c       REAL NOT NULL,
+            altitude_m    REAL,
+            distance_km   REAL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Per-local-day device temperature.
     //
     // Folded in incrementally rather than recomputed, because its source
@@ -898,6 +920,120 @@ pub async fn query_daily_energy(
         }
     }
     Ok(by_day.into_values().collect())
+}
+
+/// The configured location: what the user typed, resolved to coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Location {
+    /// The address as the geocoder matched it, for display and confirmation.
+    pub label: String,
+    /// LV95 easting/northing, used to find the nearest weather station.
+    pub east: f64,
+    pub north: f64,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+/// `Config` keys the location is stored under. Kept as individual settings rather
+/// than one encoded blob so a value can be inspected or corrected by hand.
+const LOCATION_KEYS: [&str; 5] = [
+    "location_label",
+    "location_east",
+    "location_north",
+    "location_latitude",
+    "location_longitude",
+];
+
+/// The stored location, or `None` if the user has not set one.
+///
+/// Treats a partially-written location as absent: every field is required to find
+/// a station, and half a location is not usable.
+pub async fn get_location(pool: &SqlitePool) -> anyhow::Result<Option<Location>> {
+    let mut values = Vec::with_capacity(LOCATION_KEYS.len());
+    for key in LOCATION_KEYS {
+        match get_config(pool, key).await? {
+            Some(v) => values.push(v),
+            None => return Ok(None),
+        }
+    }
+    let num = |i: usize| values[i].parse::<f64>().ok();
+    let (Some(east), Some(north), Some(latitude), Some(longitude)) =
+        (num(1), num(2), num(3), num(4))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Location {
+        label: values[0].clone(),
+        east,
+        north,
+        latitude,
+        longitude,
+    }))
+}
+
+/// Stores the location, replacing any previous one.
+pub async fn set_location(pool: &SqlitePool, loc: &Location) -> anyhow::Result<()> {
+    let values = [
+        loc.label.clone(),
+        loc.east.to_string(),
+        loc.north.to_string(),
+        loc.latitude.to_string(),
+        loc.longitude.to_string(),
+    ];
+    for (key, value) in LOCATION_KEYS.iter().zip(values.iter()) {
+        set_config(pool, key, value).await?;
+    }
+    Ok(())
+}
+
+/// Records one outdoor reading. Re-recording the same measurement instant is
+/// ignored, so polling faster than the station updates costs nothing.
+pub async fn insert_outdoor_temperature(
+    pool: &SqlitePool,
+    measured_at: chrono::DateTime<chrono::Utc>,
+    station_id: &str,
+    station_name: &str,
+    value_c: f64,
+    altitude_m: f64,
+    distance_km: f64,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "INSERT OR IGNORE INTO OutdoorTemperature
+             (timestamp, station_id, station_name, value_c, altitude_m, distance_km)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(crate::devices::ts(measured_at))
+    .bind(station_id)
+    .bind(station_name)
+    .bind(value_c)
+    .bind(altitude_m)
+    .bind(distance_km)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Lowest and highest outdoor reading recorded for a local day, if any.
+pub async fn outdoor_range_for_day(
+    pool: &SqlitePool,
+    day: chrono::NaiveDate,
+) -> anyhow::Result<Option<(f64, f64)>> {
+    let Some((start, end)) = local_day_bounds_utc(day) else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT MIN(value_c) AS lo, MAX(value_c) AS hi, COUNT(*) AS n
+         FROM OutdoorTemperature WHERE timestamp >= ? AND timestamp < ?",
+    )
+    .bind(&start)
+    .bind(&end)
+    .fetch_one(pool)
+    .await?;
+    let n: i64 = row.get("n");
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some((row.get("lo"), row.get("hi"))))
 }
 
 /// Oldest local day that has any rolled-up energy data, or `None` when the
