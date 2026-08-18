@@ -40,6 +40,8 @@ pub enum View {
     /// Long-term energy statistics, read from the daily rollup rather than the
     /// 2s series — see `crate::stats`.
     Statistics,
+    /// Device temperatures, live and as a daily range history.
+    Environment,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -365,6 +367,12 @@ pub struct App {
     /// Long-term statistics: the selected window and period, and the buckets
     /// loaded for it. Populated by `stats::refresh`, not computed during render.
     pub stats: crate::stats::Stats,
+    /// Daily temperature summaries for the Environment view's history chart,
+    /// newest last. Loaded in the background; the live readings it sits under
+    /// come from `switch_readings`.
+    pub temperature_history: Vec<crate::db::DailyTemperature>,
+    /// Highlighted row in the Environment view's sensor list.
+    pub env_selected: usize,
     /// Which colour palette to draw with. Auto-detected from the terminal at
     /// startup unless the user has stored an explicit choice, and toggled with
     /// 't' — see `tui::theme`. Stored as the mode rather than a built `Theme`

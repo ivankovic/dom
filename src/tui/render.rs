@@ -52,6 +52,7 @@ pub(super) fn render(f: &mut Frame, app: &App) {
         View::Network => render_network_view(f, rows[1], app),
         View::Devices => render_devices_view(f, rows[1], app),
         View::Statistics => render_statistics_view(f, rows[1], app),
+        View::Environment => render_environment_view(f, rows[1], app),
     }
     if app.timer_dialog.is_some() {
         render_timer_dialog(f, app);
@@ -264,6 +265,208 @@ fn render_stats_buckets(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 Span::from(format!("  prod{}", kwh(b.totals.production_kwh)))
                     .style(Style::default().fg(theme.production)),
                 Span::from(format!("  {}", pct(b.totals.self_sufficiency_pct())))
+                    .style(Style::default().fg(theme.inactive)),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+// ── Environment view ──────────────────────────────────────────────────────────
+
+/// Sensors reporting a temperature, in a stable display order.
+///
+/// Today these are myStrom switches reporting their own case temperature rather
+/// than a room reading — the view says so, because presenting an appliance's
+/// internal temperature as ambient would be misleading.
+pub(super) fn temperature_sensors(app: &App) -> Vec<(IpAddr, String, &SwitchReading)> {
+    let mut out: Vec<(IpAddr, String, &SwitchReading)> = app
+        .switch_readings
+        .iter()
+        .map(|(ip, r)| {
+            let name = app
+                .devices
+                .iter()
+                .find(|d| d.ip == *ip)
+                .map(|d| d.display_name().to_string())
+                .unwrap_or_else(|| ip.to_string());
+            (*ip, name, r)
+        })
+        .collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+fn render_environment_view(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let sensors = temperature_sensors(app);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(sensors.len().max(1) as u16 + 2),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::from(" Environment").style(Style::default().add_modifier(Modifier::BOLD)),
+            Span::from("  ·  device temperature, not room temperature")
+                .style(Style::default().fg(theme.inactive)),
+        ])),
+        rows[0],
+    );
+
+    render_environment_sensors(f, rows[1], app, &theme, &sensors);
+    render_environment_history(f, rows[2], app, &theme, &sensors);
+}
+
+fn render_environment_sensors(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    sensors: &[(IpAddr, String, &SwitchReading)],
+) {
+    let block = Block::default().borders(Borders::ALL).title(" Sensors ");
+    if sensors.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(
+                Span::from("  No device is reporting a temperature.")
+                    .style(Style::default().fg(theme.inactive)),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    let today = chrono::Local::now().date_naive();
+    let lines: Vec<Line> = sensors
+        .iter()
+        .enumerate()
+        .map(|(i, (ip, name, r))| {
+            let selected = i == app.env_selected.min(sensors.len() - 1);
+            // Today's range comes from the rollup, which is only as current as
+            // the last pass — so it can lag the live reading by a few minutes.
+            let today_row = app
+                .temperature_history
+                .iter()
+                .find(|t| t.day == today && t.ip == *ip);
+            let range = match today_row {
+                Some(t) => format!("today {:5.1} – {:5.1}", t.min_c, t.max_c),
+                None => "today       –      ".to_string(),
+            };
+            let age = format_age(chrono::Utc::now() - r.updated_at);
+            let marker = if selected { "▸ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::from(format!("{marker}{name:<24}")).style(style),
+                Span::from(format!("{:6.1} °C  ", r.temperature_c))
+                    .style(Style::default().fg(theme.battery_discharge)),
+                Span::from(range).style(Style::default().fg(theme.inactive)),
+                Span::from(format!("  {age:>9}")).style(Style::default().fg(theme.inactive)),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn format_age(d: chrono::Duration) -> String {
+    let secs = d.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
+/// A row per day for the selected sensor: the min–max span drawn as a bar across
+/// a shared temperature scale, so a hot day is visibly wider and higher than a
+/// cold one, with the daily mean marked inside it.
+fn render_environment_history(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    sensors: &[(IpAddr, String, &SwitchReading)],
+) {
+    let selected = sensors.get(app.env_selected.min(sensors.len().saturating_sub(1)));
+    let title = match selected {
+        Some((_, name, _)) => format!(" Daily range — {name} "),
+        None => " Daily range ".to_string(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    let Some((ip, _, _)) = selected else {
+        f.render_widget(block, area);
+        return;
+    };
+    let rows: Vec<&crate::db::DailyTemperature> = app
+        .temperature_history
+        .iter()
+        .filter(|t| t.ip == *ip)
+        .collect();
+
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(
+                Span::from("  No daily history recorded yet — it accumulates as days pass.")
+                    .style(Style::default().fg(theme.inactive)),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    let lo = rows.iter().map(|t| t.min_c).fold(f64::INFINITY, f64::min);
+    let hi = rows
+        .iter()
+        .map(|t| t.max_c)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let span = (hi - lo).max(0.1);
+    let bar_w = (area.width as usize).saturating_sub(38).max(10);
+
+    // Newest last reads naturally downward, like the rest of the app's history.
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|t| {
+            let cell =
+                |v: f64| -> usize { (((v - lo) / span) * (bar_w - 1) as f64).round() as usize };
+            let (from, to, mean) = (cell(t.min_c), cell(t.max_c), cell(t.avg_c));
+            let mut bar = String::new();
+            for i in 0..bar_w {
+                bar.push(if i == mean {
+                    '┃'
+                } else if i >= from && i <= to {
+                    '━'
+                } else {
+                    ' '
+                });
+            }
+            Line::from(vec![
+                Span::from(format!("  {}  ", t.day.format("%d %b"))),
+                Span::from(format!("{:5.1}", t.min_c))
+                    .style(Style::default().fg(theme.battery_charge)),
+                Span::from(" "),
+                Span::from(bar).style(Style::default().fg(theme.battery_discharge)),
+                Span::from(" "),
+                Span::from(format!("{:5.1}", t.max_c))
+                    .style(Style::default().fg(theme.consumption)),
+                Span::from(format!("   avg {:5.1}", t.avg_c))
                     .style(Style::default().fg(theme.inactive)),
             ])
         })
@@ -589,13 +792,15 @@ fn gauge_row_ratio(f: &mut Frame, area: Rect, theme: &Theme, g: Gauge, ratio: f6
 
 fn render_statusbar(f: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
-    let nav = "[c] current  [e] energy  [n] network  [d] devices  [w/m/y] stats  [s] rescan";
+    let nav = "[c] current  [e] energy  [n] network  [d] devices  [v] environment  [w/m/y] stats  [s] rescan";
     let focus_hints = if app.timer_dialog.is_some() {
         "[Tab] switch field  [Enter] save  [Esc] cancel  [Ctrl+C] quit".to_string()
     } else if app.rename_input.is_some() {
         "[Enter] save name  [Esc] cancel  [Ctrl+C] quit".to_string()
     } else if app.view == View::Energy {
         "[↑↓] select device  [Enter] toggle switch  [q] quit".to_string()
+    } else if app.view == View::Environment {
+        "[↑↓] select sensor  [t] theme  [q] quit".to_string()
     } else if app.view == View::Statistics {
         "[←→] period  [w] weekly  [m] monthly  [y] yearly  [t] theme  [q] quit".to_string()
     } else if app.view == View::Network || app.view == View::Current {
@@ -1596,6 +1801,116 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn env_app(temps: Vec<(&str, f64)>, history: Vec<(&str, &str, f64, f64, f64)>) -> App {
+        let mut app = App {
+            view: View::Environment,
+            ..Default::default()
+        };
+        for (ip, t) in temps {
+            let addr: IpAddr = ip.parse().unwrap();
+            app.devices.push(ScannedDevice {
+                ip: addr,
+                latency_ms: 1.0,
+                open_ports: vec![80],
+                name: Some(devices::mystrom_switch::NAME),
+                label: Some(format!("Sensor {}", ip.split('.').next_back().unwrap())),
+            });
+            app.switch_readings.insert(
+                addr,
+                SwitchReading {
+                    power_w: 10.0,
+                    relay_on: true,
+                    temperature_c: t,
+                    updated_at: chrono::Utc::now(),
+                },
+            );
+        }
+        app.temperature_history = history
+            .into_iter()
+            .map(|(ip, d, lo, hi, avg)| crate::db::DailyTemperature {
+                ip: ip.parse().unwrap(),
+                day: chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap(),
+                min_c: lo,
+                max_c: hi,
+                avg_c: avg,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn environment_view_lists_sensors_with_live_temperature() {
+        let app = env_app(vec![("192.168.1.10", 21.5), ("192.168.1.11", 30.2)], vec![]);
+        let out = draw(&app, 120, 20);
+        assert!(out.contains("Environment"), "{out}");
+        assert!(out.contains("21.5"), "{out}");
+        assert!(out.contains("30.2"), "{out}");
+        // The reading is a device's own temperature; saying otherwise would
+        // misrepresent it as an ambient measurement.
+        assert!(out.contains("device temperature"), "{out}");
+    }
+
+    #[test]
+    fn environment_view_explains_an_empty_history_rather_than_drawing_nothing() {
+        let app = env_app(vec![("192.168.1.10", 21.5)], vec![]);
+        let out = draw(&app, 120, 20);
+        assert!(out.contains("No daily history"), "{out}");
+    }
+
+    #[test]
+    fn environment_view_says_so_when_nothing_reports_a_temperature() {
+        let app = env_app(vec![], vec![]);
+        let out = draw(&app, 120, 20);
+        assert!(out.contains("No device is reporting"), "{out}");
+    }
+
+    #[test]
+    fn environment_history_shows_only_the_selected_sensor() {
+        let mut app = env_app(
+            vec![("192.168.1.10", 21.5), ("192.168.1.11", 30.2)],
+            vec![
+                ("192.168.1.10", "2026-08-15", 18.0, 24.0, 21.0),
+                ("192.168.1.11", "2026-08-15", 40.0, 48.0, 44.0),
+            ],
+        );
+        let first = draw(&app, 120, 20);
+        assert!(
+            first.contains(" 18.0"),
+            "selected sensor's range missing:\n{first}"
+        );
+        assert!(!first.contains(" 48.0"), "other sensor leaked in:\n{first}");
+
+        app.env_selected = 1;
+        let second = draw(&app, 120, 20);
+        assert!(second.contains(" 48.0"), "{second}");
+        assert!(!second.contains(" 24.0"), "{second}");
+    }
+
+    #[test]
+    fn environment_view_shows_todays_range_next_to_the_live_reading() {
+        let today = chrono::Local::now().date_naive();
+        let app = env_app(
+            vec![("192.168.1.10", 21.5)],
+            vec![(
+                "192.168.1.10",
+                &today.format("%Y-%m-%d").to_string(),
+                19.25,
+                26.75,
+                22.0,
+            )],
+        );
+        let out = draw(&app, 120, 20);
+        assert!(out.contains("19.2") || out.contains("19.3"), "{out}");
+        assert!(out.contains("26.8") || out.contains("26.7"), "{out}");
+    }
+
+    #[test]
+    fn statusbar_advertises_the_environment_key() {
+        let app = env_app(vec![("192.168.1.10", 21.5)], vec![]);
+        let out = draw(&app, 170, 8);
+        assert!(out.contains("environment"), "{out}");
     }
 
     #[test]

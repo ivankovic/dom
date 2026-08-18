@@ -277,6 +277,32 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Per-local-day device temperature.
+    //
+    // Folded in incrementally rather than recomputed, because its source
+    // (`RawDeviceMeasurements`) is pruned after 24 hours — far shorter than the
+    // re-roll window. Recomputing yesterday late in the day would see only the
+    // hour of it still inside that window and overwrite a complete day with a
+    // sliver of it.
+    //
+    // `temp_sum` and `samples` are stored rather than an average so that folding
+    // is exact, and `last_ts` is a watermark: only samples newer than it are
+    // added, so a pass can run as often as it likes without double-counting.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS TemperatureDaily (
+            device_id  INTEGER NOT NULL REFERENCES Devices(id),
+            day        TEXT    NOT NULL,
+            temp_min   REAL    NOT NULL,
+            temp_max   REAL    NOT NULL,
+            temp_sum   REAL    NOT NULL,
+            samples    INTEGER NOT NULL,
+            last_ts    TEXT    NOT NULL,
+            PRIMARY KEY (device_id, day)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Per-local-day battery state of charge.
     //
     // `EnergyStorage` records RSOC every 2 seconds and nothing has ever read it —
@@ -447,6 +473,116 @@ pub fn current_minute_start() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:00").to_string()
 }
 
+/// Folds any not-yet-recorded temperature samples for one local day into
+/// `TemperatureDaily`.
+///
+/// Incremental by design. Unlike the energy tiers, which can recompute a day
+/// from a raw series retained for four days, temperature comes from
+/// `RawDeviceMeasurements` and survives only 24 hours — so a day has to be
+/// accumulated while it happens, and can never be rebuilt afterwards.
+///
+/// One statement, so the read of the watermark and the write that advances it
+/// cannot interleave with another pass. Samples at or before `last_ts` are
+/// excluded, which is what makes running this every few minutes safe: re-running
+/// folds in nothing and changes nothing.
+pub async fn rollup_temperature_day(
+    pool: &SqlitePool,
+    device_id: i64,
+    day: chrono::NaiveDate,
+) -> anyhow::Result<()> {
+    let Some((start, end)) = local_day_bounds_utc(day) else {
+        return Ok(());
+    };
+    let day_str = day.format("%Y-%m-%d").to_string();
+
+    sqlx::query(
+        "INSERT INTO TemperatureDaily
+             (device_id, day, temp_min, temp_max, temp_sum, samples, last_ts)
+         SELECT ?, ?, MIN(value), MAX(value), SUM(value), COUNT(*), MAX(timestamp)
+         FROM RawDeviceMeasurements
+         WHERE device_id = ?
+           AND metric = 'temperature'
+           AND timestamp >= ?
+           AND timestamp < ?
+           AND timestamp > COALESCE(
+                 (SELECT last_ts FROM TemperatureDaily WHERE device_id = ? AND day = ?), '')
+         HAVING COUNT(*) > 0
+         ON CONFLICT(device_id, day) DO UPDATE SET
+             temp_min = MIN(temp_min, excluded.temp_min),
+             temp_max = MAX(temp_max, excluded.temp_max),
+             temp_sum = temp_sum + excluded.temp_sum,
+             samples  = samples  + excluded.samples,
+             last_ts  = excluded.last_ts",
+    )
+    .bind(device_id)
+    .bind(&day_str)
+    .bind(device_id)
+    .bind(&start)
+    .bind(&end)
+    .bind(device_id)
+    .bind(&day_str)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One local day of one device's temperature, in degrees Celsius.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyTemperature {
+    /// Address of the reporting device. Resolved here rather than handing the
+    /// view a database id it would have to map back itself.
+    pub ip: std::net::IpAddr,
+    pub day: chrono::NaiveDate,
+    pub min_c: f64,
+    pub max_c: f64,
+    pub avg_c: f64,
+}
+
+/// Daily temperature summaries for the inclusive local-date range, oldest first.
+pub async fn query_daily_temperature(
+    pool: &SqlitePool,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> anyhow::Result<Vec<DailyTemperature>> {
+    let rows = sqlx::query(
+        "SELECT d.ip AS ip, t.day AS day, t.temp_min AS temp_min, t.temp_max AS temp_max,
+                t.temp_sum AS temp_sum, t.samples AS samples
+         FROM TemperatureDaily t
+         JOIN Devices d ON d.id = t.device_id
+         WHERE t.day >= ? AND t.day <= ? AND t.samples > 0
+         ORDER BY t.day, d.ip",
+    )
+    .bind(from.format("%Y-%m-%d").to_string())
+    .bind(to.format("%Y-%m-%d").to_string())
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let day_str: String = row.get("day");
+        let Ok(day) = chrono::NaiveDate::parse_from_str(&day_str, "%Y-%m-%d") else {
+            continue;
+        };
+        let samples: i64 = row.get("samples");
+        if samples == 0 {
+            continue;
+        }
+        let sum: f64 = row.get("temp_sum");
+        let ip_str: String = row.get("ip");
+        let Ok(ip) = ip_str.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        out.push(DailyTemperature {
+            ip,
+            day,
+            min_c: row.get("temp_min"),
+            max_c: row.get("temp_max"),
+            avg_c: sum / samples as f64,
+        });
+    }
+    Ok(out)
+}
+
 /// Summarises one local day of one device's `EnergyStorage` rows into
 /// `StorageDaily`.
 pub async fn rollup_storage_day(
@@ -571,7 +707,7 @@ pub async fn rollup_energy_day(
 
 /// The rollup tiers, in the order they must run for a given day: each reads what
 /// the one before it wrote, or the 2s series in the case of the first two.
-const TIERS: [&str; 3] = ["minute", "storage", "daily"];
+const TIERS: [&str; 4] = ["minute", "storage", "temperature", "daily"];
 
 /// Brings every rollup tier up to date, returning how many local days it worked.
 ///
@@ -647,6 +783,7 @@ pub async fn rollup_history(
                         rollup_energy_minute(pool, device_id, day, &cutoff).await?;
                     }
                     "storage" => rollup_storage_day(pool, device_id, day).await?,
+                    "temperature" => rollup_temperature_day(pool, device_id, day).await?,
                     "daily" => rollup_energy_day(pool, device_id, day).await?,
                     _ => {}
                 }
@@ -2209,6 +2346,185 @@ mod tests {
         let got = query_daily_energy(&pool, old_day, old_day).await.unwrap();
         assert_eq!(got.len(), 1, "daily history must outlive the minute rows");
         assert!((got[0].consumption_kwh - 0.001).abs() < 1e-9);
+    }
+
+    // ── Temperature tier ──────────────────────────────────────────────────────
+
+    async fn temp_sample(pool: &SqlitePool, device_id: i64, local: &str, value: f64) {
+        use chrono::{Local, TimeZone};
+        let naive = chrono::NaiveDateTime::parse_from_str(local, "%Y-%m-%d %H:%M:%S").unwrap();
+        let utc = Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .unwrap()
+            .naive_utc();
+        sqlx::query(
+            "INSERT INTO RawDeviceMeasurements (device_id, timestamp, metric, value)
+             VALUES (?, ?, 'temperature', ?)",
+        )
+        .bind(device_id)
+        .bind(utc.format(crate::devices::DB_TIMESTAMP_FMT).to_string())
+        .bind(value)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn temp_of(pool: &SqlitePool, d: NaiveDate) -> Option<DailyTemperature> {
+        query_daily_temperature(pool, d, d).await.unwrap().pop()
+    }
+
+    #[tokio::test]
+    async fn temperature_rollup_records_min_max_and_average() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.3.0.1").await;
+        for (t, v) in [("06:00:00", 18.0), ("12:00:00", 26.0), ("20:00:00", 22.0)] {
+            temp_sample(&pool, id, &format!("2026-05-10 {t}"), v).await;
+        }
+
+        rollup_temperature_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+
+        let got = temp_of(&pool, day("2026-05-10")).await.unwrap();
+        assert_eq!((got.min_c, got.max_c), (18.0, 26.0));
+        assert!((got.avg_c - 22.0).abs() < 1e-9, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn temperature_rollup_folds_in_later_samples_without_double_counting() {
+        // The behaviour the whole design turns on: the source is pruned after a
+        // day, so a day is accumulated as it happens. Re-running must add only
+        // what is new.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.3.0.2").await;
+
+        temp_sample(&pool, id, "2026-05-10 06:00:00", 18.0).await;
+        temp_sample(&pool, id, "2026-05-10 07:00:00", 20.0).await;
+        rollup_temperature_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+        let first = temp_of(&pool, day("2026-05-10")).await.unwrap();
+        assert_eq!((first.min_c, first.max_c), (18.0, 20.0));
+        assert!((first.avg_c - 19.0).abs() < 1e-9);
+
+        // Running again with nothing new must change nothing at all.
+        for _ in 0..3 {
+            rollup_temperature_day(&pool, id, day("2026-05-10"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(temp_of(&pool, day("2026-05-10")).await.unwrap(), first);
+
+        // Now the day continues.
+        temp_sample(&pool, id, "2026-05-10 13:00:00", 28.0).await;
+        temp_sample(&pool, id, "2026-05-10 22:00:00", 16.0).await;
+        rollup_temperature_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+
+        let got = temp_of(&pool, day("2026-05-10")).await.unwrap();
+        assert_eq!((got.min_c, got.max_c), (16.0, 28.0), "extremes must widen");
+        // Mean of all four samples, not of the last two.
+        assert!((got.avg_c - 20.5).abs() < 1e-9, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn temperature_rollup_survives_its_source_being_pruned() {
+        // The scenario the incremental design exists for: yesterday is folded in
+        // while it happens, then its raw samples age out. A later pass must not
+        // replace the recorded day with whatever sliver of it still remains.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.3.0.3").await;
+        for (t, v) in [("06:00:00", 10.0), ("12:00:00", 30.0), ("23:30:00", 20.0)] {
+            temp_sample(&pool, id, &format!("2026-05-10 {t}"), v).await;
+        }
+        rollup_temperature_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+        let complete = temp_of(&pool, day("2026-05-10")).await.unwrap();
+        assert_eq!((complete.min_c, complete.max_c), (10.0, 30.0));
+
+        // Everything but the tail of the day is pruned, as the 24h window does.
+        sqlx::query("DELETE FROM RawDeviceMeasurements WHERE value IN (10.0, 30.0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        rollup_temperature_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            temp_of(&pool, day("2026-05-10")).await.unwrap(),
+            complete,
+            "a recorded day must not be degraded by re-running against pruned source data"
+        );
+    }
+
+    #[tokio::test]
+    async fn temperature_rollup_keeps_days_and_devices_apart() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let a = device(&pool, "10.3.0.4").await;
+        let b = device(&pool, "10.3.0.5").await;
+        temp_sample(&pool, a, "2026-05-10 12:00:00", 20.0).await;
+        temp_sample(&pool, b, "2026-05-10 12:00:00", 30.0).await;
+        temp_sample(&pool, a, "2026-05-11 12:00:00", 25.0).await;
+
+        for d in ["2026-05-10", "2026-05-11"] {
+            rollup_temperature_day(&pool, a, day(d)).await.unwrap();
+            rollup_temperature_day(&pool, b, day(d)).await.unwrap();
+        }
+
+        let d10 = query_daily_temperature(&pool, day("2026-05-10"), day("2026-05-10"))
+            .await
+            .unwrap();
+        assert_eq!(d10.len(), 2, "one row per device");
+        let d11 = query_daily_temperature(&pool, day("2026-05-11"), day("2026-05-11"))
+            .await
+            .unwrap();
+        assert_eq!(d11.len(), 1, "only one device reported on the 11th");
+        assert_eq!(d11[0].ip.to_string(), "10.3.0.4");
+    }
+
+    #[tokio::test]
+    async fn temperature_rollup_writes_nothing_without_samples() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.3.0.6").await;
+        rollup_temperature_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM TemperatureDaily").await,
+            0
+        );
+        assert!(temp_of(&pool, day("2026-05-10")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn temperature_ignores_other_metrics() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.3.0.7").await;
+        temp_sample(&pool, id, "2026-05-10 12:00:00", 20.0).await;
+        sqlx::query(
+            "INSERT INTO RawDeviceMeasurements (device_id, timestamp, metric, value)
+             VALUES (?, '2026-05-10 10:00:00', 'power', 9999.0)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        rollup_temperature_day(&pool, id, day("2026-05-10"))
+            .await
+            .unwrap();
+
+        let got = temp_of(&pool, day("2026-05-10")).await.unwrap();
+        assert_eq!(
+            (got.min_c, got.max_c),
+            (20.0, 20.0),
+            "power must not leak in"
+        );
     }
 
     #[tokio::test]

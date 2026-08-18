@@ -155,6 +155,46 @@ It passes no fingerprint. The local machine is re-derived from this host's own i
 discovery cycle, so it has no identity to preserve across an address change — and our own
 address never appears in our own ARP cache, which is where fingerprints come from.
 
+## Environment view, and incremental temperature rollup (2026-08-18)
+
+### Which of the three unbuilt views could be built
+
+README listed Security, Environment and Household as intended categories. Only Environment had a
+data source: myStrom switches report a temperature every two seconds, and it was already being
+recorded. Security and Household have no supported hardware at all, so building them would have
+produced two empty screens behind two keybindings, which is worse than not offering them. They stay
+out of the `View` enum until a device that feeds them exists.
+
+What the switches report is their own case temperature, not an ambient reading — it tracks the
+appliance plugged in more than the room. The view labels it as device temperature rather than
+presenting it as something it isn't.
+
+### Decision: accumulate the daily summary, don't recompute it
+
+Every other rollup recomputes a day from a raw series retained longer than the re-roll window.
+Temperature cannot work that way: its source is `RawDeviceMeasurements`, pruned after 24 hours, which
+is *shorter* than the two-day re-roll window. Recomputing yesterday at 23:00 would see only the last
+hour of it still inside that window and would overwrite a complete day with a sliver.
+
+So `TemperatureDaily` is folded into incrementally. It stores `temp_sum` and `samples` rather than an
+average, so merging is exact, and a `last_ts` watermark so only samples newer than the previous pass
+are added. Min and max merge as `MIN(existing, new)` / `MAX(existing, new)`.
+
+The whole fold is a single `INSERT ... SELECT ... ON CONFLICT DO UPDATE`, so reading the watermark
+and advancing it cannot interleave with another pass. Re-running with nothing new is a no-op, which is
+what makes it safe to call every few minutes.
+
+The consequence worth stating: temperature history begins the day this shipped. Unlike the energy
+tiers, which were backfilled from 47 days of retained 2s samples, there is nothing to backfill from —
+those days' raw temperature readings were already gone.
+
+### Presentation
+
+One row per day drawing the min-to-max span as a bar on a shared scale, with the mean marked inside
+it, rather than a line chart of daily averages. A day's spread is as informative as its middle for a
+temperature, and the horizontal drift of the bars shows a warming or cooling run without reading any
+numbers.
+
 ## Tiered measurement retention (2026-08-17)
 
 ### Problem

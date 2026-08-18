@@ -61,6 +61,10 @@ const ROLLUP_THROTTLE: Duration = Duration::from_millis(200);
 /// one short, and the backlog drains over the following passes rather than
 /// monopolising the database in one go.
 const PRUNE_BATCHES_PER_PASS: usize = 25;
+/// How many days of daily temperature history the Environment view shows. Bounded
+/// so the range chart stays readable in a terminal rather than by what is stored —
+/// `TemperatureDaily` is kept indefinitely.
+const ENVIRONMENT_HISTORY_DAYS: i64 = 21;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -128,6 +132,19 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if let Ok(data) = db::query_internet_traffic_today(&pool).await {
                     state.write().unwrap().internet_traffic_chart = data;
+                }
+                // Daily temperature history for the Environment view. Read here
+                // rather than during render so the view stays a pure function of
+                // state, like every other one.
+                let today = chrono::Local::now().date_naive();
+                if let Ok(rows) = db::query_daily_temperature(
+                    &pool,
+                    today - chrono::Duration::days(ENVIRONMENT_HISTORY_DAYS),
+                    today,
+                )
+                .await
+                {
+                    state.write().unwrap().temperature_history = rows;
                 }
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }

@@ -496,6 +496,20 @@ async fn event_loop(
                                 app.stats.forward();
                                 stats_reload = true;
                             }
+                            Event::Key(KeyEvent { code: KeyCode::Char('v' | 'V'), .. }) => {
+                                app.view = View::Environment;
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Up, .. })
+                                if app.view == View::Environment =>
+                            {
+                                app.env_selected = app.env_selected.saturating_sub(1);
+                            }
+                            Event::Key(KeyEvent { code: KeyCode::Down, .. })
+                                if app.view == View::Environment =>
+                            {
+                                let max = render::temperature_sensors(&app).len().saturating_sub(1);
+                                app.env_selected = (app.env_selected + 1).min(max);
+                            }
                             Event::Key(KeyEvent { code: KeyCode::Char('t' | 'T'), .. }) => {
                                 app.theme_mode = app.theme_mode.toggled();
                                 theme_chosen = Some(app.theme_mode);

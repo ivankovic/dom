@@ -31,9 +31,11 @@ There are five views:
 - **Network** ('n'): routers, modems and access points, their health, and Internet traffic.
 - **Devices** ('d'): every device discovered on the network, configured or not, with a detail panel.
 - **Statistics** ('w'/'m'/'y'): long-term energy totals and self-sufficiency, by week, month or year.
+- **Environment** ('v'): device temperatures, live and as a daily range history.
 
-Security, Environment and Household are intended categories that are not implemented yet — no
-sensors of those kinds are supported, and there are no views for them.
+Security and Household are intended categories that are not implemented yet — no alarm, camera,
+smoke, vacuum or mower devices are supported, so there is nothing for those views to show and they
+do not exist.
 
 ### Keyboard shortcuts
 
@@ -49,6 +51,7 @@ sensors of those kinds are supported, and there are no views for them.
 | w | Statistics, weekly |
 | m | Statistics, monthly |
 | y | Statistics, yearly |
+| v | Environment view |
 | Left, Right | In Statistics: previous/next period |
 | s | Rescan now (wakes the ping scan and discovery immediately) |
 | r | Rename the selected device |
@@ -136,6 +139,25 @@ Grid import and export are split when the day is rolled up, not afterwards: the 
 signed, and a daily sum of it would collapse the two into a net figure that could not be separated
 again.
 
+## Environment view
+
+Temperatures reported by your devices, with the sensor list on top and a history chart below it for
+whichever sensor is selected (Up/Down to change).
+
+**These are device temperatures, not room temperatures.** The only hardware Dom supports that
+reports one is the myStrom switch, and what it reports is its own case temperature — which tracks
+the appliance plugged into it more than the room it sits in. The view says so rather than presenting
+the figure as ambient.
+
+Each sensor row shows the live reading and today's range so far. Below, one row per day draws that
+day's minimum-to-maximum span as a bar across a shared temperature scale, with the daily mean marked
+inside it — so a run of warming or cooling days is visible as the bars drift across the scale,
+without reading any numbers.
+
+Daily figures are accumulated as each day happens rather than computed afterwards, because their
+source (`RawDeviceMeasurements`) is kept for only 24 hours. That also means history starts from the
+day this feature was first run; earlier days cannot be reconstructed.
+
 ## Supported devices
 
 - Sonnen Eco 8 battery
@@ -172,7 +194,9 @@ Energy is stored at three resolutions, each retained for progressively longer:
 | 1 minute | 90 days | The finest resolution anything displays. Summing 2-second energies into a minute is exactly lossless for totals. |
 | 1 day | forever | What the Statistics view reads. Tiny — a few thousand rows a year. |
 
-Battery state of charge is summarised to a daily min/max/average on the same schedule.
+Battery state of charge, and device temperature, are each summarised to a daily min/max/average on
+the same schedule. Temperature is folded in incrementally as the day passes, since its source is kept
+for only 24 hours and so cannot be re-read later.
 
 This matters because the 2-second series is large: a month of it is millions of rows, and keeping it
 indefinitely grew the database by roughly a gigabyte a month while storing about thirty times the
