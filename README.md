@@ -30,7 +30,7 @@ There are five views:
 - **Energy** ('e'): consumption, production, grid and battery in detail.
 - **Network** ('n'): routers, modems and access points, their health, and Internet traffic.
 - **Devices** ('d'): every device discovered on the network, configured or not, with a detail panel.
-- **Statistics** ('w'/'m'/'y'): long-term energy totals and self-sufficiency, by week, month or year.
+- **Statistics** ('m'/'y'): long-term energy totals and self-sufficiency, by month or year.
 - **Environment** ('v'): device temperatures, live and as a daily range history.
 
 Security and Household are intended categories that are not implemented yet — no alarm, camera,
@@ -48,7 +48,6 @@ do not exist.
 | e | Energy view |
 | n | Network view |
 | d | Devices view |
-| w | Statistics, weekly |
 | m | Statistics, monthly |
 | y | Statistics, yearly |
 | v | Environment view |
@@ -107,10 +106,10 @@ the wallbox confirms it.
 
 ## Statistics view
 
-Long-term energy, aggregated by calendar period. 'w', 'm' and 'y' each open the view directly on the
-weekly, monthly or yearly window; pressing the same key again returns to the current period after
-you have browsed. Left and Right step back and forward one period, stopping at the oldest recorded
-day and at today.
+Long-term energy, aggregated by calendar period. 'm' and 'y' each open the view directly on the
+monthly or yearly window; pressing the same key again returns to the current period after you have
+browsed. Left and Right step back and forward one period, stopping at the oldest recorded day and at
+today.
 
 The top shows period totals — consumption, production, grid import, grid export — and two ratios:
 
@@ -125,7 +124,7 @@ consumption relative to the largest in view, split into the part covered by your
 the part imported, so the self-sufficiency of each day is visible without reading the numbers. A day
 with no recorded data is marked as such rather than drawn as a zero.
 
-The current period is partial: this week means Monday to today, not Monday to Sunday.
+The current period is partial: this month means the 1st to today, not the 1st to the 31st.
 
 ### Where the numbers come from
 

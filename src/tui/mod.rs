@@ -466,14 +466,9 @@ async fn event_loop(
                             // Switches between the dark and light palettes. Recorded
                             // as an explicit choice, which from now on overrides
                             // terminal auto-detection on every startup.
-                            // Each of w/m/y opens the statistics view directly on
+                            // Each of m/y opens the statistics view directly on
                             // that window; pressing the same one again returns to
                             // the current period after browsing.
-                            Event::Key(KeyEvent { code: KeyCode::Char('w' | 'W'), .. }) => {
-                                app.view = View::Statistics;
-                                app.stats.set_window(crate::stats::StatsWindow::Week);
-                                stats_reload = true;
-                            }
                             Event::Key(KeyEvent { code: KeyCode::Char('m' | 'M'), .. }) => {
                                 app.view = View::Statistics;
                                 app.stats.set_window(crate::stats::StatsWindow::Month);

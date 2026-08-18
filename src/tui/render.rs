@@ -100,7 +100,7 @@ fn render_statistics_view(f: &mut Frame, area: Rect, app: &App) {
                 .style(Style::default().add_modifier(Modifier::BOLD)),
             Span::from(st.title.clone()).style(Style::default().fg(theme.focus_border)),
             browsing,
-            Span::from("   w/m/y window · ←/→ period").style(Style::default().fg(theme.inactive)),
+            Span::from("   m/y window · ←/→ period").style(Style::default().fg(theme.inactive)),
         ])),
         rows[0],
     );
@@ -792,7 +792,7 @@ fn gauge_row_ratio(f: &mut Frame, area: Rect, theme: &Theme, g: Gauge, ratio: f6
 
 fn render_statusbar(f: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
-    let nav = "[c] current  [e] energy  [n] network  [d] devices  [v] environment  [w/m/y] stats  [s] rescan";
+    let nav = "[c] current  [e] energy  [n] network  [d] devices  [v] environment  [m/y] stats  [s] rescan";
     let focus_hints = if app.timer_dialog.is_some() {
         "[Tab] switch field  [Enter] save  [Esc] cancel  [Ctrl+C] quit".to_string()
     } else if app.rename_input.is_some() {
@@ -802,7 +802,7 @@ fn render_statusbar(f: &mut Frame, area: Rect, app: &App) {
     } else if app.view == View::Environment {
         "[↑↓] select sensor  [t] theme  [q] quit".to_string()
     } else if app.view == View::Statistics {
-        "[←→] period  [w] weekly  [m] monthly  [y] yearly  [t] theme  [q] quit".to_string()
+        "[←→] period  [m] monthly  [y] yearly  [t] theme  [q] quit".to_string()
     } else if app.view == View::Network || app.view == View::Current {
         "[q] quit".to_string()
     } else if app.focus == Focus::Detail {
@@ -1952,7 +1952,7 @@ mod tests {
                 totals: Totals::default(),
                 has_data: false,
             }],
-            StatsWindow::Week,
+            StatsWindow::Month,
         );
         let out = draw(&app, 120, 24);
         assert!(
@@ -1992,7 +1992,7 @@ mod tests {
 
     #[test]
     fn statusbar_advertises_the_statistics_keys() {
-        let app = stats_app(vec![bucket("1", 1.0, 1.0, 0.0)], StatsWindow::Week);
+        let app = stats_app(vec![bucket("1", 1.0, 1.0, 0.0)], StatsWindow::Month);
         let out = draw(&app, 160, 10);
         assert!(out.contains("stats"), "{out}");
         assert!(out.contains("period"), "{out}");

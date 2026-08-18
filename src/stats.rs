@@ -26,19 +26,18 @@
 //! database or a terminal. `db::query_daily_energy` supplies the input and
 //! `tui::render` draws the output.
 
-use chrono::{Datelike, Duration, Months, NaiveDate};
+use chrono::{Datelike, Months, NaiveDate};
 
 use crate::db::DailyEnergy;
 
 /// Calendar spans the statistics view can aggregate over.
 ///
-/// Calendar-aligned rather than rolling: the week is Monday to Sunday and the
-/// month is the 1st to the last, so browsing back with Left lands on periods a
-/// person recognizes ("July") instead of arbitrary 30-day slices.
+/// Calendar-aligned rather than rolling: a month is the 1st to the last, a year
+/// January to December, so browsing back with Left lands on periods a person
+/// recognizes ("July") instead of arbitrary 30-day slices.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum StatsWindow {
     #[default]
-    Week,
     Month,
     Year,
 }
@@ -46,7 +45,6 @@ pub enum StatsWindow {
 impl StatsWindow {
     pub fn label(self) -> &'static str {
         match self {
-            StatsWindow::Week => "Weekly",
             StatsWindow::Month => "Monthly",
             StatsWindow::Year => "Yearly",
         }
@@ -99,7 +97,7 @@ impl Totals {
     }
 }
 
-/// One bar: a day for the weekly and monthly windows, a month for the yearly one.
+/// One bar: a day for the monthly window, a month for the yearly one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bucket {
     /// Short axis label — a day number, or a three-letter month.
@@ -170,11 +168,6 @@ impl Stats {
 /// 31st, so partial periods report what has actually happened.
 pub fn range(window: StatsWindow, offset: u32, today: NaiveDate) -> (NaiveDate, NaiveDate) {
     let (start, end) = match window {
-        StatsWindow::Week => {
-            let monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
-            let start = monday - Duration::weeks(offset as i64);
-            (start, start + Duration::days(6))
-        }
         StatsWindow::Month => {
             let first = today.with_day(1).unwrap_or(today);
             let start = first
@@ -199,11 +192,6 @@ pub fn range(window: StatsWindow, offset: u32, today: NaiveDate) -> (NaiveDate, 
 /// Name of the period a range belongs to, for the view's header.
 pub fn title(window: StatsWindow, start: NaiveDate) -> String {
     match window {
-        StatsWindow::Week => format!(
-            "Week {} — {}",
-            start.iso_week().week(),
-            start.format("%-d %b %Y")
-        ),
         StatsWindow::Month => start.format("%B %Y").to_string(),
         StatsWindow::Year => start.format("%Y").to_string(),
     }
@@ -225,7 +213,7 @@ pub fn bucketize(
     let mut index: Vec<(NaiveDate, NaiveDate)> = Vec::new();
 
     match window {
-        StatsWindow::Week | StatsWindow::Month => {
+        StatsWindow::Month => {
             let mut d = start;
             while d <= end {
                 buckets.push(Bucket {
@@ -345,31 +333,6 @@ mod tests {
     // ── range ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn week_range_starts_on_monday_and_stops_at_today() {
-        // 2026-08-17 is a Monday, 2026-08-19 a Wednesday.
-        let (s, e) = range(StatsWindow::Week, 0, day("2026-08-19"));
-        assert_eq!(s, day("2026-08-17"), "week must start on Monday");
-        // Current week is partial: it must not run on to a future Sunday.
-        assert_eq!(e, day("2026-08-19"));
-    }
-
-    #[test]
-    fn past_week_range_is_a_full_monday_to_sunday() {
-        let (s, e) = range(StatsWindow::Week, 1, day("2026-08-19"));
-        assert_eq!(s, day("2026-08-10"));
-        assert_eq!(e, day("2026-08-16"));
-        assert_eq!(e.weekday(), chrono::Weekday::Sun);
-    }
-
-    #[test]
-    fn week_range_of_a_sunday_uses_the_week_that_sunday_ends() {
-        // A Sunday is day 7 of its week, not the start of a new one.
-        let (s, e) = range(StatsWindow::Week, 0, day("2026-08-16"));
-        assert_eq!(s, day("2026-08-10"));
-        assert_eq!(e, day("2026-08-16"));
-    }
-
-    #[test]
     fn month_range_covers_the_calendar_month() {
         let (s, e) = range(StatsWindow::Month, 0, day("2026-08-17"));
         assert_eq!(s, day("2026-08-01"));
@@ -466,16 +429,16 @@ mod tests {
     // ── bucketize ────────────────────────────────────────────────────────────
 
     #[test]
-    fn weekly_buckets_are_one_per_day_with_gaps_marked() {
+    fn monthly_buckets_are_one_per_day_with_gaps_marked() {
         let start = day("2026-08-10");
         let end = day("2026-08-16");
         let daily = vec![
             de("2026-08-10", 1.0, 2.0, 0.5, 1.0),
             de("2026-08-12", 3.0, 0.0, 3.0, 0.0),
         ];
-        let b = bucketize(StatsWindow::Week, start, end, &daily);
+        let b = bucketize(StatsWindow::Month, start, end, &daily);
 
-        assert_eq!(b.len(), 7, "a full week is seven bars");
+        assert_eq!(b.len(), 7, "one bar per day in the range");
         assert!(b[0].has_data);
         assert_eq!(b[0].totals.consumption_kwh, 1.0);
         assert!(
@@ -517,7 +480,7 @@ mod tests {
             de("2026-08-20", 99.0, 0.0, 0.0, 0.0), // after
         ];
         let b = bucketize(
-            StatsWindow::Week,
+            StatsWindow::Month,
             day("2026-08-10"),
             day("2026-08-16"),
             &daily,
@@ -530,8 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn a_week_straddling_the_start_of_history_marks_the_days_before_it() {
-        // Browsing back to the week recording began in: only the days from the
+    fn a_period_straddling_the_start_of_history_marks_the_days_before_it() {
+        // Browsing back to the period recording began in: only the days from the
         // first recorded day onwards have data. The earlier ones must be gaps,
         // not zero bars that would drag the average down.
         let start = day("2026-06-29"); // Monday
@@ -540,7 +503,7 @@ mod tests {
             de("2026-07-01", 20.0, 30.0, 1.0, 10.0),
             de("2026-07-02", 22.0, 28.0, 2.0, 8.0),
         ];
-        let b = bucketize(StatsWindow::Week, start, end, &daily);
+        let b = bucketize(StatsWindow::Month, start, end, &daily);
 
         assert_eq!(b.len(), 7);
         assert!(!b[0].has_data, "29 Jun predates the data");
@@ -561,7 +524,7 @@ mod tests {
             de("2026-08-11", 10.0, 20.0, 30.0, 40.0),
         ];
         let t = total(&bucketize(
-            StatsWindow::Week,
+            StatsWindow::Month,
             day("2026-08-10"),
             day("2026-08-16"),
             &daily,

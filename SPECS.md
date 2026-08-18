@@ -260,7 +260,7 @@ is an operator action with Dom stopped, not something the app should do to itsel
 
 ### Problem
 
-The weekly/monthly/yearly statistics view cannot be served from the `Energy` table. That table holds
+The monthly/yearly statistics view cannot be served from the `Energy` table. That table holds
 one row per metric per 2 seconds and nothing prunes it: 47 days of recording is 12.7 million rows and
 1.7 GB, and a bare `COUNT(*)` over it measured at 16 seconds. A month is millions of rows and a year
 would be a hundred million — far past what a view can aggregate while someone waits.
@@ -333,10 +333,13 @@ spreads out instead of competing for disk. Steady state is two device-days per p
 
 ### Calendar periods, not rolling windows
 
-Weeks are Monday to Sunday, months are the 1st to the last, years are January to December — so
-browsing back with Left lands on periods a person recognizes rather than arbitrary 30-day slices. The
-current period is clamped to end at today, so a partial week reports what has actually happened rather
-than implying a full one.
+Months are the 1st to the last and years January to December — so browsing back with Left lands on
+periods a person recognizes rather than arbitrary 30-day slices. The current period is clamped to end
+at today, so a partial month reports what has actually happened rather than implying a full one.
+
+A weekly window existed initially and was removed (2026-08-18): with a month already shown as
+individual days, a week was the same bars over a shorter span rather than a different view of the
+data, and it cost a third entry key.
 
 Browsing back stops once a period would end before the oldest day that has any data, rather than
 walking indefinitely through empty periods.
