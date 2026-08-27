@@ -1,35 +1,43 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 //! Outbound calls to public online services.
 //!
-//! Everything else Dom talks to is on the LAN. These two are not, which makes
+//! Everything else Dom talks to is on the LAN. These three are not, which makes
 //! them the only places the app reaches the internet:
 //!
 //! - [`geocode`] turns an address into coordinates, via swisstopo's federal
 //!   search API.
 //! - [`weather`] reads outdoor temperature from MeteoSwiss open data.
+//! - [`forecast`] reads the solar-irradiance forecast that predicted production
+//!   is computed from, via Open-Meteo.
 //!
-//! Both are plain unauthenticated GETs over TLS, and both are optional: with no
-//! location configured, nothing here is ever called.
+//! All three are plain unauthenticated GETs over TLS, and all three are
+//! optional: with no location configured, nothing here is ever called.
+//!
+//! Note that [`forecast`] is the one whose terms bind a *licensee* rather than
+//! just this program — Open-Meteo's free tier is non-commercial. See SPECS.md.
 
+pub mod forecast;
 pub mod geocode;
 pub mod https;
 pub mod weather;

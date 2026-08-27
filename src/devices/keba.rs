@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::net::{IpAddr, SocketAddr};
@@ -372,7 +374,7 @@ pub async fn poll_loop(
 
     let mut prev: Option<(f64, DateTime<Utc>)> = None;
     let mut prev_plug: Option<u8> = None;
-    let mut failures: u8 = 0;
+    let mut failures: u32 = 0;
 
     loop {
         ticker.tick().await;
@@ -481,11 +483,56 @@ const ECO_DISABLE_HYSTERESIS_MA: u32 = 2000;
 /// wobble doesn't tip the car into drawing from the grid — it costs a little
 /// unclaimed export instead.
 const ECO_SAFETY_MARGIN: f64 = 0.9;
-const MAINS_VOLTAGE: f64 = 230.0;
-/// This wallbox is wired 3-phase — confirmed from a live capture where
-/// P = 11.04 kW exactly matches 16A × 230V × 3. Sites wired single-phase would
-/// need this changed to 1.0.
-const PHASES: f64 = 3.0;
+/// Defaults for the site's electrical supply, used until the database says
+/// otherwise. 230 V and three phases describe the installation this was written
+/// against — confirmed from a live capture where P = 11.04 kW exactly matches
+/// 16 A × 230 V × 3.
+///
+/// They are defaults rather than constants because they are facts about a
+/// building, not about the protocol, and a wrong value does not fail: it scales
+/// every Eco target by the ratio it is wrong by. A single-phase site left on
+/// these would command three times the current it should. See `Supply`.
+const DEFAULT_MAINS_VOLTAGE: f64 = 230.0;
+const DEFAULT_PHASES: f64 = 3.0;
+
+/// The site's electrical supply, as Eco mode needs it to convert power to current.
+///
+/// Read from the database rather than compiled in, since it describes the
+/// building Dom is installed in. Stored in `Config` rather than on the wallbox's
+/// own row because it is a property of the supply, which every device on the
+/// site shares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Supply {
+    pub volts: f64,
+    pub phases: f64,
+}
+
+impl Default for Supply {
+    fn default() -> Self {
+        Self {
+            volts: DEFAULT_MAINS_VOLTAGE,
+            phases: DEFAULT_PHASES,
+        }
+    }
+}
+
+impl Supply {
+    /// Volt-amps per amp of charging current: what a target current costs, and
+    /// therefore what divides available power to get one.
+    fn watts_per_amp(self) -> f64 {
+        self.volts * self.phases
+    }
+
+    /// Whether these values could describe a real supply.
+    ///
+    /// A stored value that cannot is ignored in favour of the default, because
+    /// the failure mode is silent: zero or a negative would send the target to
+    /// infinity or negative, and a plausible-looking but wrong figure mis-scales
+    /// every decision. Anything outside these bounds is a typo, not a building.
+    pub fn is_plausible(self) -> bool {
+        (100.0..=500.0).contains(&self.volts) && (1.0..=3.0).contains(&self.phases)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EcoDecision {
@@ -564,18 +611,19 @@ enum EcoDecision {
 /// `MIN_CURR_MA`; only the decision of *whether* to keep charging gets the
 /// lower bar.
 fn eco_decision(
-    avg_production_w: f64,
-    avg_consumption_w: f64,
-    avg_pac_w: f64,
+    house: crate::db::SonnenAvgs,
     avg_car_w: f64,
     car_first: bool,
     curr_hw_ma: u32,
     currently_charging: bool,
+    supply: Supply,
 ) -> EcoDecision {
+    let (avg_production_w, avg_consumption_w, avg_pac_w) =
+        (house.production_w, house.consumption_w, house.pac_w);
     let battery_term = if car_first { 0.0 } else { avg_pac_w.min(0.0) };
     let available_w =
         (avg_production_w - avg_consumption_w + avg_car_w + battery_term) * ECO_SAFETY_MARGIN;
-    let target_ma = available_w / (MAINS_VOLTAGE * PHASES) * 1000.0;
+    let target_ma = available_w / supply.watts_per_amp() * 1000.0;
 
     let min_ma = if currently_charging {
         MIN_CURR_MA.saturating_sub(ECO_DISABLE_HYSTERESIS_MA)
@@ -583,7 +631,12 @@ fn eco_decision(
         MIN_CURR_MA
     };
 
-    if target_ma < min_ma as f64 {
+    // A hardware ceiling below the protocol floor leaves no current that can
+    // legally be commanded, so there is nothing to charge at. Checked before the
+    // clamp because `.min(curr_hw_ma)` would otherwise undo the `.max` below and
+    // send a current under the floor — `curr 0` followed by `ena 1` in the worst
+    // case, with `currently_charging` then set as though the car were drawing.
+    if curr_hw_ma < MIN_CURR_MA || target_ma < min_ma as f64 {
         EcoDecision::Disable
     } else {
         EcoDecision::SetCurrent((target_ma as u32).max(MIN_CURR_MA).min(curr_hw_ma))
@@ -637,14 +690,17 @@ pub async fn eco_loop(pool: SqlitePool, device: DeviceRecord, state: SharedState
             .map(|r| r.curr_hw_ma)
             .unwrap_or(MIN_CURR_MA);
 
+        // Re-read each tick rather than captured at spawn, so correcting the
+        // supply in the database takes effect without a restart.
+        let supply = crate::db::get_supply(&pool).await;
+
         let decision = eco_decision(
-            avgs.production_w,
-            avgs.consumption_w,
-            avgs.pac_w,
+            avgs,
             avg_car_w,
             car_first,
             curr_hw_ma,
             currently_charging,
+            supply,
         );
         currently_charging = matches!(decision, EcoDecision::SetCurrent(_));
         let result = match decision {
@@ -662,7 +718,19 @@ pub async fn eco_loop(pool: SqlitePool, device: DeviceRecord, state: SharedState
 
 #[cfg(test)]
 mod tests {
-    use super::{ECO_SAFETY_MARGIN, EcoDecision, eco_decision, is_report_reply};
+    use super::{
+        ECO_SAFETY_MARGIN, EcoDecision, MIN_CURR_MA, Supply, eco_decision, is_report_reply,
+    };
+    use crate::db::SonnenAvgs;
+
+    /// The house's side of an Eco decision, as the Sonnen reports it.
+    fn avgs(production_w: f64, consumption_w: f64, pac_w: f64) -> SonnenAvgs {
+        SonnenAvgs {
+            production_w,
+            consumption_w,
+            pac_w,
+        }
+    }
 
     // Live-observed shape: KEBA pushes these to the last UDP sender on its own,
     // independent of any request, whenever a single tracked value changes.
@@ -697,7 +765,14 @@ mod tests {
     fn eco_decision_charges_at_available_surplus_with_no_car_or_battery_load() {
         // 6kW production, no other consumption, battery idle — should enable
         // at ~90% of 6kW / (230*3), holding back the safety margin.
-        let d = eco_decision(6000.0, 0.0, 0.0, 0.0, false, 20_000, false);
+        let d = eco_decision(
+            avgs(6000.0, 0.0, 0.0),
+            0.0,
+            false,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(
             d,
             EcoDecision::SetCurrent((6000.0 * ECO_SAFETY_MARGIN / (230.0 * 3.0) * 1000.0) as u32)
@@ -713,7 +788,14 @@ mod tests {
         // consumption dropped back down. 6100W production covers the 6000W
         // baseline-plus-car and leaves ~100W over, plus the 6000W the car
         // itself is already using — a stable ~6100W is available in total.
-        let d = eco_decision(6100.0, 6000.0, 0.0, 6000.0, false, 20_000, false);
+        let d = eco_decision(
+            avgs(6100.0, 6000.0, 0.0),
+            6000.0,
+            false,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(
             d,
             EcoDecision::SetCurrent((6100.0 * ECO_SAFETY_MARGIN / (230.0 * 3.0) * 1000.0) as u32)
@@ -726,7 +808,14 @@ mod tests {
         // otherwise idle, but the battery is pulling in 3kW (pac = -3000,
         // Sonnen's charging convention) — only 7kW is left over for the car,
         // not the full 10kW production, because the battery has priority.
-        let d = eco_decision(10_000.0, 0.0, -3000.0, 0.0, false, 20_000, false);
+        let d = eco_decision(
+            avgs(10_000.0, 0.0, -3000.0),
+            0.0,
+            false,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(
             d,
             EcoDecision::SetCurrent((7000.0 * ECO_SAFETY_MARGIN / (230.0 * 3.0) * 1000.0) as u32)
@@ -746,7 +835,14 @@ mod tests {
         // "target", a fixed point that never commands a reduction no matter
         // how far over production it runs. Clamping discharge to zero breaks
         // the lock: available must fall to the real 6kW surplus.
-        let d = eco_decision(8000.0, 11_000.0, 3000.0, 9000.0, false, 20_000, false);
+        let d = eco_decision(
+            avgs(8000.0, 11_000.0, 3000.0),
+            9000.0,
+            false,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(
             d,
             EcoDecision::SetCurrent((6000.0 * ECO_SAFETY_MARGIN / (230.0 * 3.0) * 1000.0) as u32)
@@ -759,7 +855,14 @@ mod tests {
         // in 3kW as the battery-priority test above, but here the car claims
         // the full 10kW production regardless of what the battery would
         // otherwise take — the battery term is left out entirely.
-        let d = eco_decision(10_000.0, 0.0, -3000.0, 0.0, true, 20_000, false);
+        let d = eco_decision(
+            avgs(10_000.0, 0.0, -3000.0),
+            0.0,
+            true,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(
             d,
             EcoDecision::SetCurrent((10_000.0 * ECO_SAFETY_MARGIN / (230.0 * 3.0) * 1000.0) as u32)
@@ -771,7 +874,14 @@ mod tests {
         // ChargingMode::EcoCarFirst: the battery discharging (pac = +2000)
         // must not inflate the car's allowance either — car_first ignores
         // pac in both directions, not just when it would help the car.
-        let d = eco_decision(5000.0, 0.0, 2000.0, 0.0, true, 20_000, false);
+        let d = eco_decision(
+            avgs(5000.0, 0.0, 2000.0),
+            0.0,
+            true,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(
             d,
             EcoDecision::SetCurrent((5000.0 * ECO_SAFETY_MARGIN / (230.0 * 3.0) * 1000.0) as u32)
@@ -783,7 +893,14 @@ mod tests {
         // Only 2kW production, nothing else going on — nowhere near enough
         // for even the 6A protocol floor, so disable rather than limp along
         // under the minimum.
-        let d = eco_decision(2000.0, 0.0, 0.0, 0.0, false, 20_000, false);
+        let d = eco_decision(
+            avgs(2000.0, 0.0, 0.0),
+            0.0,
+            false,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(d, EcoDecision::Disable);
     }
 
@@ -793,7 +910,14 @@ mod tests {
         // margin brings it to 4095W — not enough for the 6A protocol floor
         // (4140W), and this charger isn't running yet, so the full floor
         // applies (no hysteresis discount for a cold start).
-        let d = eco_decision(4550.0, 0.0, 0.0, 0.0, false, 20_000, false);
+        let d = eco_decision(
+            avgs(4550.0, 0.0, 0.0),
+            0.0,
+            false,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(d, EcoDecision::Disable);
     }
 
@@ -805,7 +929,14 @@ mod tests {
         // already running rides this out rather than shutting off and
         // immediately re-qualifying next tick; the commanded current is still
         // clamped up to the real 6A floor, never actually sent below it.
-        let d = eco_decision(4000.0, 0.0, 0.0, 0.0, false, 20_000, true);
+        let d = eco_decision(
+            avgs(4000.0, 0.0, 0.0),
+            0.0,
+            false,
+            20_000,
+            true,
+            Supply::default(),
+        );
         assert_eq!(d, EcoDecision::SetCurrent(6000));
     }
 
@@ -814,7 +945,14 @@ mod tests {
         // Same numbers as the test above, but the charger is currently off.
         // Hysteresis only rides out a dip in an *already-running* charger —
         // it must not lower the bar for starting one up in the first place.
-        let d = eco_decision(4000.0, 0.0, 0.0, 0.0, false, 20_000, false);
+        let d = eco_decision(
+            avgs(4000.0, 0.0, 0.0),
+            0.0,
+            false,
+            20_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(d, EcoDecision::Disable);
     }
 
@@ -823,14 +961,142 @@ mod tests {
         // production=2000 (others 0) puts the target far below even the
         // hysteresis-relaxed floor (2609mA vs. the 4000mA lower bound) — a
         // charger that's already running must still shut off here.
-        let d = eco_decision(2000.0, 0.0, 0.0, 0.0, false, 20_000, true);
+        let d = eco_decision(
+            avgs(2000.0, 0.0, 0.0),
+            0.0,
+            false,
+            20_000,
+            true,
+            Supply::default(),
+        );
         assert_eq!(d, EcoDecision::Disable);
     }
 
     #[test]
     fn eco_decision_clamps_to_hardware_current_ceiling() {
         // Huge surplus, but this cable/charger caps out at 16A.
-        let d = eco_decision(50_000.0, 0.0, 0.0, 0.0, false, 16_000, false);
+        let d = eco_decision(
+            avgs(50_000.0, 0.0, 0.0),
+            0.0,
+            false,
+            16_000,
+            false,
+            Supply::default(),
+        );
         assert_eq!(d, EcoDecision::SetCurrent(16_000));
+    }
+
+    #[test]
+    fn a_hardware_ceiling_below_the_floor_disables_rather_than_undercutting_it() {
+        // `eco_decision` documents that the commanded current is always at least
+        // MIN_CURR_MA, but `.min(curr_hw_ma)` used to undo that: a wallbox
+        // reporting a bad "Curr HW" got a current below the protocol floor, and
+        // `SetCurrent(0)` was sent as `curr 0` + `ena 1`.
+        let plenty = 20_000.0;
+        for ceiling in [0, 1, MIN_CURR_MA - 1] {
+            assert_eq!(
+                eco_decision(
+                    avgs(plenty, 0.0, 0.0),
+                    0.0,
+                    false,
+                    ceiling,
+                    false,
+                    Supply::default()
+                ),
+                EcoDecision::Disable,
+                "ceiling {ceiling}"
+            );
+        }
+        // At the floor exactly, charging is still possible.
+        assert_eq!(
+            eco_decision(
+                avgs(plenty, 0.0, 0.0),
+                0.0,
+                false,
+                MIN_CURR_MA,
+                false,
+                Supply::default()
+            ),
+            EcoDecision::SetCurrent(MIN_CURR_MA)
+        );
+    }
+
+    #[test]
+    fn a_commanded_current_is_never_below_the_protocol_floor() {
+        // Swept across the whole decision space rather than spot-checked.
+        for available in [-5000.0, 0.0, 1000.0, 4000.0, 12_000.0, 50_000.0] {
+            for ceiling in [0, 3000, MIN_CURR_MA, 16_000, 32_000] {
+                for charging in [false, true] {
+                    if let EcoDecision::SetCurrent(ma) = eco_decision(
+                        avgs(available, 0.0, 0.0),
+                        0.0,
+                        false,
+                        ceiling,
+                        charging,
+                        Supply::default(),
+                    ) {
+                        assert!(ma >= MIN_CURR_MA, "{available} W / {ceiling} mA gave {ma}");
+                        assert!(ma <= ceiling, "{ma} exceeds the hardware ceiling {ceiling}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Site electrical supply ────────────────────────────────────────────────
+
+    #[test]
+    fn the_default_supply_is_the_installation_this_was_written_against() {
+        let s = Supply::default();
+        assert_eq!((s.volts, s.phases), (230.0, 3.0));
+        assert!(s.is_plausible());
+        // 16 A on this supply is the 11.04 kW seen in a live capture.
+        assert!((16.0 * s.watts_per_amp() - 11_040.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_single_phase_site_is_given_a_third_of_the_current() {
+        // The reason this is configuration and not a constant: the same surplus
+        // means a different current, and getting it wrong does not fail — it
+        // commands three times what the supply can carry.
+        let surplus = 6_900.0 / ECO_SAFETY_MARGIN;
+        let three = Supply::default();
+        let one = Supply {
+            volts: 230.0,
+            phases: 1.0,
+        };
+        let ma =
+            |s: Supply| match eco_decision(avgs(surplus, 0.0, 0.0), 0.0, false, 32_000, false, s) {
+                EcoDecision::SetCurrent(ma) => ma,
+                EcoDecision::Disable => panic!("expected charging at {surplus} W"),
+            };
+        let (three_phase, single_phase) = (ma(three), ma(one));
+        assert!(
+            (single_phase as f64 / 3.0 - three_phase as f64).abs() < 2.0,
+            "three-phase {three_phase} mA, single-phase {single_phase} mA"
+        );
+    }
+
+    #[test]
+    fn a_supply_that_cannot_describe_a_building_is_rejected() {
+        for (volts, phases) in [
+            (0.0, 3.0),    // would send the target to infinity
+            (-230.0, 3.0), // ...or negative
+            (230.0, 0.0),
+            (230.0, 4.0),    // no such supply
+            (12.0, 1.0),     // not mains
+            (10_000.0, 3.0), // not a house
+        ] {
+            assert!(
+                !Supply { volts, phases }.is_plausible(),
+                "{volts} V / {phases}"
+            );
+        }
+        for (volts, phases) in [(230.0, 3.0), (230.0, 1.0), (120.0, 1.0), (400.0, 3.0)] {
+            assert!(
+                Supply { volts, phases }.is_plausible(),
+                "{volts} V / {phases}"
+            );
+        }
     }
 }

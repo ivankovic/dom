@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
@@ -26,7 +28,31 @@ use std::str::FromStr;
 pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     let opts = SqliteConnectOptions::from_str(uri)
         .map_err(|e| anyhow::anyhow!(e))?
-        .create_if_missing(true);
+        .create_if_missing(true)
+        // With WAL, `NORMAL` stops flushing the disk on every commit and flushes
+        // at checkpoints instead. What that risks is the last few committed
+        // transactions on a power cut; it changes nothing about surviving the
+        // *process* dying, which WAL already guarantees.
+        //
+        // The trade is heavily one-sided here. The data is a series sampled every
+        // two seconds, so losing the last moments of it after a power cut is
+        // invisible and the coarser tiers re-derive from what remains. The cost
+        // of `FULL` is a disk flush per commit, forever — on an SD card that is
+        // both the dominant latency and what wears the card out.
+        //
+        // Set on the options rather than by issuing `PRAGMA synchronous`, because
+        // it is a property of a *connection*: running the pragma against the pool
+        // sets it on whichever one connection happened to serve the query, and
+        // leaves every other connection on the default.
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        // Freed pages go on a list that `reclaim_free_pages` hands back a few at
+        // a time, instead of the file only ever growing to its high-water mark.
+        //
+        // This is a property of the *file*, fixed when it is created, so it only
+        // takes effect on a new database. An existing one created without it
+        // stays as it is until someone runs a full `VACUUM`, which is what
+        // rewrites the file format — and after which this keeps it that way.
+        .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental);
     let pool = if uri.contains(":memory:") {
         sqlx::pool::PoolOptions::new()
             .max_connections(1)
@@ -39,6 +65,9 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     sqlx::query("PRAGMA journal_mode=WAL")
         .execute(&pool)
         .await?;
+
+    // After WAL is enabled, so the sidecars it creates exist and are covered too.
+    restrict_to_owner(uri);
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS Devices (
@@ -70,6 +99,13 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     // recognized as the same physical device rather than showing up as a
     // second, permanently-unreachable entry — see `upsert_device`.
     let _ = sqlx::query("ALTER TABLE Devices ADD COLUMN fingerprint TEXT")
+        .execute(&pool)
+        .await;
+    // SHA-256 of the TLS certificate this device presented the first time Dom
+    // connected to it over HTTPS. NULL until then; see `devices::tls`. Distinct
+    // from `fingerprint` above, which is the LAN MAC and identifies the hardware
+    // — this identifies the key it holds.
+    let _ = sqlx::query("ALTER TABLE Devices ADD COLUMN tls_fingerprint TEXT")
         .execute(&pool)
         .await;
 
@@ -132,6 +168,19 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     )
     .execute(&pool)
     .await?;
+
+    // The index above leads with `device_id`, so a query that asks "what happened
+    // between these two instants", across devices, cannot use it and falls back
+    // to scanning the whole table — measured at 0.5 s here and several seconds on
+    // a Raspberry Pi, every sixty seconds, for the today-charts.
+    //
+    // Rows arrive in timestamp order, so maintaining this is an append to the
+    // right-hand edge of the tree rather than a random insert: about the cheapest
+    // an index can be to keep. It costs ~30 MB against a table that retention
+    // holds to four days.
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_energy_time ON Energy (timestamp)")
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS EnergyStorage (
@@ -346,7 +395,69 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Weather forecast for the array's plane, one row per 15-minute step.
+    //
+    // Rows are only ever written for steps that have not happened yet — see
+    // `insert_forecast`. That is what makes the past rows a record of what was
+    // *forecast* rather than of what the model now believes happened, and it is
+    // the whole basis of the forecast-versus-actual comparison: overwriting a
+    // past row with a fresher analysis would turn every past forecast retroactively
+    // correct.
+    //
+    // `issued_at` is kept so a row can be read as "this is what we expected, and
+    // this is when we expected it".
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS SolarForecast (
+            valid_at          TEXT PRIMARY KEY,
+            gti_w_m2          REAL NOT NULL,
+            temperature_c     REAL NOT NULL,
+            cloud_cover_pct   REAL NOT NULL,
+            precipitation_mm  REAL NOT NULL,
+            issued_at         TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
+}
+
+/// Makes the database readable and writable only by the user running Dom.
+///
+/// `Devices` holds `api_key`, `username` and `password` in plain text: what is
+/// needed to administer the routers and access points, the battery and the
+/// wallbox. Created under the ambient umask that is mode 644, so every local
+/// account can read the router administrator password out of the file. There is
+/// no reason for anything but Dom to open it.
+///
+/// Applied on every start rather than only on creation, so a database that
+/// already exists at 644 is corrected rather than left as it was found.
+///
+/// The `-wal` and `-shm` sidecars are covered because SQLite gives them the
+/// database file's own permissions; they are set explicitly as well, since they
+/// hold recently written rows and cost one syscall each.
+///
+/// Every failure is ignored deliberately. This is a hardening step, and a
+/// filesystem that cannot express it — or a file owned by someone else — is a
+/// reason to carry on with a warning, not to refuse to start. Unix-only, which
+/// matches the supported platform.
+fn restrict_to_owner(uri: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(path) = uri.strip_prefix("sqlite://") else {
+        return;
+    };
+    if path.contains(":memory:") || path.is_empty() {
+        return;
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let f = format!("{path}{suffix}");
+        match std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("could not restrict permissions on {f}: {e}"),
+        }
+    }
 }
 
 /// Reads a setting, or `None` if it was never set. Callers are expected to have
@@ -375,8 +486,16 @@ pub async fn set_config(pool: &SqlitePool, key: &str, value: &str) -> anyhow::Re
 // ── Daily energy rollup ───────────────────────────────────────────────────────
 
 /// Metrics written into `EnergyDaily`. The first two are copied straight from
-/// `Energy`; the grid pair is derived by splitting the signed `grid` series.
-pub const DAILY_METRICS: [&str; 4] = ["consumption", "production", "grid_import", "grid_export"];
+/// `Energy`; the grid pair is derived by splitting the signed `grid` series; the
+/// last two are the battery-aware attribution described in `crate::energy`.
+pub const DAILY_METRICS: [&str; 6] = [
+    "consumption",
+    "production",
+    "grid_import",
+    "grid_export",
+    "grid_to_house",
+    "grid_to_battery",
+];
 
 /// How many of the most recent days with data are re-rolled on every pass.
 ///
@@ -689,6 +808,13 @@ pub async fn rollup_energy_day(
              -- and be carried upwards, which is what energy_ws_pos/neg are for.
              SUM(CASE WHEN metric = 'grid' THEN energy_ws_neg ELSE 0 END) / 3600.0 AS grid_import,
              SUM(CASE WHEN metric = 'grid' THEN energy_ws_pos ELSE 0 END) / 3600.0 AS grid_export,
+             -- No ELSE, so these are NULL rather than zero on a day recorded
+             -- before the battery-aware series existed. That distinction is what
+             -- lets such a day fall back below instead of reporting that none of
+             -- its imported energy ever reached the house.
+             SUM(CASE WHEN metric = 'grid_to_house' THEN energy_ws END) / 3600.0 AS grid_to_house,
+             SUM(CASE WHEN metric = 'grid_to_battery' THEN energy_ws END) / 3600.0
+                 AS grid_to_battery,
              COUNT(*) AS samples
          FROM EnergyMinute
          WHERE device_id = ?
@@ -709,9 +835,19 @@ pub async fn rollup_energy_day(
         return Ok(());
     }
 
+    // A day with no battery-aware series falls back to treating every imported
+    // watt-hour as having served the house, which is what `consumption -
+    // grid_import` always assumed. That is exactly right over a long enough
+    // window and is the best available answer for a day already in the record.
+    let grid_import: Option<f64> = row.get("grid_import");
+    let fallback_grid_to_house = grid_import.unwrap_or(0.0);
+
     for metric in DAILY_METRICS {
         let wh: Option<f64> = row.get(metric);
-        let wh = wh.unwrap_or(0.0);
+        let wh = match metric {
+            "grid_to_house" => wh.unwrap_or(fallback_grid_to_house),
+            _ => wh.unwrap_or(0.0),
+        };
         sqlx::query(
             "INSERT INTO EnergyDaily (device_id, day, metric, energy_wh)
              VALUES (?, ?, ?, ?)
@@ -872,6 +1008,13 @@ pub struct DailyEnergy {
     pub production_kwh: f64,
     pub grid_import_kwh: f64,
     pub grid_export_kwh: f64,
+    /// Imported energy that actually reached the house, whether directly or by
+    /// way of the battery. Equal to `grid_import_kwh` for days recorded before
+    /// this was tracked, and for any day the battery never charged from the grid.
+    /// See `crate::energy`.
+    pub grid_to_house_kwh: f64,
+    /// Imported energy that went into the battery instead of the house.
+    pub grid_to_battery_kwh: f64,
 }
 
 /// Daily totals for the inclusive local-date range `[from, to]`, oldest first.
@@ -916,6 +1059,8 @@ pub async fn query_daily_energy(
             "production" => entry.production_kwh = kwh,
             "grid_import" => entry.grid_import_kwh = kwh,
             "grid_export" => entry.grid_export_kwh = kwh,
+            "grid_to_house" => entry.grid_to_house_kwh = kwh,
+            "grid_to_battery" => entry.grid_to_battery_kwh = kwh,
             _ => {}
         }
     }
@@ -1055,21 +1200,77 @@ pub async fn oldest_energy_day(pool: &SqlitePool) -> anyhow::Result<Option<chron
 /// Timestamps are stored as naive UTC strings, so "today" and the hour bucketing
 /// both apply SQLite's `'localtime'` modifier — otherwise the day boundary drifts
 /// by the local UTC offset (e.g. still showing "yesterday" just after local midnight).
+/// Where the per-minute tier stops and the raw tail begins, for a local day.
+///
+/// The today-charts render per-minute, which is exactly what `EnergyMinute`
+/// already holds — reading it instead of re-aggregating the 2s series turns a
+/// full table scan into an index range scan, measured here at 0.498 s against
+/// 0.003 s. But the minute tier only advances when the rollup runs, so the last
+/// few minutes are not in it yet and have to come from the raw rows.
+///
+/// Returns the start of the first minute the tier does *not* cover, so callers
+/// can read `EnergyMinute` below it and `Energy` at or above it without
+/// double-counting the boundary minute. With nothing rolled up yet it is the
+/// start of the day, and everything comes from the raw rows as it used to.
+async fn minute_tier_boundary(pool: &SqlitePool, day: chrono::NaiveDate) -> Option<String> {
+    let (start, end) = local_day_bounds_utc(day)?;
+    let last: Option<String> =
+        sqlx::query_scalar("SELECT MAX(minute) FROM EnergyMinute WHERE minute >= ? AND minute < ?")
+            .bind(&start)
+            .bind(&end)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+
+    match last.as_deref().and_then(parse_timestamp) {
+        // One minute past the last one rolled up.
+        Some(t) => Some(crate::devices::ts(t + chrono::Duration::minutes(1))),
+        None => Some(start),
+    }
+}
+
 pub async fn query_today_energy(pool: &SqlitePool) -> anyhow::Result<crate::app::EnergyChartData> {
     use sqlx::Row;
+    let today = chrono::Local::now().date_naive();
+    let Some((start, end)) = local_day_bounds_utc(today) else {
+        return Ok(crate::app::EnergyChartData::default());
+    };
+    let boundary = minute_tier_boundary(pool, today)
+        .await
+        .unwrap_or_else(|| start.clone());
+
+    // Per-minute averages, taken from the tier that already holds them and topped
+    // up from the raw rows for the minutes it has not reached yet. Both halves
+    // are bounded by explicit instants rather than `date(timestamp,'localtime')`,
+    // which no index can satisfy — that predicate alone was the full scan.
     let rows = sqlx::query(
-        "SELECT
-             (CAST(strftime('%H', timestamp, 'localtime') AS REAL) * 60
-              + CAST(strftime('%M', timestamp, 'localtime') AS REAL)) / 60.0 AS t_hours,
-             metric,
-             SUM(energy_ws) / (COUNT(*) * 2.0) / 1000.0 AS avg_kw
-         FROM Energy
-         WHERE date(timestamp, 'localtime') = date('now', 'localtime')
-           AND resolution = '2s'
-           AND metric IN ('consumption', 'production', 'pac', 'grid')
-         GROUP BY strftime('%Y-%m-%d %H:%M', timestamp, 'localtime'), metric
+        "SELECT t_hours, metric, SUM(ws) / SUM(secs) / 1000.0 AS avg_kw
+         FROM (
+             SELECT (CAST(strftime('%H', minute, 'localtime') AS REAL) * 60
+                     + CAST(strftime('%M', minute, 'localtime') AS REAL)) / 60.0 AS t_hours,
+                    strftime('%Y-%m-%d %H:%M', minute, 'localtime') AS slot,
+                    metric, energy_ws AS ws, span_secs AS secs
+             FROM EnergyMinute
+             WHERE minute >= ? AND minute < ?
+               AND metric IN ('consumption', 'production', 'pac', 'grid')
+             UNION ALL
+             SELECT (CAST(strftime('%H', timestamp, 'localtime') AS REAL) * 60
+                     + CAST(strftime('%M', timestamp, 'localtime') AS REAL)) / 60.0 AS t_hours,
+                    strftime('%Y-%m-%d %H:%M', timestamp, 'localtime') AS slot,
+                    metric, energy_ws AS ws, 2.0 AS secs
+             FROM Energy
+             WHERE timestamp >= ? AND timestamp < ?
+               AND resolution = '2s'
+               AND metric IN ('consumption', 'production', 'pac', 'grid')
+         )
+         GROUP BY slot, metric
          ORDER BY t_hours",
     )
+    .bind(&start)
+    .bind(&boundary)
+    .bind(&boundary)
+    .bind(&end)
     .fetch_all(pool)
     .await?;
 
@@ -1087,16 +1288,31 @@ pub async fn query_today_energy(pool: &SqlitePool) -> anyhow::Result<crate::app:
         }
     }
 
-    // Daily grid import/export totals.
+    // Daily grid import/export totals, from the same two tiers.
+    //
+    // The minute tier's `energy_ws_pos`/`energy_ws_neg` carry the split, and they
+    // have to be read rather than re-derived: a minute that both imported and
+    // exported nets out, so splitting an aggregated value afterwards would
+    // understate both directions.
     let totals = sqlx::query(
-        "SELECT
-             SUM(CASE WHEN energy_ws < 0 THEN ABS(energy_ws) ELSE 0 END) / 3600.0 / 1000.0 AS imported_kwh,
-             SUM(CASE WHEN energy_ws > 0 THEN energy_ws          ELSE 0 END) / 3600.0 / 1000.0 AS exported_kwh
-         FROM Energy
-         WHERE date(timestamp, 'localtime') = date('now', 'localtime')
-           AND resolution = '2s'
-           AND metric = 'grid'",
+        "SELECT SUM(imported) / 3600.0 / 1000.0 AS imported_kwh,
+                SUM(exported) / 3600.0 / 1000.0 AS exported_kwh
+         FROM (
+             SELECT energy_ws_neg AS imported, energy_ws_pos AS exported
+             FROM EnergyMinute
+             WHERE minute >= ? AND minute < ? AND metric = 'grid'
+             UNION ALL
+             SELECT CASE WHEN energy_ws < 0 THEN ABS(energy_ws) ELSE 0 END,
+                    CASE WHEN energy_ws > 0 THEN energy_ws      ELSE 0 END
+             FROM Energy
+             WHERE timestamp >= ? AND timestamp < ?
+               AND resolution = '2s' AND metric = 'grid'
+         )",
     )
+    .bind(&start)
+    .bind(&boundary)
+    .bind(&boundary)
+    .bind(&end)
     .fetch_one(pool)
     .await?;
     let imported: Option<f64> = totals.get("imported_kwh");
@@ -1114,24 +1330,47 @@ pub async fn query_device_energy_today(
     pool: &SqlitePool,
 ) -> anyhow::Result<std::collections::HashMap<std::net::IpAddr, crate::app::DeviceEnergyToday>> {
     use sqlx::Row;
+    let today = chrono::Local::now().date_naive();
+    let Some((start, end)) = local_day_bounds_utc(today) else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let boundary = minute_tier_boundary(pool, today)
+        .await
+        .unwrap_or_else(|| start.clone());
+
+    // Same two-tier read as the charts, and for the same reason. The charge and
+    // discharge parts come from the minute tier's own sign split rather than
+    // being re-derived: a minute that both charged and discharged nets out.
     let rows = sqlx::query(
         "SELECT d.ip, d.type,
-                SUM(CASE WHEN e.energy_ws < 0 THEN ABS(e.energy_ws) ELSE 0 END) / 3600.0 / 1000.0 AS kwh_charged,
-                SUM(CASE WHEN e.energy_ws > 0 THEN e.energy_ws          ELSE 0 END) / 3600.0 / 1000.0 AS kwh_discharged,
-                SUM(ABS(e.energy_ws))                                              / 3600.0 / 1000.0 AS kwh_total
-         FROM Energy e
+                SUM(e.charged)    / 3600.0 / 1000.0 AS kwh_charged,
+                SUM(e.discharged) / 3600.0 / 1000.0 AS kwh_discharged,
+                SUM(e.total)      / 3600.0 / 1000.0 AS kwh_total
+         FROM (
+             SELECT device_id, metric,
+                    energy_ws_neg AS charged,
+                    energy_ws_pos AS discharged,
+                    energy_ws_neg + energy_ws_pos AS total
+             FROM EnergyMinute
+             WHERE minute >= ? AND minute < ?
+             UNION ALL
+             SELECT device_id, metric,
+                    CASE WHEN energy_ws < 0 THEN ABS(energy_ws) ELSE 0 END,
+                    CASE WHEN energy_ws > 0 THEN energy_ws      ELSE 0 END,
+                    ABS(energy_ws)
+             FROM Energy
+             WHERE timestamp >= ? AND timestamp < ? AND resolution = '2s'
+         ) e
          JOIN Devices d ON e.device_id = d.id
-         WHERE date(e.timestamp, 'localtime') = date('now', 'localtime')
-           AND e.resolution = '2s'
-           AND (
-             (d.type = 'sonnen_eco8'    AND e.metric = 'pac')
-             OR
-             (d.type = 'mystrom_switch' AND e.metric = 'power')
-             OR
-             (d.type = 'keba'          AND e.metric = 'power')
-           )
+         WHERE (d.type = 'sonnen_eco8'    AND e.metric = 'pac')
+            OR (d.type = 'mystrom_switch' AND e.metric = 'power')
+            OR (d.type = 'keba'           AND e.metric = 'power')
          GROUP BY e.device_id",
     )
+    .bind(&start)
+    .bind(&boundary)
+    .bind(&boundary)
+    .bind(&end)
     .fetch_all(pool)
     .await?;
 
@@ -1247,19 +1486,32 @@ pub async fn prune_network_status_events(pool: &SqlitePool) -> anyhow::Result<u6
 /// resolution. x = hours since local midnight, y = average throughput in kbps.
 /// Samples are stored as per-poll byte deltas (see `devices::mikrotik`), so
 /// summing a bucket and dividing by its 120s width gives average bytes/sec.
+/// Width of one bar on the Internet-traffic chart, in minutes.
+///
+/// Tied to how often the modem's counters are actually read: each poll records
+/// the bytes since the previous one, so a bucket narrower than the poll interval
+/// leaves most bars empty and divides one poll's bytes by a span it did not
+/// cover, overstating the rate. Kept equal to `mikrotik`'s poll interval.
+const TRAFFIC_BUCKET_MINUTES: i64 = 30;
+
+/// The chart's bar width, for the test that pins it against the poll interval.
+pub fn traffic_bucket_minutes() -> i64 {
+    TRAFFIC_BUCKET_MINUTES
+}
+
 pub async fn query_internet_traffic_today(
     pool: &SqlitePool,
 ) -> anyhow::Result<crate::app::InternetTrafficChartData> {
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT
-             bucket * 2.0 / 60.0 AS t_hours,
+             bucket * CAST(? AS REAL) / 60.0 AS t_hours,
              metric,
-             SUM(value) / 120.0 AS bytes_per_sec
+             SUM(value) / (CAST(? AS REAL) * 60.0) AS bytes_per_sec
          FROM (
              SELECT r.metric, r.value,
                     CAST((CAST(strftime('%H', r.timestamp, 'localtime') AS INTEGER) * 60
-                          + CAST(strftime('%M', r.timestamp, 'localtime') AS INTEGER)) / 2 AS INTEGER) AS bucket
+                          + CAST(strftime('%M', r.timestamp, 'localtime') AS INTEGER)) / ? AS INTEGER) AS bucket
              FROM RawDeviceMeasurements r
              WHERE date(r.timestamp, 'localtime') = date('now', 'localtime')
                AND r.metric IN ('traffic_rx_bytes', 'traffic_tx_bytes')
@@ -1267,6 +1519,9 @@ pub async fn query_internet_traffic_today(
          GROUP BY bucket, metric
          ORDER BY bucket",
     )
+    .bind(TRAFFIC_BUCKET_MINUTES)
+    .bind(TRAFFIC_BUCKET_MINUTES)
+    .bind(TRAFFIC_BUCKET_MINUTES)
     .fetch_all(pool)
     .await?;
 
@@ -1705,6 +1960,36 @@ async fn prune_raw_series(
     Ok(removed)
 }
 
+/// Pages returned to the operating system per pass.
+///
+/// `auto_vacuum=INCREMENTAL` puts freed pages on a list but never shrinks the
+/// file on its own; only `incremental_vacuum` hands them back. Without this the
+/// database grows to its high-water mark and stays there — 1.29 GB against 265 MB
+/// of live data, before a manual `VACUUM` reclaimed it.
+///
+/// Bounded per pass because this is the alternative to `VACUUM`, not a smaller
+/// version of it: `VACUUM` rewrites the whole file under an exclusive lock and
+/// needs Dom stopped, while this moves a few pages at a time and runs alongside
+/// everything else. A thousand 4 KB pages is 4 MB an hour, which outpaces
+/// anything pruning frees.
+const VACUUM_PAGES_PER_PASS: u32 = 1000;
+
+/// Hands a bounded number of freed pages back to the filesystem.
+///
+/// Returns how many pages remain on the free list, so a caller can see whether it
+/// is keeping up.
+pub async fn reclaim_free_pages(pool: &SqlitePool) -> anyhow::Result<i64> {
+    sqlx::query(&format!(
+        "PRAGMA incremental_vacuum({VACUUM_PAGES_PER_PASS})"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0))
+}
+
 pub async fn prune_raw_measurements(pool: &SqlitePool) -> anyhow::Result<u64> {
     let result = sqlx::query(
         "DELETE FROM RawDeviceMeasurements WHERE timestamp < datetime('now', '-1 day')",
@@ -1764,6 +2049,121 @@ pub async fn upsert_device(
     Ok(())
 }
 
+/// Moves every row that belongs to `loser_id` onto `winner_id`.
+///
+/// Eight tables carry `device_id REFERENCES Devices(id)`, and every one of them
+/// has to be moved before the loser row can be deleted — `sqlx` turns on
+/// `PRAGMA foreign_keys`, so a table left behind aborts the whole migration with
+/// a constraint violation rather than merely orphaning rows. This list having
+/// fallen out of date with the schema is exactly how that happened once: the
+/// four rollup tiers were added later, and the merge kept naming only the
+/// original four.
+///
+/// The two groups are handled differently because their keys differ.
+///
+/// The raw series and the timers key on nothing but their own row id, so a plain
+/// `UPDATE` moves them and no two rows can collide.
+///
+/// The four rolled-up tiers all have `device_id` inside a composite primary key,
+/// so the same (day, metric) can exist on both sides — the transition day
+/// especially, when one address stopped answering and the other started. Moving
+/// those needs an aggregate rather than an overwrite, and each tier stores enough
+/// to do it exactly:
+///
+/// - energy is additive, so `EnergyDaily` and `EnergyMinute` sum. `EnergyMinute`
+///   keeps its positive and negative parts separate for the reason given at its
+///   schema, and they sum independently; `span_secs` sums as covered time; and
+///   `peak_w` takes the larger, since a peak is the largest sample either side
+///   saw and cannot be recovered from a sum.
+/// - `StorageDaily` and `TemperatureDaily` are summaries of a state rather than
+///   a flow, so their extremes take min and max. Both store the sample count
+///   alongside, which makes the mean exactly recoverable: `StorageDaily` weights
+///   the two averages by their counts, and `TemperatureDaily` stores a sum rather
+///   than a mean and so simply adds.
+///
+/// Nothing here is lossy, and nothing invents a value: for every column the
+/// result is what a single device reporting both streams would have recorded.
+async fn merge_device_history(
+    tx: &mut sqlx::SqliteConnection,
+    winner_id: i64,
+    loser_id: i64,
+) -> anyhow::Result<()> {
+    // Rows with no per-device uniqueness: move them as they are.
+    for table in [
+        "RawDeviceMeasurements",
+        "Energy",
+        "EnergyStorage",
+        "SwitchTimers",
+    ] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET device_id = ? WHERE device_id = ?"
+        ))
+        .bind(winner_id)
+        .bind(loser_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Rolled-up tiers: combine on conflict, then clear the loser's side.
+    let merges = [
+        "INSERT INTO EnergyDaily (device_id, day, metric, energy_wh)
+         SELECT ?, day, metric, energy_wh FROM EnergyDaily WHERE device_id = ?
+         ON CONFLICT(device_id, day, metric) DO UPDATE SET
+             energy_wh = EnergyDaily.energy_wh + excluded.energy_wh",
+        "INSERT INTO EnergyMinute
+             (device_id, minute, metric, energy_ws, energy_ws_pos, energy_ws_neg,
+              span_secs, peak_w)
+         SELECT ?, minute, metric, energy_ws, energy_ws_pos, energy_ws_neg,
+                span_secs, peak_w
+         FROM EnergyMinute WHERE device_id = ?
+         ON CONFLICT(device_id, minute, metric) DO UPDATE SET
+             energy_ws     = EnergyMinute.energy_ws     + excluded.energy_ws,
+             energy_ws_pos = EnergyMinute.energy_ws_pos + excluded.energy_ws_pos,
+             energy_ws_neg = EnergyMinute.energy_ws_neg + excluded.energy_ws_neg,
+             span_secs     = EnergyMinute.span_secs     + excluded.span_secs,
+             peak_w        = MAX(EnergyMinute.peak_w, excluded.peak_w)",
+        "INSERT INTO StorageDaily (device_id, day, rsoc_min, rsoc_max, rsoc_avg, samples)
+         SELECT ?, day, rsoc_min, rsoc_max, rsoc_avg, samples
+         FROM StorageDaily WHERE device_id = ?
+         ON CONFLICT(device_id, day) DO UPDATE SET
+             rsoc_min = MIN(StorageDaily.rsoc_min, excluded.rsoc_min),
+             rsoc_max = MAX(StorageDaily.rsoc_max, excluded.rsoc_max),
+             rsoc_avg = (StorageDaily.rsoc_avg * StorageDaily.samples
+                         + excluded.rsoc_avg * excluded.samples)
+                        / (StorageDaily.samples + excluded.samples),
+             samples  = StorageDaily.samples + excluded.samples",
+        "INSERT INTO TemperatureDaily
+             (device_id, day, temp_min, temp_max, temp_sum, samples, last_ts)
+         SELECT ?, day, temp_min, temp_max, temp_sum, samples, last_ts
+         FROM TemperatureDaily WHERE device_id = ?
+         ON CONFLICT(device_id, day) DO UPDATE SET
+             temp_min = MIN(TemperatureDaily.temp_min, excluded.temp_min),
+             temp_max = MAX(TemperatureDaily.temp_max, excluded.temp_max),
+             temp_sum = TemperatureDaily.temp_sum + excluded.temp_sum,
+             samples  = TemperatureDaily.samples  + excluded.samples,
+             last_ts  = MAX(TemperatureDaily.last_ts, excluded.last_ts)",
+    ];
+    for sql in merges {
+        sqlx::query(sql)
+            .bind(winner_id)
+            .bind(loser_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for table in [
+        "EnergyDaily",
+        "EnergyMinute",
+        "StorageDaily",
+        "TemperatureDaily",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE device_id = ?"))
+            .bind(loser_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Moves device `id` to `new_ip`. If another row already occupies `new_ip`
 /// (e.g. it was auto-discovered as a "new" device before the fingerprint
 /// match caught up), that row's measurement/timer history is reassigned onto
@@ -1779,20 +2179,7 @@ async fn migrate_device_ip(pool: &SqlitePool, id: i64, new_ip: &str) -> anyhow::
         .await?;
 
     if let Some(loser_id) = collision {
-        for table in [
-            "RawDeviceMeasurements",
-            "Energy",
-            "EnergyStorage",
-            "SwitchTimers",
-        ] {
-            sqlx::query(&format!(
-                "UPDATE {table} SET device_id = ? WHERE device_id = ?"
-            ))
-            .bind(id)
-            .bind(loser_id)
-            .execute(&mut *tx)
-            .await?;
-        }
+        merge_device_history(&mut tx, id, loser_id).await?;
         sqlx::query("DELETE FROM Devices WHERE id = ?")
             .bind(loser_id)
             .execute(&mut *tx)
@@ -1822,6 +2209,428 @@ pub async fn device_moved(pool: &SqlitePool, id: i64, ip: IpAddr) -> anyhow::Res
         .fetch_optional(pool)
         .await?;
     Ok(current != Some(ip.to_string()))
+}
+
+// ── Clock sanity ──────────────────────────────────────────────────────────────
+
+/// The newest instant anything was recorded at.
+///
+/// Proof that the clock once read at least this — which is the only evidence
+/// available, on a machine with no battery-backed clock, that the current time is
+/// not nonsense. See `main::await_plausible_clock`.
+pub async fn newest_recorded_time(
+    pool: &SqlitePool,
+) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let newest: Option<String> = sqlx::query_scalar(
+        "SELECT MAX(t) FROM (
+             SELECT MAX(timestamp) AS t FROM Energy
+             UNION ALL SELECT MAX(timestamp) FROM RawDeviceMeasurements
+             UNION ALL SELECT MAX(minute)    FROM EnergyMinute
+         )",
+    )
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    Ok(newest.as_deref().and_then(parse_timestamp))
+}
+
+// ── Battery energy provenance ─────────────────────────────────────────────────
+
+/// `Config` key holding how much of a battery's stored energy came from the grid.
+fn grid_origin_key(device_id: i64) -> String {
+    format!("battery_grid_origin_wh_{device_id}")
+}
+
+/// Reads the battery's stored grid share, or zero if it has never been recorded.
+///
+/// Zero is the right default rather than an error: a battery whose history is
+/// unknown is assumed to hold solar, and the first time it runs flat the figure
+/// is corrected against a hard observation anyway — see `energy::GridOrigin`.
+pub async fn get_grid_origin_wh(pool: &SqlitePool, device_id: i64) -> anyhow::Result<f64> {
+    Ok(get_config(pool, &grid_origin_key(device_id))
+        .await?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0))
+}
+
+/// Records the battery's stored grid share.
+pub async fn set_grid_origin_wh(
+    pool: &SqlitePool,
+    device_id: i64,
+    grid_wh: f64,
+) -> anyhow::Result<()> {
+    set_config(pool, &grid_origin_key(device_id), &grid_wh.to_string()).await
+}
+
+// ── Pinned device certificates ────────────────────────────────────────────────
+
+/// The TLS certificate fingerprint pinned for a device, if one has been.
+pub async fn get_tls_pin(pool: &SqlitePool, ip: IpAddr) -> anyhow::Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT tls_fingerprint FROM Devices WHERE ip = ?")
+            .bind(ip.to_string())
+            .fetch_optional(pool)
+            .await?
+            .flatten(),
+    )
+}
+
+/// Pins a device's TLS certificate, replacing any previous pin.
+///
+/// Called on first contact, and again when a person accepts a changed
+/// certificate. Nothing else may call it: a pin that can be rewritten by the
+/// code that failed to match it is not a pin.
+pub async fn set_tls_pin(pool: &SqlitePool, ip: IpAddr, fingerprint: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE Devices SET tls_fingerprint = ? WHERE ip = ?")
+        .bind(fingerprint)
+        .bind(ip.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ── Site electrical supply ────────────────────────────────────────────────────
+
+/// `Config` keys the site's supply is stored under. Individual settings so a
+/// value can be read or corrected by hand, like `LOCATION_KEYS`.
+const SUPPLY_KEYS: [&str; 2] = ["supply_volts", "supply_phases"];
+
+/// Reads the site's electrical supply, falling back to the default for anything
+/// missing or unreadable.
+///
+/// Never fails and never returns something implausible: Eco mode divides by this
+/// on every tick, and a supply that is absent, half-written or mistyped must not
+/// be able to stop the wallbox being controlled — nor to silently mis-scale it.
+/// A value that cannot describe a building is logged and ignored.
+pub async fn get_supply(pool: &SqlitePool) -> crate::devices::keba::Supply {
+    let read = |key: &'static str| async move {
+        get_config(pool, key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<f64>().ok())
+    };
+    let default = crate::devices::keba::Supply::default();
+    let supply = crate::devices::keba::Supply {
+        volts: read(SUPPLY_KEYS[0]).await.unwrap_or(default.volts),
+        phases: read(SUPPLY_KEYS[1]).await.unwrap_or(default.phases),
+    };
+    if supply.is_plausible() {
+        supply
+    } else {
+        log::warn!("stored supply {supply:?} is not plausible; using {default:?}");
+        default
+    }
+}
+
+/// Stores the site's electrical supply.
+pub async fn set_supply(
+    pool: &SqlitePool,
+    supply: crate::devices::keba::Supply,
+) -> anyhow::Result<()> {
+    if !supply.is_plausible() {
+        anyhow::bail!("{supply:?} does not describe a real supply");
+    }
+    set_config(pool, SUPPLY_KEYS[0], &supply.volts.to_string()).await?;
+    set_config(pool, SUPPLY_KEYS[1], &supply.phases.to_string()).await?;
+    Ok(())
+}
+
+// ── Solar forecast and calibration ────────────────────────────────────────────
+
+/// `Config` keys the fitted array response is stored under. Individual settings
+/// rather than one blob, so a value can be read or corrected by hand — the same
+/// reasoning as `LOCATION_KEYS`.
+const CALIBRATION_KEYS: [&str; 8] = [
+    "solar_k",
+    "solar_tilt_deg",
+    "solar_azimuth_deg",
+    "solar_days",
+    "solar_samples",
+    "solar_rmse_w",
+    "solar_daily_rmse_kwh",
+    "solar_fitted_at",
+];
+
+/// Records forecast steps, without ever rewriting one whose time has passed.
+///
+/// `cutoff` is the instant that divides them: at or after it a row is still a
+/// prediction and is replaced with the fresher one; before it the row already
+/// stands as what was expected, and is left exactly as it was. Passing `now` is
+/// the normal call. Nothing else enforces this — it is a plain `WHERE` in the
+/// upsert — because the guarantee has to hold even if a caller forgets.
+pub async fn insert_forecast(
+    pool: &SqlitePool,
+    points: &[crate::solar::ForecastPoint],
+    issued_at: chrono::DateTime<chrono::Utc>,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<u64> {
+    let issued = crate::devices::ts(issued_at);
+    let cutoff = crate::devices::ts(cutoff);
+    let mut written = 0;
+    for p in points {
+        let valid_at = crate::devices::ts(p.valid_at);
+        if valid_at < cutoff {
+            continue;
+        }
+        let r = sqlx::query(
+            "INSERT INTO SolarForecast
+                 (valid_at, gti_w_m2, temperature_c, cloud_cover_pct,
+                  precipitation_mm, issued_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(valid_at) DO UPDATE SET
+                 gti_w_m2         = excluded.gti_w_m2,
+                 temperature_c    = excluded.temperature_c,
+                 cloud_cover_pct  = excluded.cloud_cover_pct,
+                 precipitation_mm = excluded.precipitation_mm,
+                 issued_at        = excluded.issued_at
+             WHERE SolarForecast.valid_at >= ?",
+        )
+        .bind(&valid_at)
+        .bind(p.gti_w_m2)
+        .bind(p.temperature_c)
+        .bind(p.cloud_cover_pct)
+        .bind(p.precipitation_mm)
+        .bind(&issued)
+        .bind(&cutoff)
+        .execute(pool)
+        .await?;
+        written += r.rows_affected();
+    }
+    Ok(written)
+}
+
+/// Forecast steps covering the local days `from..=to`, in time order.
+pub async fn query_forecast(
+    pool: &SqlitePool,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> anyhow::Result<Vec<crate::solar::ForecastPoint>> {
+    let (Some((start, _)), Some((_, end))) = (local_day_bounds_utc(from), local_day_bounds_utc(to))
+    else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        "SELECT valid_at, gti_w_m2, temperature_c, cloud_cover_pct, precipitation_mm
+         FROM SolarForecast
+         WHERE valid_at >= ? AND valid_at < ?
+         ORDER BY valid_at",
+    )
+    .bind(&start)
+    .bind(&end)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(crate::solar::ForecastPoint {
+                valid_at: parse_timestamp(row.get("valid_at"))?,
+                gti_w_m2: row.get("gti_w_m2"),
+                temperature_c: row.get("temperature_c"),
+                cloud_cover_pct: row.get("cloud_cover_pct"),
+                precipitation_mm: row.get("precipitation_mm"),
+            })
+        })
+        .collect())
+}
+
+/// Parses a stored UTC timestamp. A row whose timestamp cannot be read is
+/// dropped by the callers rather than defaulted — an unparseable instant placed
+/// at the epoch would silently land in the wrong day.
+pub fn parse_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(raw, crate::devices::DB_TIMESTAMP_FMT)
+        .ok()
+        .map(|n| n.and_utc())
+}
+
+/// Fraction of a day that must carry samples before it may be fitted against.
+///
+/// A day with a poll-loop gap is missing production that the weather still
+/// predicts, so fitting on it drags `k` down by however much was missed. This
+/// screens the day out entirely rather than trying to repair it: the gap cannot
+/// be located precisely enough to subtract, and there are plenty of whole days.
+const MIN_DAY_COVERAGE: f64 = 0.98;
+
+/// Local days between `from` and `to` whose production record is complete enough
+/// to calibrate against, oldest first.
+///
+/// `span_secs` counts seconds that actually carried samples — the rollup writes
+/// `COUNT(*) * 2`, not a nominal 60 — so summing it over a day and comparing
+/// against 86400 is a direct measure of how much of the day was recorded.
+pub async fn query_complete_production_days(
+    pool: &SqlitePool,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> anyhow::Result<Vec<chrono::NaiveDate>> {
+    let (Some((start, _)), Some((_, end))) = (local_day_bounds_utc(from), local_day_bounds_utc(to))
+    else {
+        return Ok(Vec::new());
+    };
+    let rows: Vec<(String, f64)> = sqlx::query_as(
+        // `* 1.0` forces REAL: SUM over an INTEGER column yields INTEGER, and
+        // decoding that as f64 is an error rather than a widening.
+        "SELECT date(minute, 'localtime') AS day, SUM(span_secs) * 1.0 AS covered
+         FROM EnergyMinute
+         WHERE metric = 'production' AND minute >= ? AND minute < ?
+         GROUP BY day
+         HAVING covered >= ?
+         ORDER BY day",
+    )
+    .bind(&start)
+    .bind(&end)
+    .bind(MIN_DAY_COVERAGE * 86_400.0)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(day, _)| chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d").ok())
+        .collect())
+}
+
+/// Seconds of samples a 15-minute step must carry to be fitted against, out of
+/// the 900 a complete one has.
+///
+/// The screen that matters, and it is finer than the per-day one above. A step
+/// that was only half recorded reports half the production the weather predicts,
+/// and fitting on it drags the array's scale down by exactly that much. It also
+/// catches the whole of a historical data fault: before the integration gap was
+/// clamped (see `sonnen_batterie::MAX_INTEGRATION_GAP_MS`) a stalled poll loop
+/// wrote hours of energy into one row, and every such row sits in a minute with
+/// `span_secs = 2` — so the step containing it falls short here and is dropped,
+/// smeared energy and all, without needing to guess a plausible power for an
+/// array that has not been measured yet.
+const MIN_STEP_COVERAGE_SECS: f64 = 850.0;
+
+/// Measured production in watt-hours per 15-minute step, over the given local
+/// days, keyed by the step's start instant in UTC.
+///
+/// Aggregated from the per-minute tier rather than the 2s series, which is only
+/// kept for a few days — so a calibration window of ninety days is readable.
+pub async fn query_production_15min(
+    pool: &SqlitePool,
+    days: &[chrono::NaiveDate],
+) -> anyhow::Result<std::collections::HashMap<chrono::DateTime<chrono::Utc>, f64>> {
+    let mut out = std::collections::HashMap::new();
+    for day in days {
+        let Some((start, end)) = local_day_bounds_utc(*day) else {
+            continue;
+        };
+        // Truncate each minute to its quarter-hour: the forecast's step start is
+        // what the join is keyed on, and the two must agree exactly.
+        let rows: Vec<(String, f64)> = sqlx::query_as(
+            "SELECT strftime('%Y-%m-%d %H:', minute)
+                    || substr('00' || (CAST(strftime('%M', minute) AS INTEGER) / 15 * 15), -2, 2)
+                    || ':00' AS step,
+                    SUM(energy_ws) / 3600.0 AS wh
+             FROM EnergyMinute
+             WHERE metric = 'production' AND minute >= ? AND minute < ?
+             GROUP BY step
+             HAVING SUM(span_secs) >= ?",
+        )
+        .bind(&start)
+        .bind(&end)
+        .bind(MIN_STEP_COVERAGE_SECS)
+        .fetch_all(pool)
+        .await?;
+        for (step, wh) in rows {
+            if let Some(at) = parse_timestamp(&step) {
+                out.insert(at, wh);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Production in kWh for each local day in `from..=to` that has any, from the
+/// daily rollup.
+pub async fn query_daily_production_kwh(
+    pool: &SqlitePool,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> anyhow::Result<std::collections::BTreeMap<chrono::NaiveDate, f64>> {
+    let rows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT day, SUM(energy_wh) / 1000.0
+         FROM EnergyDaily
+         WHERE metric = 'production' AND day >= ? AND day <= ?
+         GROUP BY day",
+    )
+    .bind(from.to_string())
+    .bind(to.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(day, kwh)| {
+            Some((
+                chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d").ok()?,
+                kwh,
+            ))
+        })
+        .collect())
+}
+
+/// Stores a fitted calibration, replacing any previous one.
+pub async fn set_calibration(
+    pool: &SqlitePool,
+    c: &crate::solar::Calibration,
+) -> anyhow::Result<()> {
+    let values = [
+        c.k.to_string(),
+        c.tilt_deg.to_string(),
+        c.azimuth_deg.to_string(),
+        c.days.to_string(),
+        c.samples.to_string(),
+        c.rmse_w.to_string(),
+        c.daily_rmse_kwh.to_string(),
+        crate::devices::ts(c.fitted_at),
+    ];
+    for (key, value) in CALIBRATION_KEYS.iter().zip(values.iter()) {
+        set_config(pool, key, value).await?;
+    }
+    Ok(())
+}
+
+/// Reads the stored calibration, or `None` if the array has never been fitted.
+///
+/// A partially written or hand-edited set of keys reads as `None` rather than as
+/// a calibration with defaults filled in: predicting against half a fit would be
+/// worse than predicting nothing, and visibly so.
+pub async fn get_calibration(
+    pool: &SqlitePool,
+) -> anyhow::Result<Option<crate::solar::Calibration>> {
+    let mut values = Vec::with_capacity(CALIBRATION_KEYS.len());
+    for key in CALIBRATION_KEYS {
+        match get_config(pool, key).await? {
+            Some(v) => values.push(v),
+            None => return Ok(None),
+        }
+    }
+    let (Ok(k), Ok(tilt_deg), Ok(azimuth_deg), Ok(days), Ok(samples), Ok(rmse_w), Ok(daily)) = (
+        values[0].parse(),
+        values[1].parse(),
+        values[2].parse(),
+        values[3].parse(),
+        values[4].parse(),
+        values[5].parse(),
+        values[6].parse(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(fitted_at) = parse_timestamp(&values[7]) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::solar::Calibration {
+        k,
+        tilt_deg,
+        azimuth_deg,
+        days,
+        samples,
+        rmse_w,
+        daily_rmse_kwh: daily,
+        fitted_at,
+    }))
 }
 
 #[cfg(test)]
@@ -2813,6 +3622,97 @@ mod tests {
         assert_eq!(got[1].day, day("2026-05-12"));
     }
 
+    /// Today, as the local-date string the daily tier keys on.
+    fn local_today_string() -> String {
+        chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    /// Rolls the minute and daily tiers over today for one device.
+    async fn roll_up_today(pool: &SqlitePool, device_id: i64) {
+        let today = chrono::Local::now().date_naive();
+        let cutoff = crate::devices::ts(chrono::Utc::now() + chrono::Duration::days(1));
+        rollup_energy_minute(pool, device_id, today, &cutoff)
+            .await
+            .unwrap();
+        rollup_energy_day(pool, device_id, today).await.unwrap();
+    }
+
+    /// Reads one metric out of `EnergyDaily` for a day.
+    async fn daily(pool: &SqlitePool, day: &str, metric: &str) -> Option<f64> {
+        sqlx::query_scalar("SELECT energy_wh FROM EnergyDaily WHERE day = ? AND metric = ?")
+            .bind(day)
+            .bind(metric)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_day_recorded_before_the_battery_aware_series_keeps_its_old_answer() {
+        // Every day already in the record was written without `grid_to_house`,
+        // and the minute tier it is re-rolled from has none either. Treating that
+        // absence as zero would report that none of the imported energy ever
+        // reached the house — every historical day would jump to 100%
+        // self-sufficient. It has to fall back to what the old definition
+        // assumed: that all of it did.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.0.0.9").await;
+        let day = local_today_string();
+
+        sample(
+            &pool,
+            id,
+            &format!("{day} 09:00:00"),
+            "consumption",
+            3600.0 * 10.0,
+        )
+        .await;
+        sample(
+            &pool,
+            id,
+            &format!("{day} 09:00:00"),
+            "production",
+            3600.0 * 4.0,
+        )
+        .await;
+        // Signed grid: negative is imported.
+        sample(&pool, id, &format!("{day} 09:00:00"), "grid", -3600.0 * 6.0).await;
+
+        roll_up_today(&pool, id).await;
+
+        assert_eq!(daily(&pool, &day, "grid_import").await, Some(6.0));
+        assert_eq!(
+            daily(&pool, &day, "grid_to_house").await,
+            Some(6.0),
+            "absent means unknown, and the old answer is the best one available"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_day_with_the_battery_aware_series_uses_it_instead() {
+        // The winter night: 12 kWh imported, 2 into the house and 10 into the
+        // battery, so only 2 counts against self-sufficiency.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "10.0.0.9").await;
+        let day = local_today_string();
+        let at = format!("{day} 02:00:00");
+
+        sample(&pool, id, &at, "consumption", 3600.0 * 2.0).await;
+        sample(&pool, id, &at, "production", 0.0).await;
+        sample(&pool, id, &at, "grid", -3600.0 * 12.0).await;
+        sample(&pool, id, &at, "grid_to_house", 3600.0 * 2.0).await;
+        sample(&pool, id, &at, "grid_to_battery", 3600.0 * 10.0).await;
+
+        roll_up_today(&pool, id).await;
+
+        assert_eq!(daily(&pool, &day, "grid_import").await, Some(12.0));
+        assert_eq!(daily(&pool, &day, "grid_to_house").await, Some(2.0));
+        assert_eq!(daily(&pool, &day, "grid_to_battery").await, Some(10.0));
+    }
+
     #[tokio::test]
     async fn rollup_energy_daily_backfills_then_settles() {
         let pool = init("sqlite::memory:").await.unwrap();
@@ -2935,8 +3835,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Two samples for the same instant (same 2-min bucket): 1000 rx bytes
-        // and 200 tx bytes over the 120s bucket width.
+        // Two samples for the same instant, and so the same bucket: 1000 rx bytes
+        // and 200 tx bytes spread over the bucket's width.
         sqlx::query(
             "INSERT INTO RawDeviceMeasurements (device_id, timestamp, metric, value)
              VALUES (?, datetime('now'), 'traffic_rx_bytes', 1000)",
@@ -2957,8 +3857,51 @@ mod tests {
         let data = query_internet_traffic_today(&pool).await.unwrap();
         assert_eq!(data.rx_kbps.len(), 1);
         assert_eq!(data.tx_kbps.len(), 1);
-        assert!((data.rx_kbps[0].1 - (1000.0 * 8.0 / 1000.0 / 120.0)).abs() < 1e-9);
-        assert!((data.tx_kbps[0].1 - (200.0 * 8.0 / 1000.0 / 120.0)).abs() < 1e-9);
+        // Bytes over the bucket's own width, in kbps — expressed against the
+        // constant rather than a literal, so widening the bucket to follow the
+        // poll interval cannot leave the conversion behind.
+        let bucket_secs = TRAFFIC_BUCKET_MINUTES as f64 * 60.0;
+        assert!((data.rx_kbps[0].1 - (1000.0 * 8.0 / 1000.0 / bucket_secs)).abs() < 1e-9);
+        assert!((data.tx_kbps[0].1 - (200.0 * 8.0 / 1000.0 / bucket_secs)).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn traffic_buckets_are_as_wide_as_the_gap_between_polls() {
+        // Two samples a bucket apart must land in different bars rather than
+        // being summed into one and reported as twice the rate.
+        let pool = init("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO Devices (type, name, ip) VALUES ('mikrotik', 'modem', '10.0.0.1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let device_id: i64 = sqlx::query_scalar("SELECT id FROM Devices WHERE ip = '10.0.0.1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Anchored to local midnight so both land in today and in known buckets.
+        for minute in [0, TRAFFIC_BUCKET_MINUTES] {
+            sqlx::query(
+                "INSERT INTO RawDeviceMeasurements (device_id, timestamp, metric, value)
+                 VALUES (?, datetime(date('now','localtime') || ' 06:00:00', '+' || ? || ' minutes', 'utc'),
+                         'traffic_rx_bytes', 600)",
+            )
+            .bind(device_id)
+            .bind(minute)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let data = query_internet_traffic_today(&pool).await.unwrap();
+        assert_eq!(data.rx_kbps.len(), 2, "one bar each: {:?}", data.rx_kbps);
+        let gap = data.rx_kbps[1].0 - data.rx_kbps[0].0;
+        assert!(
+            (gap - TRAFFIC_BUCKET_MINUTES as f64 / 60.0).abs() < 1e-9,
+            "bars are {gap} h apart"
+        );
     }
 
     #[tokio::test]

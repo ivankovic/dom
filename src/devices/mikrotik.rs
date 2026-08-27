@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::fmt;
@@ -37,7 +39,27 @@ pub const NAME: &str = "MikroTik RouterOS";
 pub const API_PORT: u16 = 80;
 const DHCP_LEASE_PATH: &str = "/rest/ip/dhcp-server/lease";
 const FIREWALL_FILTER_PATH: &str = "/rest/ip/firewall/filter";
-const DEFAULT_POLL_SECS: i64 = 10;
+/// How often a MikroTik device is polled, in seconds.
+///
+/// Everything this fetches is slow-moving or coarse-grained: DHCP leases, which
+/// discovery reads out of `App` whenever it happens to run, firewall rules, which
+/// change when a person changes them, and cumulative byte counters, where a
+/// longer interval costs resolution rather than accuracy.
+///
+/// Nothing here feeds an energy measurement. The battery, wallbox and switches
+/// keep their own much faster intervals, because what they report is a rate that
+/// has to be integrated rather than a state that can be sampled.
+///
+/// It used to be ten seconds, which across six devices and three requests each
+/// meant nearly two REST round-trips a second, all day, carrying the router
+/// administrator password every time. Alongside a ping task doing three ICMP
+/// packets every ten seconds per router and every thirty per access point, that
+/// was a steady stream of traffic answering questions nothing was asking.
+///
+/// What is lost at this interval is resolution, not correctness: the traffic
+/// counters are cumulative, so a delta over half an hour is exactly the bytes
+/// that passed, just without the shape of anything shorter.
+const DEFAULT_POLL_SECS: i64 = 1800;
 /// The modem's Internet-facing interface, shown in the Network view as
 /// "Internet traffic". Only the modem reports this name; fetches against
 /// other MikroTik devices (router, APs) simply come back empty and are
@@ -142,19 +164,174 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Port RouterOS serves the REST API over TLS on, when `www-ssl` is enabled.
+pub const API_PORT_TLS: u16 = 443;
+
+/// How a request reached the device, and what it saw on the way.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transport {
+    /// TLS, with the certificate the device presented.
+    Tls { fingerprint: String },
+    /// Plain HTTP, because the device is not serving `www-ssl`. The credentials
+    /// went across the network readable by anything that could see them.
+    Cleartext,
+}
+
+/// The outcome of one REST call: the body, and how it got there.
+pub struct Response {
+    pub body: String,
+    pub transport: Transport,
+}
+
+/// Fetches `path` from RouterOS, over TLS where the device offers it.
+///
+/// TLS is tried first, on `API_PORT_TLS`, authenticated by pinning — see
+/// `devices::tls` for why pinning rather than a certificate authority. If the
+/// device is not listening there at all, the request falls back to plain HTTP
+/// and says so in the `Transport` it returns, so the caller can tell the user
+/// their router password is crossing the network in the clear.
+///
+/// A **pin mismatch never falls back.** The two failures look similar and are
+/// not: "not serving TLS" is a device that has not been set up for it, while
+/// "serving a different certificate" is either a device that changed or
+/// something pretending to be it. Retrying that in cleartext would hand the
+/// credentials to exactly the party the pin just refused.
 async fn rest_get(
     ip: IpAddr,
     port: u16,
     path: &str,
     username: &str,
     password: &str,
+    pin: Option<&str>,
+) -> anyhow::Result<Response> {
+    match rest_get_tls(ip, path, username, password, pin).await {
+        Ok(response) => return Ok(response),
+        Err(e) => {
+            // A failure to *reach* TLS is expected on a device that has not had
+            // `www-ssl` enabled, and is the case that falls back.
+            if !e.is_unreachable {
+                return Err(e.error);
+            }
+            log::debug!("{ip} is not serving HTTPS ({}); using HTTP", e.error);
+        }
+    }
+
+    let raw = http_request(
+        TcpStream::connect(SocketAddr::new(ip, port)),
+        ip,
+        path,
+        username,
+        password,
+    )
+    .await?;
+    Ok(Response {
+        body: parse_rest_response(&raw)?,
+        transport: Transport::Cleartext,
+    })
+}
+
+/// A TLS attempt that failed, and whether it failed because there was nothing
+/// listening — which is the only reason to try cleartext instead.
+struct TlsAttemptError {
+    error: anyhow::Error,
+    is_unreachable: bool,
+}
+
+async fn rest_get_tls(
+    ip: IpAddr,
+    path: &str,
+    username: &str,
+    password: &str,
+    pin: Option<&str>,
+) -> Result<Response, TlsAttemptError> {
+    let addr = SocketAddr::new(ip, API_PORT_TLS);
+    let tcp = match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(e)) => {
+            return Err(TlsAttemptError {
+                error: anyhow::anyhow!("connect failed: {e}"),
+                is_unreachable: true,
+            });
+        }
+        Err(_) => {
+            return Err(TlsAttemptError {
+                error: anyhow::anyhow!("connect timeout"),
+                is_unreachable: true,
+            });
+        }
+    };
+
+    let (config, observed) = crate::devices::tls::pinned_config(pin.map(str::to_string));
+    // The certificate is identified by its key, not by a name, so any valid
+    // server name serves — see `devices::tls`.
+    let server_name = tokio_rustls::rustls::pki_types::ServerName::IpAddress(ip.into());
+    let stream = match tokio_rustls::TlsConnector::from(config)
+        .connect(server_name, tcp)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            // A rejected pin is a refusal, not an unreachable device.
+            return Err(TlsAttemptError {
+                error: anyhow::anyhow!("{e}"),
+                is_unreachable: false,
+            });
+        }
+    };
+
+    let fingerprint = observed
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default();
+
+    match http_exchange(stream, ip, path, username, password).await {
+        Ok(raw) => match parse_rest_response(&raw) {
+            Ok(body) => Ok(Response {
+                body,
+                transport: Transport::Tls { fingerprint },
+            }),
+            Err(e) => Err(TlsAttemptError {
+                error: e,
+                is_unreachable: false,
+            }),
+        },
+        Err(e) => Err(TlsAttemptError {
+            error: e,
+            is_unreachable: false,
+        }),
+    }
+}
+
+/// Connects, then runs the HTTP exchange over whatever the future yields.
+async fn http_request(
+    connect: impl std::future::Future<Output = std::io::Result<TcpStream>>,
+    ip: IpAddr,
+    path: &str,
+    username: &str,
+    password: &str,
 ) -> anyhow::Result<String> {
-    let addr = SocketAddr::new(ip, port);
-    let mut stream = timeout(Duration::from_secs(5), TcpStream::connect(addr))
+    let stream = timeout(Duration::from_secs(5), connect)
         .await
         .context("connect timeout")?
         .context("connect failed")?;
+    http_exchange(stream, ip, path, username, password).await
+}
 
+/// One HTTP/1.1 request and its response, over any stream.
+///
+/// Written once and used for both transports so the request cannot differ
+/// between them — the plain and encrypted paths send byte-identical bytes.
+async fn http_exchange<S>(
+    mut stream: S,
+    ip: IpAddr,
+    path: &str,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let auth = base64_encode(format!("{username}:{password}").as_bytes());
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {ip}\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"
@@ -169,14 +346,17 @@ async fn rest_get(
         .await
         .context("read timeout")?
         .context("read failed")?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
 
-    let raw = String::from_utf8_lossy(&buf);
+/// Splits a RouterOS response into a body, or an error naming the status.
+fn parse_rest_response(raw: &str) -> anyhow::Result<String> {
     let status = raw
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok());
-    let body = raw.split("\r\n\r\n").nth(1).unwrap_or(&raw).trim();
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or(raw).trim();
 
     if status != Some(200) {
         let code = status
@@ -187,43 +367,59 @@ async fn rest_get(
     Ok(body.to_string())
 }
 
-pub async fn fetch_dhcp_leases(
-    ip: IpAddr,
-    port: u16,
-    username: &str,
-    password: &str,
-) -> anyhow::Result<Vec<DhcpLease>> {
-    let body = rest_get(ip, port, DHCP_LEASE_PATH, username, password).await?;
-    serde_json::from_str(&body).context("parse JSON")
+/// One device's REST endpoint, with everything a request needs.
+///
+/// Introduced so the pin travels with the credentials rather than as a fourth
+/// argument on every call, and so the transport a poll actually used can be
+/// reported back once instead of per request.
+pub struct Session<'a> {
+    pub ip: IpAddr,
+    pub port: u16,
+    pub username: &'a str,
+    pub password: &'a str,
+    /// The certificate fingerprint pinned for this device, if any.
+    pub pin: Option<&'a str>,
 }
 
-pub async fn fetch_firewall_rules(
-    ip: IpAddr,
-    port: u16,
-    username: &str,
-    password: &str,
-) -> anyhow::Result<Vec<FirewallRule>> {
-    let body = rest_get(ip, port, FIREWALL_FILTER_PATH, username, password).await?;
-    serde_json::from_str(&body).context("parse JSON")
-}
+impl Session<'_> {
+    async fn get(&self, path: &str) -> anyhow::Result<Response> {
+        rest_get(
+            self.ip,
+            self.port,
+            path,
+            self.username,
+            self.password,
+            self.pin,
+        )
+        .await
+    }
 
-/// Fetches rx/tx byte counters for `INTERNET_INTERFACE`. Returns `None` if
-/// the device has no such interface (e.g. the router or an AP, rather than
-/// the modem) rather than treating that as a poll failure.
-pub async fn fetch_internet_traffic(
-    ip: IpAddr,
-    port: u16,
-    username: &str,
-    password: &str,
-) -> anyhow::Result<Option<InterfaceStats>> {
-    let path = format!("/rest/interface?name={INTERNET_INTERFACE}");
-    let body = rest_get(ip, port, &path, username, password).await?;
-    let mut stats: Vec<InterfaceStats> = serde_json::from_str(&body).context("parse JSON")?;
-    Ok(if stats.is_empty() {
-        None
-    } else {
-        Some(stats.remove(0))
-    })
+    pub async fn dhcp_leases(&self) -> anyhow::Result<(Vec<DhcpLease>, Transport)> {
+        let r = self.get(DHCP_LEASE_PATH).await?;
+        Ok((
+            serde_json::from_str(&r.body).context("parse JSON")?,
+            r.transport,
+        ))
+    }
+
+    pub async fn firewall_rules(&self) -> anyhow::Result<Vec<FirewallRule>> {
+        let r = self.get(FIREWALL_FILTER_PATH).await?;
+        serde_json::from_str(&r.body).context("parse JSON")
+    }
+
+    /// Fetches rx/tx byte counters for `INTERNET_INTERFACE`. Returns `None` if
+    /// the device has no such interface (e.g. the router or an AP, rather than
+    /// the modem) rather than treating that as a poll failure.
+    pub async fn internet_traffic(&self) -> anyhow::Result<Option<InterfaceStats>> {
+        let path = format!("/rest/interface?name={INTERNET_INTERFACE}");
+        let r = self.get(&path).await?;
+        let mut stats: Vec<InterfaceStats> = serde_json::from_str(&r.body).context("parse JSON")?;
+        Ok(if stats.is_empty() {
+            None
+        } else {
+            Some(stats.remove(0))
+        })
+    }
 }
 
 // ── Database ──────────────────────────────────────────────────────────────────
@@ -356,12 +552,68 @@ async fn save_traffic_delta(
     Ok(())
 }
 
+/// Records what a poll's transport implies: pins a certificate seen for the first
+/// time, clears any standing alert once a connection succeeds, and raises one
+/// when the pinned certificate no longer matches.
+///
+/// Reads the outcome of the first request of the tick rather than making its own,
+/// so this costs nothing.
+async fn record_transport(
+    pool: &SqlitePool,
+    state: &SharedState,
+    device: &DeviceRecord,
+    pin: Option<&str>,
+    outcome: &anyhow::Result<(Vec<DhcpLease>, Transport)>,
+) {
+    match outcome {
+        Ok((_, Transport::Tls { fingerprint })) => {
+            if pin.is_none() && !fingerprint.is_empty() {
+                // Trust on first use: whatever it presented becomes the pin.
+                match crate::db::set_tls_pin(pool, device.ip, fingerprint).await {
+                    Ok(()) => log::info!(
+                        "pinned the TLS certificate for {} ({})",
+                        device.ip,
+                        crate::devices::tls::short_fingerprint(fingerprint)
+                    ),
+                    Err(e) => log::warn!("could not pin {}'s certificate: {e:#}", device.ip),
+                }
+            }
+            state.write().unwrap().cert_alerts.remove(&device.ip);
+            state.write().unwrap().cleartext_devices.remove(&device.ip);
+        }
+        Ok((_, Transport::Cleartext)) => {
+            state.write().unwrap().cert_alerts.remove(&device.ip);
+            state.write().unwrap().cleartext_devices.insert(device.ip);
+        }
+        Err(e) => {
+            // Only a pin mismatch becomes an alert; an ordinary failure is just a
+            // failed poll, already reported as one.
+            if let Some(crate::devices::tls::PinFailure::Changed { expected, observed }) =
+                crate::devices::tls::pin_failure(&format!("{e:#}"), pin)
+            {
+                log::warn!(
+                    "{} presented a different TLS certificate ({}, pinned {}); refusing to send \
+                     credentials until it is accepted",
+                    device.ip,
+                    crate::devices::tls::short_fingerprint(&observed),
+                    crate::devices::tls::short_fingerprint(&expected)
+                );
+                state
+                    .write()
+                    .unwrap()
+                    .cert_alerts
+                    .insert(device.ip, crate::app::CertAlert { expected, observed });
+            }
+        }
+    }
+}
+
 pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedState) {
     let secs = device.poll_interval_secs.max(1) as u64;
     let mut ticker = interval(Duration::from_secs(secs));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut failures: u8 = 0;
+    let mut failures: u32 = 0;
     // Previous poll's raw counters, kept locally per poll loop (i.e. per
     // device) so a delta can be computed without a DB round-trip.
     let mut prev_traffic: Option<InterfaceStats> = None;
@@ -369,14 +621,37 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
     loop {
         ticker.tick().await;
 
-        let leases =
-            fetch_dhcp_leases(device.ip, device.port, &device.username, &device.password).await;
-        let rules =
-            fetch_firewall_rules(device.ip, device.port, &device.username, &device.password).await;
+        // Re-read each tick, so accepting a changed certificate in the UI takes
+        // effect on the next poll rather than at the next restart.
+        let pin = crate::db::get_tls_pin(&pool, device.ip)
+            .await
+            .unwrap_or(None);
+        let session = Session {
+            ip: device.ip,
+            port: device.port,
+            username: &device.username,
+            password: &device.password,
+            pin: pin.as_deref(),
+        };
 
-        if let Ok(Some(traffic)) =
-            fetch_internet_traffic(device.ip, device.port, &device.username, &device.password).await
-        {
+        // Timed because the Network view's slow/ok distinction is derived from
+        // it — see `app::network_status`. The request was going to happen
+        // anyway, so this replaces a dedicated ping task at no cost.
+        let started = std::time::Instant::now();
+        let leases = session.dhcp_leases().await;
+        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let rules = session.firewall_rules().await;
+        if leases.is_ok() {
+            state
+                .write()
+                .unwrap()
+                .poll_latency_ms
+                .insert(device.ip, latency_ms);
+        }
+        record_transport(&pool, &state, &device, pin.as_deref(), &leases).await;
+        let leases = leases.map(|(l, _)| l);
+
+        if let Ok(Some(traffic)) = session.internet_traffic().await {
             if let Some(prev) = &prev_traffic {
                 // Skip a sample straddling a counter reset/reboot (new < old)
                 // rather than recording a bogus huge delta from wraparound.
@@ -539,5 +814,16 @@ mod tests {
             PollOutcome::Disconnected { error } => assert!(error.contains("leases")),
             PollOutcome::Online { .. } => panic!("expected Disconnected when leases fail"),
         }
+    }
+
+    #[test]
+    fn the_traffic_chart_bucket_matches_the_poll_interval() {
+        // A bucket narrower than the poll interval leaves most bars empty and
+        // divides one poll's bytes by a span it did not cover.
+        assert_eq!(
+            crate::db::traffic_bucket_minutes() * 60,
+            DEFAULT_POLL_SECS,
+            "the chart's bar width and the modem's poll interval must agree"
+        );
     }
 }

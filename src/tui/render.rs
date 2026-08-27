@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::net::IpAddr;
@@ -71,7 +73,9 @@ fn kwh(v: f64) -> String {
 fn pct(v: Option<f64>) -> String {
     match v {
         Some(p) => format!("{p:>5.1} %"),
-        None => "    — ".to_string(),
+        // Padded to the same width as a real figure, so the column below stays
+        // aligned when a period has nothing to divide by.
+        None => "    —  ".to_string(),
     }
 }
 
@@ -94,16 +98,24 @@ fn render_statistics_view(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Span::from(format!("  ({} back)", st.offset)).style(Style::default().fg(theme.input_active))
     };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::from(format!(" {} · ", st.window.label()))
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-            Span::from(st.title.clone()).style(Style::default().fg(theme.focus_border)),
-            browsing,
+    // A failing rollup is stated here rather than only logged: these totals stop
+    // advancing when it fails, and so does pruning. See `crate::logging`.
+    let mut header = vec![
+        Span::from(format!(" {} · ", st.window.label()))
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Span::from(st.title.clone()).style(Style::default().fg(theme.focus_border)),
+        browsing,
+    ];
+    match &app.rollup_error {
+        Some(e) => header.push(
+            Span::from(format!("   rollup failing — totals are stale: {e}"))
+                .style(Style::default().fg(theme.status_lost)),
+        ),
+        None => header.push(
             Span::from("   m/y window · ←/→ period").style(Style::default().fg(theme.inactive)),
-        ])),
-        rows[0],
-    );
+        ),
+    }
+    f.render_widget(Paragraph::new(Line::from(header)), rows[0]);
 
     render_stats_totals(f, rows[1], app, &theme);
     render_stats_buckets(f, rows[2], app, &theme);
@@ -138,6 +150,18 @@ fn render_stats_totals(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Span::from(" kWh"),
         ]),
     ];
+    let mut totals = totals;
+    // Shown only when it happened. On an installation whose battery charges from
+    // the sun alone this is always zero, and a permanent zero row would be one
+    // more thing to read past; when it is not zero it is the line that explains
+    // an import figure much larger than the house used.
+    if t.grid_to_battery_kwh > 0.0 {
+        totals.push(Line::from(vec![
+            Span::from("   of which to  "),
+            Span::from(kwh(t.grid_to_battery_kwh)).style(Style::default().fg(theme.grid_import)),
+            Span::from(" kWh  charged the battery").style(Style::default().fg(theme.inactive)),
+        ]));
+    }
     f.render_widget(
         Paragraph::new(totals).block(Block::default().borders(Borders::ALL).title(" Totals ")),
         cols[0],
@@ -250,19 +274,16 @@ fn render_stats_buckets(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Line::from(vec![
                 Span::from(format!("  {:<4}", b.label)),
                 Span::styled(
-                    "\u{2588}".repeat(own_cells),
+                    bar_segment(own_cells),
                     Style::default().fg(theme.production),
                 ),
                 Span::styled(
-                    "\u{2588}".repeat(cells - own_cells),
+                    bar_segment(cells - own_cells),
                     Style::default().fg(theme.grid_import),
                 ),
-                Span::styled(
-                    "\u{2591}".repeat(bar_w - cells),
-                    Style::default().fg(theme.gauge_track),
-                ),
+                Span::from(" ".repeat(bar_w - cells)),
                 Span::from(format!("{} kWh", kwh(b.totals.consumption_kwh))),
-                Span::from(format!("  prod{}", kwh(b.totals.production_kwh)))
+                Span::from(format!("  {} kWh", kwh(b.totals.production_kwh)))
                     .style(Style::default().fg(theme.production)),
                 Span::from(format!("  {}", pct(b.totals.self_sufficiency_pct())))
                     .style(Style::default().fg(theme.inactive)),
@@ -270,7 +291,89 @@ fn render_stats_buckets(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         })
         .collect();
 
+    // Named, because the two segments are the whole point of the row and colour
+    // alone does not say which is which.
+    let dim = Style::default().fg(theme.inactive);
+    let legend = Line::from(vec![
+        Span::from("      "),
+        Span::styled(bar_segment(6), Style::default().fg(theme.production)),
+        Span::from(" own generation   ").style(dim),
+        Span::styled(bar_segment(6), Style::default().fg(theme.grid_import)),
+        Span::from(" imported").style(dim),
+    ]);
+    // The three figures after the bar, named over the columns they belong to.
+    // Right-aligned to each column's end, which is where the numbers end too.
+    let headings = Line::from(
+        Span::from(format!(
+            "{:>label$}{:>consumed$}{:>produced$}{:>ratio$}",
+            "",
+            "consumed",
+            "produced",
+            "self",
+            label = ROW_LABEL_WIDTH + bar_w,
+            consumed = COL_CONSUMED,
+            produced = COL_PRODUCED,
+            ratio = COL_SELF_SUFFICIENCY,
+        ))
+        .style(dim),
+    );
+    let lines = [legend, headings]
+        .into_iter()
+        .chain(lines)
+        .collect::<Vec<_>>();
+
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The day or month label at the start of each row: `"  {:<4}"`.
+const ROW_LABEL_WIDTH: usize = 6;
+
+/// Widths of the three figures that follow each bar.
+///
+/// Named because the heading that labels them has to line up with them, and the
+/// only way to be sure of that is for both to be laid out from the same numbers.
+/// Each is the full width of its column including the leading gap: `{:>7.1} kWh`,
+/// `  {:>7.1} kWh`, and `  ` followed by the seven characters `pct` returns.
+///
+/// Both energy figures carry their unit, because both are energy and the ratio
+/// column already repeats its `%` on every row. Carrying it also means a row
+/// says what it means on its own, without reading back up to the heading.
+///
+/// The production column used to carry a literal `prod` before it, from before
+/// the columns were named in a heading. Two labels for one number is one too
+/// many, and the heading is the one that stays put when the row is scrolled past.
+const COL_CONSUMED: usize = 11;
+const COL_PRODUCED: usize = 13;
+const COL_SELF_SUFFICIENCY: usize = 9;
+
+/// One run of a stacked bar, drawn with an end mark at each end.
+///
+/// The reason the bars are not solid blocks. Two abutting runs of `█` in
+/// different colours are ambiguous about what the second one is measured from:
+/// it reads equally as "imported, stacked on top of own generation" and as
+/// "imported, drawn from zero and overlapping". Ending each run explicitly —
+/// `┃━━━━┃┃━━┃` — leaves only the first reading.
+///
+/// The returned string is exactly `width` characters, so the columns after the
+/// bar stay aligned. A run of one has no room for two ends and gets a single
+/// mark; a run of none draws nothing at all, which is what a fully self-
+/// sufficient day or a fully imported one should look like.
+fn bar_segment(width: usize) -> String {
+    /// Heavy vertical and horizontal box-drawing, as the Environment view's
+    /// daily-range chart already uses.
+    const END: &str = "\u{2503}";
+    const LINE: &str = "\u{2501}";
+
+    match width {
+        0 => String::new(),
+        1 => END.to_string(),
+        n => {
+            let mut out = String::from(END);
+            out.push_str(&LINE.repeat(n - 2));
+            out.push_str(END);
+            out
+        }
+    }
 }
 
 // ── Environment view ──────────────────────────────────────────────────────────
@@ -302,15 +405,23 @@ fn render_environment_view(f: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
     let sensors = temperature_sensors(app);
 
+    // Outdoor and Solar sit side by side and share a height, so the row is as
+    // tall as whichever has more to say.
+    let outdoor = outdoor_lines(app, &theme);
+    let solar = solar_lines(app, &theme);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(outdoor_lines(app, &theme).len() as u16 + 2),
+            Constraint::Length(outdoor.len().max(solar.len()) as u16 + 2),
             Constraint::Length(sensors.len().max(1) as u16 + 2),
             Constraint::Min(0),
         ])
         .split(area);
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(rows[1]);
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -323,7 +434,11 @@ fn render_environment_view(f: &mut Frame, area: Rect, app: &App) {
         rows[0],
     );
 
-    render_outdoor(f, rows[1], app, &theme);
+    render_outdoor(f, top[0], app, &theme);
+    f.render_widget(
+        Paragraph::new(solar).block(Block::default().borders(Borders::ALL).title(" Solar ")),
+        top[1],
+    );
     render_environment_sensors(f, rows[2], app, &theme, &sensors);
     render_environment_history(f, rows[3], app, &theme, &sensors);
 }
@@ -414,6 +529,165 @@ fn outdoor_lines<'a>(app: &'a App, theme: &Theme) -> Vec<Line<'a>> {
                 .style(Style::default().fg(theme.status_lost)),
         ));
     }
+    lines
+}
+
+/// Eight levels of block, for the inline forecast curve. A sparkline rather than
+/// a chart widget because it sits on one line beside the numbers it qualifies —
+/// the shape of tomorrow (an even arc, or a hole punched in the middle of the
+/// day) is the part a person reads at a glance.
+const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Tomorrow's predicted power as one line of blocks, over daylight only.
+fn sparkline(curve: &[(f64, f64)], width: usize) -> String {
+    let peak = curve.iter().map(|(_, kw)| *kw).fold(0.0_f64, f64::max);
+    if peak <= 0.0 || width == 0 {
+        return String::new();
+    }
+    // Daylight only: a bar per hour of darkness says nothing and squeezes the
+    // part that does.
+    let lit: Vec<_> = curve.iter().filter(|(_, kw)| *kw > 0.0).collect();
+    if lit.is_empty() {
+        return String::new();
+    }
+    (0..width)
+        .map(|i| {
+            let from = i * lit.len() / width;
+            let to = ((i + 1) * lit.len() / width).max(from + 1).min(lit.len());
+            let mean = lit[from..to].iter().map(|(_, kw)| *kw).sum::<f64>() / (to - from) as f64;
+            let level = ((mean / peak) * (SPARK.len() - 1) as f64).round() as usize;
+            SPARK[level.min(SPARK.len() - 1)]
+        })
+        .collect()
+}
+
+/// The Solar panel's contents.
+///
+/// Every state is distinguished: no location, a location but no fit yet, a fit
+/// too thin to lean on, and a working forecast all read differently. A predicted
+/// number with nothing behind it must not look like one with forty days behind
+/// it.
+fn solar_lines<'a>(app: &'a App, theme: &Theme) -> Vec<Line<'a>> {
+    let dim = Style::default().fg(theme.inactive);
+    let s = &app.solar;
+
+    if app.location.is_none() {
+        return vec![Line::from(
+            Span::from("  Set a location with 'a' to forecast production").style(dim),
+        )];
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    match (s.tomorrow_kwh, &s.calibration) {
+        (Some(kwh), Some(cal)) => {
+            // The band comes from how past forecasts actually turned out, not
+            // from a figure written into the code: before there are enough
+            // compared days it is simply absent, which is the honest reading.
+            let band = if s.accuracy.is_meaningful() {
+                format!("± {:.0}%", s.accuracy.mape * 100.0)
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::from("  Tomorrow  "),
+                Span::from(format!("{kwh:5.1} kWh")).style(
+                    Style::default()
+                        .fg(theme.production)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::from(format!("  {band}")).style(dim),
+                Span::from("   "),
+                Span::from(sparkline(&s.tomorrow_curve, 16))
+                    .style(Style::default().fg(theme.production)),
+            ]));
+            if !cal.is_well_founded() {
+                lines.push(Line::from(
+                    Span::from(format!(
+                        "  Fitted on {} days — rough until there are {}",
+                        cal.days,
+                        crate::solar::MIN_CALIBRATION_DAYS
+                    ))
+                    .style(Style::default().fg(theme.level_warn)),
+                ));
+            }
+        }
+        (_, None) => lines.push(Line::from(
+            Span::from("  Learning the array from recorded production…").style(dim),
+        )),
+        (None, Some(_)) => lines.push(Line::from(
+            Span::from("  No forecast for tomorrow yet").style(dim),
+        )),
+    }
+
+    if let Some(today) = s.today_kwh {
+        lines.push(Line::from(vec![
+            Span::from("  Today     "),
+            Span::from(format!("{today:5.1} kWh")),
+            Span::from(format!("  expected · {:.1} kWh so far", s.today_actual_kwh)).style(dim),
+        ]));
+    }
+
+    if let Some(cloud) = s.tomorrow_cloud_pct {
+        lines.push(Line::from(
+            Span::from(format!("  Cloud cover tomorrow {cloud:.0}% of daylight")).style(dim),
+        ));
+    }
+
+    // The most recent finished day, as forecast against as produced. One day
+    // rather than a list: it answers "is this thing working" without becoming a
+    // table nobody reads.
+    if let Some((day, predicted, actual)) = s.recent.last() {
+        let err = predicted - actual;
+        let colour = if actual > &0.0 && (err / actual).abs() <= 0.10 {
+            theme.status_ok
+        } else {
+            theme.level_warn
+        };
+        lines.push(Line::from(vec![
+            Span::from(format!("  {}    ", day.format("%d %b"))),
+            Span::from(format!("{predicted:5.1} kWh")).style(dim),
+            Span::from(format!(" expected, {actual:.1} made  ")),
+            Span::from(format!("{err:+.1}")).style(Style::default().fg(colour)),
+        ]));
+    }
+
+    if let Some(cal) = &s.calibration {
+        let facing = match cal.azimuth_deg {
+            0 => "due south".to_string(),
+            d if d > 0 => format!("{d}° west of south"),
+            d => format!("{}° east of south", -d),
+        };
+        lines.push(Line::from(
+            Span::from(format!(
+                "  {:.1} kWp · {}° tilt · {facing}",
+                cal.peak_w() / 1000.0,
+                cal.tilt_deg
+            ))
+            .style(dim),
+        ));
+    }
+    if s.accuracy.is_meaningful() {
+        lines.push(Line::from(
+            Span::from(format!(
+                "  {} of the last {} days within 10%",
+                s.accuracy.within_10pct, s.accuracy.days
+            ))
+            .style(dim),
+        ));
+    }
+
+    if let Some(e) = &s.last_error {
+        lines.push(Line::from(
+            Span::from(format!("  Forecast unavailable: {e}"))
+                .style(Style::default().fg(theme.status_lost)),
+        ));
+    }
+
+    // Required by the data licence wherever the data is shown.
+    lines.push(Line::from(
+        Span::from(format!("  {}", crate::online::forecast::ATTRIBUTION)).style(dim),
+    ));
     lines
 }
 
@@ -1659,9 +1933,18 @@ fn render_network_view(f: &mut Frame, area: Rect, app: &App) {
     // Calculate total height needed
     let total_devices = router_devices.len() + modem_devices.len() + ap_devices.len();
     let list_h = total_devices.max(1) as u16 + 2;
+    let security = security_lines(app, &app.theme());
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(list_h), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(list_h),
+            Constraint::Length(if security.is_empty() {
+                0
+            } else {
+                security.len() as u16 + 2
+            }),
+            Constraint::Min(0),
+        ])
         .split(area);
 
     render_network_infrastructure_health(
@@ -1673,13 +1956,85 @@ fn render_network_view(f: &mut Frame, area: Rect, app: &App) {
         &ap_devices,
     );
 
+    if !security.is_empty() {
+        f.render_widget(
+            Paragraph::new(security)
+                .block(Block::default().borders(Borders::ALL).title(" Security ")),
+            rows[1],
+        );
+    }
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
+        .split(rows[2]);
 
     render_network_status_history(f, cols[0], app);
     render_internet_traffic_chart(f, cols[1], app);
+}
+
+/// How Dom is talking to the infrastructure, when that is worth saying.
+///
+/// Empty — and so not drawn at all — when every device is reached over TLS with
+/// the certificate Dom pinned for it. Two things break that, and they are very
+/// different: a device that is not serving HTTPS at all, whose credentials are
+/// therefore crossing the network readable; and a device presenting a
+/// certificate that is not the pinned one, which Dom refuses to talk to until a
+/// person accepts it.
+fn security_lines<'a>(app: &'a App, theme: &Theme) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Changed certificates first: nothing is being polled on those devices.
+    let mut changed: Vec<_> = app.cert_alerts.iter().collect();
+    changed.sort_by_key(|(ip, _)| **ip);
+    for (ip, alert) in changed {
+        lines.push(Line::from(vec![
+            Span::from("  "),
+            Span::from(format!("{ip} presented a different TLS certificate")).style(
+                Style::default()
+                    .fg(theme.status_lost)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(
+            Span::from(format!(
+                "    pinned {}   now {}",
+                crate::devices::tls::short_fingerprint(&alert.expected),
+                crate::devices::tls::short_fingerprint(&alert.observed),
+            ))
+            .style(Style::default().fg(theme.inactive)),
+        ));
+        lines.push(Line::from(
+            Span::from(
+                "    Not polling it, and not sending its password. If you reset or reinstalled \
+                 this device, press 'k' to accept the new certificate.",
+            )
+            .style(Style::default().fg(theme.level_warn)),
+        ));
+    }
+
+    let mut cleartext: Vec<_> = app.cleartext_devices.iter().collect();
+    cleartext.sort();
+    if !cleartext.is_empty() {
+        let list = cleartext
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(
+            Span::from(format!("  Sending credentials in the clear to {list}"))
+                .style(Style::default().fg(theme.level_warn)),
+        ));
+        lines.push(Line::from(
+            Span::from(
+                "    These are not serving HTTPS. Enable it on each: \
+                 /certificate add name=dom common-name=dom; /certificate sign dom; \
+                 /ip service set www-ssl certificate=dom disabled=no",
+            )
+            .style(Style::default().fg(theme.inactive)),
+        ));
+    }
+    lines
 }
 
 fn render_network_infrastructure_health(
@@ -1871,6 +2226,8 @@ mod tests {
             .join("\n")
     }
 
+    /// A bucket whose imported energy all reached the house, which is every day
+    /// on a battery that only ever charges from the sun.
     fn bucket(label: &str, consumption: f64, production: f64, import: f64) -> Bucket {
         Bucket {
             label: label.to_string(),
@@ -1879,6 +2236,29 @@ mod tests {
                 production_kwh: production,
                 grid_import_kwh: import,
                 grid_export_kwh: 0.0,
+                grid_to_house_kwh: import,
+                grid_to_battery_kwh: 0.0,
+            },
+            has_data: true,
+        }
+    }
+
+    /// A bucket that imported energy into the battery rather than the house.
+    fn bucket_charging_from_grid(
+        label: &str,
+        consumption: f64,
+        to_house: f64,
+        to_battery: f64,
+    ) -> Bucket {
+        Bucket {
+            label: label.to_string(),
+            totals: Totals {
+                consumption_kwh: consumption,
+                production_kwh: 0.0,
+                grid_import_kwh: to_house + to_battery,
+                grid_export_kwh: 0.0,
+                grid_to_house_kwh: to_house,
+                grid_to_battery_kwh: to_battery,
             },
             has_data: true,
         }
@@ -2109,6 +2489,189 @@ mod tests {
     }
 
     #[test]
+    fn a_stacked_bar_marks_where_each_part_ends() {
+        // The ambiguity this replaces: two abutting runs of solid blocks read
+        // equally as "stacked" and as "both drawn from zero, overlapping".
+        assert_eq!(bar_segment(6), "┃━━━━┃");
+        // The join between two segments is two end marks, which is what makes
+        // the boundary unmistakable.
+        let joined = format!("{}{}", bar_segment(6), bar_segment(4));
+        assert!(joined.contains("┃┃"), "{joined}");
+    }
+
+    #[test]
+    fn a_segment_is_exactly_as_wide_as_it_is_asked_for() {
+        // The columns after the bar are aligned by padding to a fixed width, so
+        // a segment that miscounts by one shifts every number on the row.
+        for width in 0..40 {
+            assert_eq!(bar_segment(width).chars().count(), width, "width {width}");
+        }
+    }
+
+    #[test]
+    fn a_segment_too_narrow_for_two_ends_still_draws_something() {
+        assert_eq!(bar_segment(1), "┃");
+        assert_eq!(bar_segment(2), "┃┃");
+        // And nothing at all is nothing at all — a day that imported none, or
+        // generated none, has no second segment rather than a stray mark.
+        assert_eq!(bar_segment(0), "");
+    }
+
+    #[test]
+    fn a_fully_self_sufficient_day_draws_one_segment_and_a_fully_imported_one_the_other() {
+        // consumption 10, production 10, import 0 -> all own generation.
+        let app = stats_app(vec![bucket("1", 10.0, 10.0, 0.0)], StatsWindow::Month);
+        let out = draw(&app, 120, 24);
+        let row = out.lines().find(|l| l.contains("  1 ")).unwrap_or_default();
+        assert_eq!(row.matches("┃┃").count(), 0, "no boundary to draw: {row}");
+
+        // consumption 10, production 0, import 10 -> all imported.
+        let app = stats_app(vec![bucket("1", 10.0, 0.0, 10.0)], StatsWindow::Month);
+        let out = draw(&app, 120, 24);
+        let row = out.lines().find(|l| l.contains("  1 ")).unwrap_or_default();
+        assert_eq!(row.matches("┃┃").count(), 0, "no boundary to draw: {row}");
+    }
+
+    #[test]
+    fn a_partly_imported_day_shows_the_boundary_between_the_two() {
+        let app = stats_app(vec![bucket("1", 10.0, 6.0, 4.0)], StatsWindow::Month);
+        let out = draw(&app, 120, 24);
+        let row = out.lines().find(|l| l.contains("  1 ")).unwrap_or_default();
+        assert_eq!(row.matches("┃┃").count(), 1, "one join expected: {row}");
+    }
+
+    #[test]
+    fn the_two_parts_of_the_bar_are_named() {
+        // Colour alone does not say which segment is which.
+        let app = stats_app(vec![bucket("1", 10.0, 6.0, 4.0)], StatsWindow::Month);
+        let out = draw(&app, 120, 24);
+        assert!(out.contains("own generation"), "{out}");
+        assert!(out.contains("imported"), "{out}");
+    }
+
+    #[test]
+    fn the_column_headings_line_up_with_the_figures_they_name() {
+        // The headings and the rows are laid out from the same widths, and this
+        // is what proves it: each heading has to end in the same column as the
+        // figure below it, or it is labelling the wrong number.
+        let app = stats_app(vec![bucket("1", 30.0, 40.0, 10.0)], StatsWindow::Month);
+        let out = draw(&app, 120, 24);
+        let lines: Vec<&str> = out.lines().collect();
+        let headings = lines
+            .iter()
+            .find(|l| l.contains("consumed"))
+            .expect("a heading row");
+        // A bucket row, not the totals panel above it — both contain " kWh".
+        let row = lines
+            .iter()
+            .find(|l| l.contains(" kWh") && l.contains('\u{2503}'))
+            .expect("a bucket row");
+
+        // Character positions, not byte offsets: the bar is drawn from box-drawing
+        // characters that are three bytes each, so byte indices are not columns.
+        let ends_at = |line: &str, needle: &str| {
+            let at = line
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} not in {line}"));
+            line[..at].chars().count() + needle.chars().count()
+        };
+
+        assert_eq!(
+            ends_at(headings, "consumed"),
+            ends_at(row, "kWh"),
+            "\n{headings}\n{row}"
+        );
+        // The production column ends with its own unit, so this is the second
+        // "kWh" on the row, not the number before it.
+        let second_kwh = {
+            let first = row.find("kWh").expect("a consumed figure") + 3;
+            let rest = &row[first..];
+            let at = rest.find("kWh").expect("a produced figure");
+            row[..first + at].chars().count() + 3
+        };
+        assert_eq!(
+            ends_at(headings, "produced"),
+            second_kwh,
+            "\n{headings}\n{row}"
+        );
+        assert_eq!(
+            ends_at(headings, "self"),
+            ends_at(row, "%"),
+            "\n{headings}\n{row}"
+        );
+    }
+
+    #[test]
+    fn the_headings_do_not_run_into_one_another() {
+        let app = stats_app(vec![bucket("1", 30.0, 40.0, 10.0)], StatsWindow::Month);
+        let out = draw(&app, 120, 24);
+        let headings = out.lines().find(|l| l.contains("consumed")).unwrap();
+        // At least two spaces: one is not a gap, it is a near miss, and the
+        // headings are the only thing naming these columns.
+        for (left, right) in [("consumed", "produced"), ("produced", "self")] {
+            let from = headings.find(left).unwrap() + left.len();
+            let to = headings.find(right).unwrap();
+            assert!(
+                to >= from + 2,
+                "only {} space(s) between {left} and {right}:\n{headings}",
+                to - from
+            );
+        }
+    }
+
+    #[test]
+    fn a_period_with_no_ratio_keeps_the_column_aligned() {
+        // `pct` returns an em dash when there is nothing to divide by, and it has
+        // to be as wide as a real percentage or the column shifts under it.
+        assert_eq!(pct(None).chars().count(), pct(Some(100.0)).chars().count());
+        assert_eq!(pct(None).chars().count(), pct(Some(7.5)).chars().count());
+    }
+
+    #[test]
+    fn energy_bought_to_charge_the_battery_is_shown_only_when_it_happened() {
+        // A permanent zero row would be one more thing to read past on an
+        // installation that never charges from the grid.
+        let summer = stats_app(vec![bucket("1", 30.0, 40.0, 5.0)], StatsWindow::Month);
+        assert!(!draw(&summer, 120, 24).contains("charged the battery"));
+
+        let winter = stats_app(
+            vec![bucket_charging_from_grid("1", 2.0, 2.0, 10.0)],
+            StatsWindow::Month,
+        );
+        let out = draw(&winter, 120, 24);
+        assert!(out.contains("charged the battery"), "{out}");
+        // The line that explains why import is six times what the house used.
+        assert!(out.contains("12.0"), "import: {out}");
+        assert!(out.contains("10.0"), "of which to the battery: {out}");
+    }
+
+    #[test]
+    fn a_night_spent_charging_the_battery_does_not_look_like_a_full_bar() {
+        // Importing 10 kWh into the battery while the house uses 2 is a night
+        // that ran entirely on the grid — the bar is all imported, and the
+        // battery charging is not consumption and so is not in the bar at all.
+        let app = stats_app(
+            vec![bucket_charging_from_grid("1", 2.0, 2.0, 10.0)],
+            StatsWindow::Month,
+        );
+        let out = draw(&app, 120, 24);
+        let row = out
+            .lines()
+            .find(|l| l.contains(" kWh") && l.contains('\u{2503}'))
+            .unwrap();
+        assert!(
+            row.contains("2.0 kWh"),
+            "consumption is the house alone: {row}"
+        );
+        assert!(row.contains("0.0 %"), "none of it was self-supplied: {row}");
+        assert_eq!(
+            row.matches("┃┃").count(),
+            0,
+            "one segment, all imported: {row}"
+        );
+    }
+
+    #[test]
     fn statistics_view_marks_days_without_data_rather_than_drawing_zero_bars() {
         let mut buckets = vec![bucket("1", 10.0, 8.0, 4.0)];
         buckets.push(Bucket {
@@ -2165,6 +2728,20 @@ mod tests {
             out.contains("3 back"),
             "browsing state should be visible:\n{out}"
         );
+    }
+
+    #[test]
+    fn a_failing_rollup_is_stated_on_the_statistics_view() {
+        // The failure that silently stops pruning must not be visible only in a
+        // log file — see `crate::logging`.
+        let mut app = stats_app(vec![bucket("1", 10.0, 8.0, 4.0)], StatsWindow::Month);
+        assert!(!draw(&app, 120, 24).contains("rollup failing"));
+
+        app.rollup_error = Some("database is locked".into());
+        let out = draw(&app, 120, 24);
+        assert!(out.contains("rollup failing"), "{out}");
+        assert!(out.contains("database is locked"), "{out}");
+        assert!(out.contains("totals are stale"), "{out}");
     }
 
     #[test]
@@ -2454,5 +3031,316 @@ mod tests {
         assert!(content.contains("DHCP"), "{content}");
         assert!(content.contains("1 leases"), "{content}");
         assert!(!content.contains("No readings yet"), "{content}");
+    }
+
+    // ── Solar panel ───────────────────────────────────────────────────────────
+
+    fn solar_app(solar: crate::app::SolarOutlook, located: bool) -> App {
+        let mut app = App {
+            view: View::Environment,
+            solar,
+            ..Default::default()
+        };
+        if located {
+            app.location = Some(crate::db::Location {
+                label: "8912 - Obfelden".into(),
+                east: 2_674_204.0,
+                north: 1_235_037.0,
+                latitude: 47.262,
+                longitude: 8.419,
+            });
+        }
+        app
+    }
+
+    fn calibration(days: usize) -> crate::solar::Calibration {
+        crate::solar::Calibration {
+            k: 2.2963,
+            tilt_deg: 35,
+            azimuth_deg: 60,
+            days,
+            samples: 4096,
+            rmse_w: 1196.8,
+            daily_rmse_kwh: 4.28,
+            fitted_at: chrono::Utc::now(),
+        }
+    }
+
+    fn rendered(app: &App) -> String {
+        let theme = app.theme();
+        solar_lines(app, &theme)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn with_no_location_the_panel_says_how_to_get_one() {
+        let out = rendered(&solar_app(Default::default(), false));
+        assert!(out.contains("Set a location"), "{out}");
+        // Nothing is claimed about production.
+        assert!(!out.contains("kWh"), "{out}");
+    }
+
+    #[test]
+    fn before_the_first_fit_the_panel_says_it_is_still_learning() {
+        let out = rendered(&solar_app(Default::default(), true));
+        assert!(out.contains("Learning the array"), "{out}");
+        assert!(!out.contains("kWh"), "{out}");
+        // The data licence requires the credit wherever the data is shown.
+        assert!(out.contains(crate::online::forecast::ATTRIBUTION), "{out}");
+    }
+
+    #[test]
+    fn a_working_forecast_reports_tomorrow_and_the_array_behind_it() {
+        let app = solar_app(
+            crate::app::SolarOutlook {
+                calibration: Some(calibration(44)),
+                tomorrow_kwh: Some(47.3),
+                today_kwh: Some(52.1),
+                today_actual_kwh: 31.4,
+                tomorrow_cloud_pct: Some(34.0),
+                tomorrow_curve: (0..96)
+                    .map(|i| {
+                        (
+                            i as f64 / 4.0,
+                            (i as f64 - 48.0).abs().mul_add(-0.2, 9.0).max(0.0),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            true,
+        );
+        let out = rendered(&app);
+        assert!(out.contains("47.3 kWh"), "{out}");
+        assert!(out.contains("52.1 kWh"), "{out}");
+        assert!(out.contains("31.4 kWh so far"), "{out}");
+        assert!(out.contains("34% of daylight"), "{out}");
+        assert!(out.contains("9.2 kWp"), "{out}");
+        assert!(out.contains("35° tilt"), "{out}");
+        assert!(out.contains("60° west of south"), "{out}");
+        // No error band until enough forecasts have been checked.
+        assert!(!out.contains("±"), "{out}");
+    }
+
+    #[test]
+    fn the_error_band_appears_only_once_it_has_been_measured() {
+        let mut solar = crate::app::SolarOutlook {
+            calibration: Some(calibration(44)),
+            tomorrow_kwh: Some(47.3),
+            ..Default::default()
+        };
+        // Five days exact and five out by 20%: a 10% mean error, half of them
+        // inside the band.
+        let mut pairs = vec![(50.0, 50.0); 5];
+        pairs.extend(vec![(60.0, 50.0); 5]);
+        solar.accuracy = crate::solar::Accuracy::from_pairs(&pairs);
+        let out = rendered(&solar_app(solar, true));
+        assert!(out.contains("± 10%"), "{out}");
+        assert!(out.contains("5 of the last 10 days within 10%"), "{out}");
+    }
+
+    #[test]
+    fn a_thin_calibration_is_flagged_rather_than_quietly_used() {
+        let app = solar_app(
+            crate::app::SolarOutlook {
+                calibration: Some(calibration(4)),
+                tomorrow_kwh: Some(47.3),
+                ..Default::default()
+            },
+            true,
+        );
+        let out = rendered(&app);
+        assert!(out.contains("Fitted on 4 days"), "{out}");
+        assert!(out.contains("rough until"), "{out}");
+    }
+
+    #[test]
+    fn a_failed_fetch_is_shown_not_swallowed() {
+        let app = solar_app(
+            crate::app::SolarOutlook {
+                calibration: Some(calibration(44)),
+                tomorrow_kwh: Some(47.3),
+                last_error: Some("timed out".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(rendered(&app).contains("Forecast unavailable: timed out"));
+    }
+
+    #[test]
+    fn a_south_facing_array_is_described_as_south_facing() {
+        let mut c = calibration(44);
+        for (az, expected) in [
+            (0, "due south"),
+            (-40, "40° east of south"),
+            (25, "25° west of south"),
+        ] {
+            c.azimuth_deg = az;
+            let app = solar_app(
+                crate::app::SolarOutlook {
+                    calibration: Some(c.clone()),
+                    tomorrow_kwh: Some(1.0),
+                    ..Default::default()
+                },
+                true,
+            );
+            assert!(rendered(&app).contains(expected), "az {az}");
+        }
+    }
+
+    #[test]
+    fn the_sparkline_shows_the_shape_of_the_day() {
+        // A flat night either side of an arc: the drawn line covers only the lit
+        // part, so it is all shape and no padding.
+        let curve: Vec<(f64, f64)> = (0..96)
+            .map(|i| {
+                let h = i as f64 / 4.0;
+                (
+                    h,
+                    if (6.0..20.0).contains(&h) {
+                        9.0 - (h - 13.0).abs()
+                    } else {
+                        0.0
+                    },
+                )
+            })
+            .collect();
+        let line = sparkline(&curve, 16);
+        assert_eq!(line.chars().count(), 16);
+        assert!(line.contains('█'), "the peak should reach the top: {line}");
+        assert!(!line.contains(' '), "no gaps: {line}");
+    }
+
+    #[test]
+    fn a_day_with_no_sun_draws_no_sparkline() {
+        assert_eq!(sparkline(&[(0.0, 0.0), (1.0, 0.0)], 16), "");
+        assert_eq!(sparkline(&[], 16), "");
+        // A zero-width area must not panic or divide by zero.
+        assert_eq!(sparkline(&[(0.0, 5.0)], 0), "");
+    }
+
+    #[test]
+    fn the_environment_view_draws_with_a_forecast_present() {
+        let app = solar_app(
+            crate::app::SolarOutlook {
+                calibration: Some(calibration(44)),
+                tomorrow_kwh: Some(47.3),
+                today_kwh: Some(52.1),
+                today_actual_kwh: 31.4,
+                recent: vec![(
+                    chrono::NaiveDate::from_ymd_opt(2026, 8, 21).unwrap(),
+                    50.5,
+                    48.2,
+                )],
+                ..Default::default()
+            },
+            true,
+        );
+        let screen = draw(&app, 120, 30);
+        assert!(screen.contains("Solar"), "{screen}");
+        assert!(screen.contains("47.3"), "{screen}");
+        assert!(screen.contains("Outdoor"), "{screen}");
+    }
+
+    // ── Transport security notice ─────────────────────────────────────────────
+
+    fn net_app() -> App {
+        App {
+            view: View::Network,
+            ..Default::default()
+        }
+    }
+
+    fn security_text(app: &App) -> String {
+        let theme = app.theme();
+        security_lines(app, &theme)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn nothing_is_said_when_every_device_is_reached_over_a_pinned_connection() {
+        // The panel is not drawn at all in the good case; a permanent "all fine"
+        // banner would train the eye to ignore the place the warning appears.
+        assert!(security_lines(&net_app(), &net_app().theme()).is_empty());
+    }
+
+    #[test]
+    fn a_changed_certificate_says_what_is_not_happening_and_what_to_do() {
+        let mut app = net_app();
+        app.cert_alerts.insert(
+            "172.16.0.1".parse().unwrap(),
+            crate::app::CertAlert {
+                expected: "a".repeat(64),
+                observed: "b".repeat(64),
+            },
+        );
+        let out = security_text(&app);
+        assert!(out.contains("172.16.0.1"), "{out}");
+        assert!(out.contains("different TLS certificate"), "{out}");
+        // The consequence, not just the event.
+        assert!(out.contains("Not polling it"), "{out}");
+        assert!(out.contains("not sending its password"), "{out}");
+        assert!(out.contains("press 'k'"), "{out}");
+        // Both fingerprints, so they can be compared against the device.
+        assert!(out.contains("aaaa:aaaa"), "{out}");
+        assert!(out.contains("bbbb:bbbb"), "{out}");
+    }
+
+    #[test]
+    fn a_cleartext_device_is_named_with_the_commands_that_fix_it() {
+        let mut app = net_app();
+        app.cleartext_devices.insert("172.16.0.10".parse().unwrap());
+        app.cleartext_devices.insert("172.16.0.1".parse().unwrap());
+        let out = security_text(&app);
+        assert!(out.contains("in the clear"), "{out}");
+        // Sorted, so the list does not reshuffle between frames.
+        assert!(
+            out.find("172.16.0.1,").unwrap() < out.find("172.16.0.10").unwrap(),
+            "{out}"
+        );
+        assert!(out.contains("www-ssl"), "{out}");
+    }
+
+    #[test]
+    fn a_changed_certificate_is_listed_before_a_merely_unencrypted_one() {
+        // One means Dom has stopped talking to the device; the other means it is
+        // talking to it badly. They must not be able to be confused.
+        let mut app = net_app();
+        app.cleartext_devices.insert("172.16.0.10".parse().unwrap());
+        app.cert_alerts.insert(
+            "172.16.0.20".parse().unwrap(),
+            crate::app::CertAlert {
+                expected: "a".repeat(64),
+                observed: "b".repeat(64),
+            },
+        );
+        let out = security_text(&app);
+        assert!(out.find("different TLS certificate").unwrap() < out.find("in the clear").unwrap());
+    }
+
+    #[test]
+    fn the_network_view_draws_the_notice() {
+        let mut app = net_app();
+        app.cleartext_devices.insert("172.16.0.1".parse().unwrap());
+        let screen = draw(&app, 140, 30);
+        assert!(screen.contains("Security"), "{screen}");
+        assert!(screen.contains("in the clear"), "{screen}");
     }
 }

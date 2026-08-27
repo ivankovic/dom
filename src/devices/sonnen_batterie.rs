@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::net::{IpAddr, SocketAddr};
@@ -60,6 +62,18 @@ pub struct Reading {
     pub GridFeedIn_W: f64,
     /// Current usable energy left in the battery, Wh.
     pub RemainingCapacity_Wh: f64,
+}
+
+impl Reading {
+    /// The four powers, in the form `crate::energy` works in.
+    fn flows(&self) -> crate::energy::Flows {
+        crate::energy::Flows {
+            production_w: self.Production_W,
+            consumption_w: self.Consumption_W,
+            battery_w: self.Pac_total_W,
+            grid_w: self.GridFeedIn_W,
+        }
+    }
 }
 
 pub async fn fetch_status(ip: IpAddr, port: u16, api_key: &str) -> anyhow::Result<Reading> {
@@ -153,7 +167,12 @@ pub async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<DeviceRecord>> {
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
-async fn save_raw(pool: &SqlitePool, device_id: i64, t: &str, r: &Reading) -> anyhow::Result<()> {
+async fn save_raw(
+    tx: &mut sqlx::SqliteConnection,
+    device_id: i64,
+    t: &str,
+    r: &Reading,
+) -> anyhow::Result<()> {
     for (metric, value) in [
         ("consumption", r.Consumption_W),
         ("production", r.Production_W),
@@ -168,26 +187,74 @@ async fn save_raw(pool: &SqlitePool, device_id: i64, t: &str, r: &Reading) -> an
         .bind(t)
         .bind(metric)
         .bind(value)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
     Ok(())
 }
 
+/// How many polls between writes of the battery's grid share to the database.
+/// About a minute at the default interval.
+const GRID_ORIGIN_SAVE_EVERY: u32 = 30;
+
+/// A reading and the instant it was taken, which only ever travel together.
+#[derive(Clone, Copy)]
+struct Sample<'a> {
+    reading: &'a Reading,
+    at: DateTime<Utc>,
+}
+
 /// Trapezoidal integration of the interval [prev → curr] into Energy rows.
+///
+/// Returns `Ok(false)` when the interval was too long to integrate; see
+/// `devices::max_integration_gap_ms`.
 async fn save_energy(
-    pool: &SqlitePool,
+    tx: &mut sqlx::SqliteConnection,
     device_id: i64,
-    prev_r: &Reading,
-    prev_t: DateTime<Utc>,
-    curr_r: &Reading,
-    curr_t: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    let dt = (curr_t - prev_t).num_milliseconds() as f64 / 1000.0;
-    if dt <= 0.0 {
-        return Ok(());
+    prev: Sample<'_>,
+    curr: Sample<'_>,
+    poll_interval_secs: u64,
+    origin: &mut crate::energy::GridOrigin,
+) -> anyhow::Result<bool> {
+    let (prev_r, prev_t, curr_r, curr_t) = (prev.reading, prev.at, curr.reading, curr.at);
+    let dt_ms = (curr_t - prev_t).num_milliseconds();
+    if dt_ms <= 0 || dt_ms > crate::devices::max_integration_gap_ms(poll_interval_secs) {
+        // The battery kept working while Dom was not watching, so the provenance
+        // has to cross the gap even though no energy is recorded for it.
+        origin.resync(prev_r.RemainingCapacity_Wh, curr_r.RemainingCapacity_Wh);
+        return Ok(false);
     }
+    let dt = dt_ms as f64 / 1000.0;
     let t = ts(curr_t);
+
+    // Where the grid's energy went, and where the battery's came from. Recorded
+    // as ordinary metrics so the existing rollup tiers carry them upwards — see
+    // `crate::energy` for why `consumption - grid_import` stops being
+    // self-sufficiency once the battery charges overnight.
+    let accounted = origin.account(
+        prev_r.flows(),
+        curr_r.flows(),
+        dt,
+        prev_r.RemainingCapacity_Wh,
+        curr_r.RemainingCapacity_Wh,
+        curr_r.RSOC,
+    );
+    for (metric, wh) in [
+        ("grid_to_house", accounted.grid_to_house_wh),
+        ("grid_to_battery", accounted.grid_to_battery_wh),
+    ] {
+        sqlx::query(
+            "INSERT INTO Energy (device_id, timestamp, resolution, metric, energy_ws)
+             VALUES (?, ?, '2s', ?, ?)",
+        )
+        .bind(device_id)
+        .bind(&t)
+        .bind(metric)
+        .bind(wh * 3600.0)
+        .execute(&mut *tx)
+        .await?;
+    }
+
     for (metric, p, c) in [
         ("consumption", prev_r.Consumption_W, curr_r.Consumption_W),
         ("production", prev_r.Production_W, curr_r.Production_W),
@@ -202,13 +269,18 @@ async fn save_energy(
         .bind(&t)
         .bind(metric)
         .bind((p + c) / 2.0 * dt)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
-    Ok(())
+    Ok(true)
 }
 
-async fn save_storage(pool: &SqlitePool, device_id: i64, t: &str, rsoc: f64) -> anyhow::Result<()> {
+async fn save_storage(
+    tx: &mut sqlx::SqliteConnection,
+    device_id: i64,
+    t: &str,
+    rsoc: f64,
+) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO EnergyStorage (device_id, timestamp, resolution, rsoc_avg)
          VALUES (?, ?, '2s', ?)",
@@ -216,9 +288,52 @@ async fn save_storage(pool: &SqlitePool, device_id: i64, t: &str, rsoc: f64) -> 
     .bind(device_id)
     .bind(t)
     .bind(rsoc)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     Ok(())
+}
+
+/// Writes everything one poll produced, as a single transaction.
+///
+/// Returns whether the interval since the previous reading was integrated;
+/// `false` means it was treated as a gap. A failure rolls the whole poll back
+/// rather than leaving a raw reading with no energy beside it — the tiers are
+/// derived from these rows, and half a poll is worse than none.
+#[allow(clippy::too_many_arguments)]
+async fn write_poll(
+    pool: &SqlitePool,
+    device: &DeviceRecord,
+    t: &str,
+    curr: &Reading,
+    prev: Option<Sample<'_>>,
+    poll_time: DateTime<Utc>,
+    poll_interval_secs: u64,
+    origin: &mut crate::energy::GridOrigin,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+
+    save_raw(&mut tx, device.id, t, curr).await?;
+    let integrated = match prev {
+        Some(prev) => {
+            save_energy(
+                &mut tx,
+                device.id,
+                prev,
+                Sample {
+                    reading: curr,
+                    at: poll_time,
+                },
+                poll_interval_secs,
+                origin,
+            )
+            .await?
+        }
+        None => false,
+    };
+    save_storage(&mut tx, device.id, t, curr.RSOC).await?;
+
+    tx.commit().await?;
+    Ok(integrated)
 }
 
 // ── Poll loop ─────────────────────────────────────────────────────────────────
@@ -232,7 +347,16 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
     let mut prev: Option<(Reading, DateTime<Utc>)> = None;
     // Cached total capacity; updated whenever RSOC is reliable enough to derive it.
     let mut known_capacity_kwh: f64 = 0.0;
-    let mut failures: u8 = 0;
+    // How much of what the battery holds came from the grid. Carried across
+    // restarts because it is path-dependent and cannot be recomputed — see
+    // `crate::energy::GridOrigin`.
+    let mut origin = crate::energy::GridOrigin::new(
+        crate::db::get_grid_origin_wh(&pool, device.id)
+            .await
+            .unwrap_or(0.0),
+    );
+    let mut polls_since_saved: u32 = 0;
+    let mut failures: u32 = 0;
 
     loop {
         ticker.tick().await;
@@ -242,13 +366,57 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
             Ok(curr) => {
                 let t = ts(poll_time);
 
-                if let Err(e) = save_raw(&pool, device.id, &t, &curr).await {
-                    let _ = e;
+                // Everything this poll writes goes in one transaction. Written
+                // separately, each of the eleven inserts was its own commit, and
+                // a commit is a disk flush: on this device alone that was five
+                // and a half flushes a second, forever. One transaction makes it
+                // one. See `db::init` for the other half of that.
+                match write_poll(
+                    &pool,
+                    &device,
+                    &t,
+                    &curr,
+                    prev.as_ref().map(|(r, at)| Sample {
+                        reading: r,
+                        at: *at,
+                    }),
+                    poll_time,
+                    secs,
+                    &mut origin,
+                )
+                .await
+                {
+                    Ok(integrated) => {
+                        if let (false, Some((_, prev_t))) = (integrated, prev.as_ref()) {
+                            // A skipped interval is a gap in the record, not an
+                            // error: logged so a poll loop that keeps stalling is
+                            // visible, but never integrated. See
+                            // `MAX_INTEGRATION_GAP_MS`.
+                            log::debug!(
+                                "sonnen {}: {} ms since the previous reading, too long to \
+                                 integrate; that interval is recorded as missing",
+                                device.ip,
+                                (poll_time - *prev_t).num_milliseconds()
+                            );
+                        }
+                    }
+                    Err(e) => log::warn!("sonnen {}: recording this poll failed: {e:#}", device.ip),
                 }
-                if let Some((ref prev_r, prev_t)) = prev {
-                    let _ = save_energy(&pool, device.id, prev_r, prev_t, &curr, poll_time).await;
+
+                // Persisted about once a minute rather than every poll: losing a
+                // minute of it across an unclean shutdown costs nothing, since
+                // the next `resync` scales whatever is stored to the battery's
+                // actual state anyway.
+                polls_since_saved += 1;
+                if polls_since_saved >= GRID_ORIGIN_SAVE_EVERY {
+                    polls_since_saved = 0;
+                    if let Err(e) =
+                        crate::db::set_grid_origin_wh(&pool, device.id, origin.stored_grid_wh())
+                            .await
+                    {
+                        log::debug!("could not record the battery's grid share: {e:#}");
+                    }
                 }
-                let _ = save_storage(&pool, device.id, &t, curr.RSOC).await;
 
                 if curr.RSOC > 5.0 {
                     known_capacity_kwh = curr.RemainingCapacity_Wh / (curr.RSOC / 100.0) / 1000.0;
@@ -299,12 +467,14 @@ mod tests {
     use crate::fingerprint::HttpProbe;
 
     fn fp(ports: Vec<u16>, raws: Vec<&str>) -> Fingerprint {
+        let ip = IpAddr::from([172, 16, 20, 8]);
         Fingerprint {
-            ip: IpAddr::from([172, 16, 20, 8]),
+            ip,
             open_ports: ports,
             http: raws
                 .into_iter()
                 .map(|raw| HttpProbe {
+                    ip,
                     port: 8080,
                     url: "/".to_string(),
                     raw: raw.to_string(),
@@ -333,5 +503,325 @@ mod tests {
     fn detect_requires_the_vendor_marker() {
         assert!(!detect(&fp(vec![8080, 8883], vec!["<html>generic</html>"])));
         assert!(!detect(&fp(vec![8080, 8883], vec![])));
+    }
+
+    // ── Integration across gaps ───────────────────────────────────────────────
+
+    fn reading(production_w: f64) -> Reading {
+        Reading {
+            Consumption_W: 0.0,
+            Production_W: production_w,
+            Pac_total_W: 0.0,
+            GridFeedIn_W: 0.0,
+            RSOC: 50.0,
+            RemainingCapacity_Wh: 5_000.0,
+        }
+    }
+
+    /// An in-memory database with one Sonnen row, so the `Energy` foreign key
+    /// resolves. The real schema, per the project's no-mocks rule.
+    async fn pool_with_device() -> (SqlitePool, i64) {
+        let pool = crate::db::init("sqlite://:memory:").await.unwrap();
+        let ip = IpAddr::from([172, 16, 20, 8]);
+        save_device(&pool, ip, "battery", None).await.unwrap();
+        let id = load_all(&pool).await.unwrap()[0].id;
+        (pool, id)
+    }
+
+    /// The interval the battery is actually polled at.
+    const POLL: u64 = DEFAULT_POLL_SECS as u64;
+
+    /// A fresh provenance accumulator, for the tests that only care about the
+    /// trapezoid and not about where the energy came from.
+    fn origin() -> crate::energy::GridOrigin {
+        crate::energy::GridOrigin::default()
+    }
+
+    /// Runs one interval through `save_energy` on a connection borrowed just for
+    /// the call. The in-memory pool holds a single connection, so a test that
+    /// kept one open while querying would deadlock against itself.
+    async fn save_interval(
+        pool: &SqlitePool,
+        device_id: i64,
+        prev: Sample<'_>,
+        curr: Sample<'_>,
+        poll_interval_secs: u64,
+        origin: &mut crate::energy::GridOrigin,
+    ) -> anyhow::Result<bool> {
+        let mut conn = pool.acquire().await?;
+        super::save_energy(&mut conn, device_id, prev, curr, poll_interval_secs, origin).await
+    }
+
+    async fn energy_rows(pool: &SqlitePool) -> Vec<f64> {
+        sqlx::query_scalar::<_, f64>(
+            "SELECT energy_ws FROM Energy WHERE metric = 'production' ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Row counts across the three tables a poll writes to.
+    async fn row_counts(pool: &SqlitePool) -> (i64, i64, i64) {
+        let one = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        };
+        (
+            one("SELECT COUNT(*) FROM RawDeviceMeasurements").await,
+            one("SELECT COUNT(*) FROM Energy").await,
+            one("SELECT COUNT(*) FROM EnergyStorage").await,
+        )
+    }
+
+    fn record(id: i64) -> DeviceRecord {
+        DeviceRecord {
+            id,
+            name: "battery".into(),
+            ip: IpAddr::from([172, 16, 20, 8]),
+            port: 8080,
+            api_key: None,
+            poll_interval_secs: DEFAULT_POLL_SECS,
+            label: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_poll_is_one_transaction() {
+        // Written separately, a poll's eleven inserts were eleven commits, and a
+        // commit is a disk flush — five and a half a second, forever, which is
+        // what wears out an SD card. They are now one transaction.
+        let (pool, id) = pool_with_device().await;
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(DEFAULT_POLL_SECS);
+        let mut origin = origin();
+
+        let integrated = write_poll(
+            &pool,
+            &record(id),
+            &ts(t1),
+            &reading(3_000.0),
+            Some(Sample {
+                reading: &reading(3_000.0),
+                at: t0,
+            }),
+            t1,
+            POLL,
+            &mut origin,
+        )
+        .await
+        .unwrap();
+
+        assert!(integrated);
+        let (raw, energy, storage) = row_counts(&pool).await;
+        assert_eq!(raw, 4, "one per raw metric");
+        assert_eq!(energy, 6, "four flows plus the two grid-origin series");
+        assert_eq!(storage, 1);
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_fails_partway_leaves_nothing_behind() {
+        // The property one transaction buys. The tiers are derived from these
+        // rows, and a raw reading with no energy beside it is worse than nothing.
+        let (pool, _) = pool_with_device().await;
+        let before = row_counts(&pool).await;
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(DEFAULT_POLL_SECS);
+
+        // No such device, so the foreign key rejects the first insert.
+        let result = write_poll(
+            &pool,
+            &record(9_999),
+            &ts(t1),
+            &reading(3_000.0),
+            Some(Sample {
+                reading: &reading(3_000.0),
+                at: t0,
+            }),
+            t1,
+            POLL,
+            &mut origin(),
+        )
+        .await;
+
+        assert!(result.is_err(), "the poll should have failed");
+        assert_eq!(
+            row_counts(&pool).await,
+            before,
+            "a failed poll must leave the database as it found it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_normal_interval_is_integrated() {
+        let (pool, id) = pool_with_device().await;
+        let mut origin = origin();
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(DEFAULT_POLL_SECS);
+
+        let integrated = save_interval(
+            &pool,
+            id,
+            Sample {
+                reading: &reading(3_000.0),
+                at: t0,
+            },
+            Sample {
+                reading: &reading(3_000.0),
+                at: t1,
+            },
+            POLL,
+            &mut origin,
+        )
+        .await
+        .unwrap();
+
+        assert!(integrated);
+        // 3 kW held for 2 s is 6000 Ws — the trapezoid, exactly.
+        assert_eq!(energy_rows(&pool).await, vec![6_000.0]);
+    }
+
+    #[tokio::test]
+    async fn a_gap_is_recorded_as_missing_rather_than_integrated() {
+        // The bug this guards: a stalled poll loop leaves `prev` hours old, and
+        // integrating across it attributed 10.8 kWh to one row labelled `2s`,
+        // inflating that day's total by 23% while looking entirely plausible.
+        let (pool, id) = pool_with_device().await;
+        let mut origin = origin();
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::hours(3);
+
+        let integrated = save_interval(
+            &pool,
+            id,
+            Sample {
+                reading: &reading(3_000.0),
+                at: t0,
+            },
+            Sample {
+                reading: &reading(3_000.0),
+                at: t1,
+            },
+            POLL,
+            &mut origin,
+        )
+        .await
+        .unwrap();
+
+        assert!(!integrated);
+        assert!(
+            energy_rows(&pool).await.is_empty(),
+            "a gap must leave a hole, not invented energy"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gap_limit_is_a_boundary_not_a_range() {
+        let (pool, id) = pool_with_device().await;
+        let mut origin = origin();
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let at = |ms| t0 + chrono::Duration::milliseconds(ms);
+        let gap = crate::devices::max_integration_gap_ms(POLL);
+
+        // Exactly at the limit still counts; one millisecond past it does not.
+        assert!(
+            save_interval(
+                &pool,
+                id,
+                Sample {
+                    reading: &reading(1.0),
+                    at: t0
+                },
+                Sample {
+                    reading: &reading(1.0),
+                    at: at(gap)
+                },
+                POLL,
+                &mut origin
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !save_interval(
+                &pool,
+                id,
+                Sample {
+                    reading: &reading(1.0),
+                    at: t0
+                },
+                Sample {
+                    reading: &reading(1.0),
+                    at: at(gap + 1)
+                },
+                POLL,
+                &mut origin
+            )
+            .await
+            .unwrap()
+        );
+        // A device configured to poll more slowly still records. The limit is
+        // derived from the device's own interval for exactly this reason: a fixed
+        // one tuned to the two-second default would refuse every interval here
+        // and silently stop recording all of its energy.
+        let slow = 30;
+        assert!(
+            save_interval(
+                &pool,
+                id,
+                Sample {
+                    reading: &reading(1.0),
+                    at: t0
+                },
+                Sample {
+                    reading: &reading(1.0),
+                    at: at(slow as i64 * 1_000)
+                },
+                slow,
+                &mut origin
+            )
+            .await
+            .unwrap()
+        );
+
+        // A clock that went backwards, and a repeated timestamp, are both refused.
+        assert!(
+            !save_interval(
+                &pool,
+                id,
+                Sample {
+                    reading: &reading(1.0),
+                    at: t0
+                },
+                Sample {
+                    reading: &reading(1.0),
+                    at: t0
+                },
+                POLL,
+                &mut origin
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !save_interval(
+                &pool,
+                id,
+                Sample {
+                    reading: &reading(1.0),
+                    at: t0
+                },
+                Sample {
+                    reading: &reading(1.0),
+                    at: at(-1)
+                },
+                POLL,
+                &mut origin
+            )
+            .await
+            .unwrap()
+        );
     }
 }

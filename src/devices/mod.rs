@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 pub mod dom_local;
@@ -23,6 +25,7 @@ pub mod keba;
 pub mod mikrotik;
 pub mod mystrom_switch;
 pub mod sonnen_batterie;
+pub mod tls;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -140,7 +143,24 @@ pub fn ts(dt: DateTime<Utc>) -> String {
 /// Up to and including this many failures the device shows as `Connecting`,
 /// which keeps a single dropped packet or a device rebooting from flapping the
 /// UI. Mirrored in `ConnStatus::Lost`'s documentation.
-const LOST_AFTER_FAILURES: u8 = 3;
+const LOST_AFTER_FAILURES: u32 = 3;
+
+/// How often, in further failed polls, a device that is already Lost is
+/// re-checked for having moved to another address.
+///
+/// The check used to fire on exactly one tick — the transition into Lost — to
+/// keep it to one query per device rather than one per poll interval. That is
+/// the right instinct and the wrong mechanism: `device_moved` returning an error
+/// was folded into "has not moved" with `unwrap_or(false)`, and since the
+/// trigger was an equality against a counter that only ever rises, a single
+/// database hiccup on that one tick meant the device was never checked again.
+/// The old loop then went on failing against an address the device had left,
+/// until the process was restarted.
+///
+/// Re-checking periodically costs one query per Lost device per minute or so at
+/// the fastest poll interval — only for devices that are already failing — and
+/// it also catches a device that moves long after it went quiet.
+const MOVED_RECHECK_EVERY_FAILURES: u32 = 30;
 
 /// Shared failure handling for every device poll loop.
 ///
@@ -152,19 +172,59 @@ const LOST_AFTER_FAILURES: u8 = 3;
 /// Every device type's poll loop had its own byte-identical copy of this,
 /// differing only in which readings map it cleared — now handled uniformly by
 /// `App::forget_device`.
+/// How many poll intervals may elapse before an interval is treated as a gap.
+///
+/// Loose enough that ordinary scheduling jitter, a retry, or a slow response
+/// never trips it.
+const MAX_INTEGRATION_GAP_POLLS: i64 = 10;
+
+/// Longest interval, in milliseconds, that may be integrated as one step.
+///
+/// Poll loops integrate power between consecutive readings. That is only
+/// meaningful while the two bracket a continuous stretch of polling: when a loop
+/// stalls — a restart, a network drop, the device unreachable — the previous
+/// reading is whatever was seen before the gap, and integrating across it invents
+/// energy that was never measured. The worst observed case attributed 10.8 kWh to
+/// a single row labelled `2s`, which flowed into `EnergyDaily` and inflated that
+/// day by 23% while looking entirely plausible beside its neighbours.
+///
+/// A gap is missing data. Recording nothing for it is correct and leaves a hole
+/// that `EnergyMinute.span_secs` makes visible; interpolating across it would not.
+///
+/// Derived from the device's own configured interval rather than a fixed figure:
+/// `poll_interval_secs` is a column, and a limit tuned to one device's default
+/// would silently stop recording *all* energy for a device polled any slower.
+pub fn max_integration_gap_ms(poll_interval_secs: u64) -> i64 {
+    MAX_INTEGRATION_GAP_POLLS * (poll_interval_secs.max(1) as i64) * 1_000
+}
+
+/// Whether this failed poll is one that should ask whether the device moved.
+///
+/// True on the tick the device is first declared Lost, and every
+/// `MOVED_RECHECK_EVERY_FAILURES` failures after that. Never while the device is
+/// merely Connecting: a device that has missed one or two polls is far more
+/// likely to be briefly busy than to have changed address.
+fn is_moved_recheck_tick(failures: u32) -> bool {
+    let Some(since_lost) = failures.checked_sub(LOST_AFTER_FAILURES + 1) else {
+        return false;
+    };
+    since_lost % MOVED_RECHECK_EVERY_FAILURES == 0
+}
+
 pub async fn handle_poll_failure(
     pool: &SqlitePool,
     state: &SharedState,
     device_id: i64,
     ip: IpAddr,
-    failures: u8,
+    failures: u32,
     error: String,
 ) -> bool {
-    // Checked only on the single tick the device transitions to Lost, not on
-    // every failed tick: whether a fingerprint match moved this device to a
-    // new address (see db::upsert_device). Re-checking every tick would cost
-    // one extra query per device per poll interval for no benefit.
-    if failures == LOST_AFTER_FAILURES + 1
+    // Whether a fingerprint match moved this device to a new address (see
+    // db::upsert_device). Checked on the tick it goes Lost and periodically
+    // after — see `MOVED_RECHECK_EVERY_FAILURES` for why "once, exactly" was
+    // not enough. An error still reads as "has not moved" for this tick, but a
+    // later tick asks again.
+    if is_moved_recheck_tick(failures)
         && crate::db::device_moved(pool, device_id, ip)
             .await
             .unwrap_or(false)
@@ -362,52 +422,6 @@ async fn ping_once(client: Arc<Client>, ip: IpAddr) -> Option<Device> {
     .flatten()
 }
 
-/// Ping a device multiple times and return aggregated results.
-/// Returns (average_latency_ms, success_count, total_count) or None if all pings failed.
-pub async fn ping_device_multi(
-    client: Arc<Client>,
-    ip: IpAddr,
-    count: u8,
-) -> Option<(f64, usize, usize)> {
-    let count = count.max(1) as usize;
-    let mut latencies: Vec<f64> = Vec::with_capacity(count);
-    let mut successes: usize = 0;
-
-    for seq_num in 0..count {
-        let seq = PingSequence(seq_num as u16);
-        // Clone the Arc for this iteration
-        let c = Arc::clone(&client);
-        // Small delay between pings to avoid overwhelming
-        if seq_num > 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let result = tokio::time::timeout(TIMEOUT, async move {
-            let mut pinger = c.pinger(ip, PingIdentifier(random())).await;
-            pinger.ping(seq, &[0u8; 56]).await
-        })
-        .await;
-
-        match result {
-            Ok(Ok((IcmpPacket::V4(_), dur))) => {
-                let latency_ms = dur.as_secs_f64() * 1000.0;
-                latencies.push(latency_ms);
-                successes += 1;
-            }
-            _ => {
-                // Ping failed or timed out
-            }
-        }
-    }
-
-    if latencies.is_empty() {
-        return None;
-    }
-
-    let avg_latency = latencies.iter().sum::<f64>() / latencies.len() as f64;
-    Some((avg_latency, successes, count))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,12 +457,14 @@ mod tests {
     use crate::fingerprint::{Fingerprint, HttpProbe};
 
     fn fp(ports: Vec<u16>, probes: Vec<(&str, &str)>) -> Fingerprint {
+        let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 20, 30));
         Fingerprint {
-            ip: IpAddr::V4(Ipv4Addr::new(172, 16, 20, 30)),
+            ip,
             open_ports: ports,
             http: probes
                 .into_iter()
                 .map(|(url, raw)| HttpProbe {
+                    ip,
                     port: 80,
                     url: url.to_string(),
                     raw: raw.to_string(),
@@ -679,5 +695,51 @@ mod tests {
 
         assert!(exit);
         assert!(!state.read().unwrap().polled_ips.contains(&IP_A));
+    }
+
+    // ── When a failing device is asked whether it moved ───────────────────────
+
+    #[test]
+    fn a_device_that_is_only_connecting_is_not_asked() {
+        // One or two missed polls is far more likely to be a busy device than a
+        // changed address, and the query is not free.
+        for failures in 0..=LOST_AFTER_FAILURES {
+            assert!(!is_moved_recheck_tick(failures), "failures = {failures}");
+        }
+    }
+
+    #[test]
+    fn the_tick_it_goes_lost_is_asked() {
+        assert!(is_moved_recheck_tick(LOST_AFTER_FAILURES + 1));
+    }
+
+    #[test]
+    fn it_is_asked_again_later_rather_than_only_once() {
+        // The regression: the check used to be an equality against a counter
+        // that only rises, so one database error on that single tick meant the
+        // device was never checked again for the life of the process.
+        let first = LOST_AFTER_FAILURES + 1;
+        assert!(is_moved_recheck_tick(first + MOVED_RECHECK_EVERY_FAILURES));
+        assert!(is_moved_recheck_tick(
+            first + MOVED_RECHECK_EVERY_FAILURES * 2
+        ));
+        // ...and not on every tick in between, which is what the equality was
+        // avoiding in the first place.
+        let asked = (first..first + MOVED_RECHECK_EVERY_FAILURES * 2)
+            .filter(|f| is_moved_recheck_tick(*f))
+            .count();
+        assert_eq!(asked, 2);
+    }
+
+    #[test]
+    fn a_device_that_has_been_down_for_days_is_still_asked() {
+        // The counter used to be a `u8`, so it pinned at 255 and the modulo
+        // below would have frozen on whatever residue it landed on.
+        let first = LOST_AFTER_FAILURES + 1;
+        let far = first + MOVED_RECHECK_EVERY_FAILURES * 100_000;
+        assert!(
+            is_moved_recheck_tick(far),
+            "still asking after {far} failures"
+        );
     }
 }

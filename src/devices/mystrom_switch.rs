@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::net::{IpAddr, SocketAddr};
@@ -58,6 +60,13 @@ pub struct Report {
     pub temperature: f64,
 }
 
+/// Switches the relay, and confirms the device said it did.
+///
+/// The reply used to be read and discarded, so this returned `Ok(())` as long as
+/// the TCP connect and write succeeded — a device that answered "500" or did not
+/// answer at all reported success. That mattered: `timer_job` treats a scheduled
+/// firing as done once this returns `Ok`, so a switch that refused the command
+/// was silently skipped for the day.
 pub async fn set_relay(ip: IpAddr, port: u16, on: bool) -> anyhow::Result<()> {
     let state = u8::from(on);
     let addr = SocketAddr::new(ip, port);
@@ -68,9 +77,32 @@ pub async fn set_relay(ip: IpAddr, port: u16, on: bool) -> anyhow::Result<()> {
     let req =
         format!("GET /relay?state={state} HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.context("send")?;
-    let mut buf = [0u8; 256];
-    let _ = timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
-    Ok(())
+
+    let mut buf = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
+        .await
+        .context("read timeout")?
+        .context("read failed")?;
+    check_relay_reply(&String::from_utf8_lossy(&buf))
+}
+
+/// Accepts a 2xx reply and rejects anything else.
+///
+/// Split out so the response handling is testable without a socket, like
+/// `parse_report`. An empty reply is a failure rather than a success: the device
+/// answers this request, so nothing coming back means the command did not land.
+fn check_relay_reply(raw: &str) -> anyhow::Result<()> {
+    let status = raw
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .context("no HTTP status line in the reply")?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        anyhow::bail!("the switch answered HTTP {status}")
+    }
 }
 
 pub async fn fetch_report(ip: IpAddr, port: u16) -> anyhow::Result<Report> {
@@ -161,7 +193,12 @@ pub async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<DeviceRecord>> {
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
-async fn save_raw(pool: &SqlitePool, device_id: i64, t: &str, r: &Report) -> anyhow::Result<()> {
+async fn save_raw(
+    tx: &mut sqlx::SqliteConnection,
+    device_id: i64,
+    t: &str,
+    r: &Report,
+) -> anyhow::Result<()> {
     for (metric, value) in [("power", r.power), ("temperature", r.temperature)] {
         sqlx::query(
             "INSERT INTO RawDeviceMeasurements (device_id, timestamp, metric, value)
@@ -171,24 +208,31 @@ async fn save_raw(pool: &SqlitePool, device_id: i64, t: &str, r: &Report) -> any
         .bind(t)
         .bind(metric)
         .bind(value)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
     Ok(())
 }
 
+/// Trapezoidal integration of the interval [prev → curr] into an Energy row.
+///
+/// Returns `Ok(false)` when the interval was too long to integrate — see
+/// `devices::max_integration_gap_ms`. A switch left unreachable for hours would
+/// otherwise have its last known power multiplied across the whole absence.
 async fn save_energy(
-    pool: &SqlitePool,
+    tx: &mut sqlx::SqliteConnection,
     device_id: i64,
     prev_r: &Report,
     prev_t: DateTime<Utc>,
     curr_r: &Report,
     curr_t: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    let dt = (curr_t - prev_t).num_milliseconds() as f64 / 1000.0;
-    if dt <= 0.0 {
-        return Ok(());
+    poll_interval_secs: u64,
+) -> anyhow::Result<bool> {
+    let dt_ms = (curr_t - prev_t).num_milliseconds();
+    if dt_ms <= 0 || dt_ms > crate::devices::max_integration_gap_ms(poll_interval_secs) {
+        return Ok(false);
     }
+    let dt = dt_ms as f64 / 1000.0;
     let energy_ws = (prev_r.power + curr_r.power) / 2.0 * dt;
     sqlx::query(
         "INSERT INTO Energy (device_id, timestamp, resolution, metric, energy_ws)
@@ -197,8 +241,39 @@ async fn save_energy(
     .bind(device_id)
     .bind(ts(curr_t))
     .bind(energy_ws)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    Ok(true)
+}
+
+/// Writes everything one poll produced, as a single transaction.
+///
+/// Two raw readings and an energy row were three separate commits, and a commit
+/// is a disk flush. See `db::init` and `sonnen_batterie::write_poll`.
+async fn write_poll(
+    pool: &SqlitePool,
+    device_id: i64,
+    t: &str,
+    curr: &Report,
+    prev: Option<(&Report, DateTime<Utc>)>,
+    poll_time: DateTime<Utc>,
+    poll_interval_secs: u64,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    save_raw(&mut tx, device_id, t, curr).await?;
+    if let Some((prev_r, prev_t)) = prev {
+        save_energy(
+            &mut tx,
+            device_id,
+            prev_r,
+            prev_t,
+            curr,
+            poll_time,
+            poll_interval_secs,
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -210,7 +285,7 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut prev: Option<(Report, DateTime<Utc>)> = None;
-    let mut failures: u8 = 0;
+    let mut failures: u32 = 0;
 
     loop {
         ticker.tick().await;
@@ -219,9 +294,18 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
         match fetch_report(device.ip, device.port).await {
             Ok(curr) => {
                 let t = ts(poll_time);
-                let _ = save_raw(&pool, device.id, &t, &curr).await;
-                if let Some((ref prev_r, prev_t)) = prev {
-                    let _ = save_energy(&pool, device.id, prev_r, prev_t, &curr, poll_time).await;
+                if let Err(e) = write_poll(
+                    &pool,
+                    device.id,
+                    &t,
+                    &curr,
+                    prev.as_ref().map(|(r, at)| (r, *at)),
+                    poll_time,
+                    secs,
+                )
+                .await
+                {
+                    log::warn!("myStrom {}: recording this poll failed: {e:#}", device.ip);
                 }
 
                 failures = 0;
@@ -265,12 +349,14 @@ mod tests {
     use crate::fingerprint::HttpProbe;
 
     fn fp(ports: Vec<u16>, probes: Vec<(&str, &str)>) -> Fingerprint {
+        let ip = IpAddr::from([172, 16, 20, 7]);
         Fingerprint {
-            ip: IpAddr::from([172, 16, 20, 7]),
+            ip,
             open_ports: ports,
             http: probes
                 .into_iter()
                 .map(|(url, raw)| HttpProbe {
+                    ip,
                     port: 80,
                     url: url.to_string(),
                     raw: raw.to_string(),
@@ -324,5 +410,138 @@ mod tests {
     fn parse_report_errors_on_a_non_json_payload() {
         assert!(parse_report("HTTP/1.1 404 Not Found\r\n\r\n<html>nope</html>").is_err());
         assert!(parse_report("").is_err());
+    }
+
+    // ── Relay command confirmation ────────────────────────────────────────────
+
+    #[test]
+    fn a_successful_relay_command_is_accepted() {
+        assert!(check_relay_reply("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").is_ok());
+        assert!(check_relay_reply("HTTP/1.0 204 No Content\r\n\r\n").is_ok());
+    }
+
+    #[test]
+    fn a_refused_relay_command_is_an_error_rather_than_a_silent_success() {
+        // `timer_job` marks a scheduled firing done when this returns Ok, so a
+        // refusal that read as success skipped that timer for the day.
+        for raw in [
+            "HTTP/1.1 500 Internal Server Error\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\n\r\n",
+            "HTTP/1.1 401 Unauthorized\r\n\r\n",
+        ] {
+            assert!(check_relay_reply(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_reply_that_is_not_http_is_an_error() {
+        // Including no reply at all: the device answers this request, so silence
+        // means the command did not land.
+        assert!(check_relay_reply("").is_err());
+        assert!(check_relay_reply("garbage").is_err());
+        assert!(check_relay_reply("HTTP/1.1 notanumber OK\r\n\r\n").is_err());
+    }
+
+    // ── Integration across gaps ───────────────────────────────────────────────
+
+    async fn switch_pool() -> (SqlitePool, i64) {
+        let pool = crate::db::init("sqlite://:memory:").await.unwrap();
+        let ip = IpAddr::from([172, 16, 75, 4]);
+        save_device(&pool, ip, "switch", None).await.unwrap();
+        let id = load_all(&pool).await.unwrap()[0].id;
+        (pool, id)
+    }
+
+    fn report(power: f64) -> Report {
+        Report {
+            power,
+            relay: true,
+            temperature: 24.0,
+        }
+    }
+
+    async fn energy_rows(pool: &SqlitePool) -> Vec<f64> {
+        sqlx::query_scalar::<_, f64>("SELECT energy_ws FROM Energy ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_gap_is_recorded_as_missing_rather_than_integrated() {
+        // The same defect the battery had: a switch unreachable for hours would
+        // have its last known power multiplied across the whole absence.
+        let (pool, id) = switch_pool().await;
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        write_poll(&pool, id, &ts(t0), &report(100.0), None, t0, 2)
+            .await
+            .unwrap();
+        let hours_later = t0 + chrono::Duration::hours(3);
+        write_poll(
+            &pool,
+            id,
+            &ts(hours_later),
+            &report(100.0),
+            Some((&report(100.0), t0)),
+            hours_later,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            energy_rows(&pool).await.is_empty(),
+            "a gap must leave a hole, not three hours of invented energy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_normal_interval_is_integrated() {
+        let (pool, id) = switch_pool().await;
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(2);
+
+        write_poll(
+            &pool,
+            id,
+            &ts(t1),
+            &report(100.0),
+            Some((&report(100.0), t0)),
+            t1,
+            2,
+        )
+        .await
+        .unwrap();
+
+        // 100 W held for 2 s is 200 Ws — the trapezoid, exactly.
+        assert_eq!(energy_rows(&pool).await, vec![200.0]);
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_fails_partway_leaves_nothing_behind() {
+        let (pool, _) = switch_pool().await;
+        let t0 = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(2);
+
+        // No such device, so the foreign key rejects the first insert.
+        let result = write_poll(
+            &pool,
+            9_999,
+            &ts(t1),
+            &report(100.0),
+            Some((&report(100.0), t0)),
+            t1,
+            2,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let raw: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM RawDeviceMeasurements")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(raw, 0, "a failed poll must leave nothing behind");
+        assert!(energy_rows(&pool).await.is_empty());
     }
 }

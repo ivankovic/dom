@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::net::IpAddr;
@@ -111,12 +113,57 @@ fn energy_active_devices(app: &App) -> Vec<&ScannedDevice> {
         .collect()
 }
 
-pub async fn run(state: SharedState, pool: SqlitePool, rescan: Arc<Notify>) -> anyhow::Result<()> {
-    let mut terminal = ratatui::try_init()
-        .map_err(|e| anyhow::anyhow!("terminal init failed (is stdout a TTY?): {e}"))?;
+/// Longest text either free-text input will accept.
+///
+/// A stuck or held key must not be able to grow a buffer without limit, and no
+/// real address or device name comes close. Shared by the address and rename
+/// inputs because there is no reason for them to differ — the rename buffer
+/// previously had no bound at all, and neither did the label column it is
+/// written to.
+const MAX_INPUT_CHARS: usize = 120;
+
+/// Appends a typed character to a text input, ignoring it once the input is full.
+///
+/// One function for both inputs so they cannot drift apart again. Counts
+/// characters rather than bytes: the limit is about how much someone can type,
+/// and a bound in bytes would cut a non-ASCII name short at an arbitrary point.
+fn push_bounded(buf: &mut String, c: char) {
+    if buf.chars().count() < MAX_INPUT_CHARS {
+        buf.push(c);
+    }
+}
+
+/// Whether the interface could be started.
+///
+/// Not an error, because there is nothing wrong: a Dom running as a service on a
+/// headless machine has no terminal to draw on and every reason to keep
+/// collecting. See `run`.
+pub enum Interface {
+    /// The TUI ran and the user asked to quit.
+    Closed,
+    /// There was no terminal to attach to.
+    Unavailable(String),
+}
+
+/// Runs the interface, if there is one to run.
+///
+/// Returning `Unavailable` rather than an error is the whole point. Dom's actual
+/// work — polling devices, integrating energy, rolling up tiers — happens in
+/// background tasks that neither need nor notice a terminal. Treating a missing
+/// TTY as fatal meant a headless install collected nothing at all, which is the
+/// normal way to run this on a Raspberry Pi.
+pub async fn run(
+    state: SharedState,
+    pool: SqlitePool,
+    rescan: Arc<Notify>,
+) -> anyhow::Result<Interface> {
+    let mut terminal = match ratatui::try_init() {
+        Ok(t) => t,
+        Err(e) => return Ok(Interface::Unavailable(e.to_string())),
+    };
     let result = event_loop(&mut terminal, &state, &pool, &rescan).await;
     ratatui::restore();
-    result
+    result.map(|()| Interface::Closed)
 }
 
 async fn event_loop(
@@ -145,6 +192,34 @@ async fn event_loop(
                     &event,
                     Event::Key(KeyEvent { code: KeyCode::Char('d' | 'D'), .. })
                 );
+
+                // Accepting a device's new TLS certificate. Only from the Network
+                // view, where the alert that prompts it is shown, and only while
+                // no text input is open — 'k' is a character like any other while
+                // someone is typing a name.
+                let accept_cert: Option<(IpAddr, String)> = {
+                    let app = state.read().unwrap();
+                    let is_k = matches!(
+                        &event,
+                        Event::Key(KeyEvent { code: KeyCode::Char('k' | 'K'), .. })
+                    );
+                    if is_k
+                        && app.view == View::Network
+                        && app.address_input.is_none()
+                        && app.rename_input.is_none()
+                        && app.timer_dialog.is_none()
+                    {
+                        // Oldest address first, so repeated presses work through
+                        // them in a stable order rather than at random.
+                        let mut pending: Vec<_> = app.cert_alerts.iter().collect();
+                        pending.sort_by_key(|(ip, _)| **ip);
+                        pending
+                            .first()
+                            .map(|(ip, alert)| (**ip, alert.observed.clone()))
+                    } else {
+                        None
+                    }
+                };
 
                 // Address entry is modal: while it is open, Enter looks the address
                 // up and every other key edits the buffer.
@@ -300,6 +375,19 @@ async fn event_loop(
                         keba_mode_toggle,
                     )
                 }; // read lock dropped here
+
+                if let Some((ip, fingerprint)) = accept_cert {
+                    // Pin the new certificate and clear the alert. The poll loop
+                    // re-reads the pin every tick, so the device is reachable
+                    // again on its next poll without a restart.
+                    match crate::db::set_tls_pin(pool, ip, &fingerprint).await {
+                        Ok(()) => {
+                            log::info!("accepted a new TLS certificate for {ip}");
+                            state.write().unwrap().cert_alerts.remove(&ip);
+                        }
+                        Err(e) => log::warn!("could not accept {ip}'s new certificate: {e:#}"),
+                    }
+                }
 
                 if let Some(address) = address_save {
                     match crate::online::geocode::lookup(&address).await {
@@ -473,12 +561,7 @@ async fn event_loop(
                             }
                             Event::Key(KeyEvent { code: KeyCode::Char(c), .. }) => {
                                 if let Some(buf) = app.address_input.as_mut() {
-                                    // Bounded so a stuck key cannot grow the
-                                    // buffer without limit; no real address is
-                                    // anywhere near this long.
-                                    if buf.chars().count() < 120 {
-                                        buf.push(c);
-                                    }
+                                    push_bounded(buf, c);
                                 }
                             }
                             _ => {}
@@ -491,10 +574,14 @@ async fn event_loop(
                                 ..
                             }) => break,
                             Event::Key(KeyEvent { code: KeyCode::Char(c), .. }) => {
-                                app.rename_input.as_mut().unwrap().push(c);
+                                if let Some(buf) = app.rename_input.as_mut() {
+                                    push_bounded(buf, c);
+                                }
                             }
                             Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
-                                app.rename_input.as_mut().unwrap().pop();
+                                if let Some(buf) = app.rename_input.as_mut() {
+                                    buf.pop();
+                                }
                             }
                             Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
                                 app.rename_input = None;
@@ -510,7 +597,7 @@ async fn event_loop(
                         });
                     } else {
                         match event {
-                            Event::Key(KeyEvent { code: KeyCode::Char('q'), .. })
+                            Event::Key(KeyEvent { code: KeyCode::Char('q' | 'Q'), .. })
                             | Event::Key(KeyEvent {
                                 code: KeyCode::Char('c'),
                                 modifiers: KeyModifiers::CONTROL,
@@ -683,4 +770,240 @@ async fn event_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, SwitchTimer};
+    use devices::keba::ChargingMode;
+
+    const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 75, 4));
+
+    fn app_with_switch(auto: Option<SwitchAutoMode>, timers: usize) -> App {
+        let mut app = App::default();
+        if let Some(mode) = auto {
+            app.switch_auto_modes.insert(IP, mode);
+        }
+        app.switch_timers.insert(
+            IP,
+            (0..timers)
+                .map(|i| SwitchTimer {
+                    id: i as i64,
+                    time_hhmm: "07:00".into(),
+                    relay_on: true,
+                })
+                .collect(),
+        );
+        app
+    }
+
+    // ── Detail-panel slots ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_switch_with_auto_mode_off_has_only_two_rows() {
+        // Timers exist in the model but are not reachable while auto mode is
+        // disabled, so Down must not walk onto them.
+        let mut app = app_with_switch(Some(SwitchAutoMode::Disabled), 3);
+        assert_eq!(max_detail_row(&app, IP), 1);
+        app.detail_row = 0;
+        assert!(detail_slot(&app, IP) == DetailSlot::Relay);
+        app.detail_row = 1;
+        assert!(detail_slot(&app, IP) == DetailSlot::Auto);
+    }
+
+    #[test]
+    fn time_mode_exposes_each_timer_and_an_add_row() {
+        let mut app = app_with_switch(Some(SwitchAutoMode::Time), 2);
+        assert_eq!(max_detail_row(&app, IP), 4, "relay, auto, two timers, add");
+        for (row, expected) in [
+            (0, DetailSlot::Relay),
+            (1, DetailSlot::Auto),
+            (2, DetailSlot::Timer(0)),
+            (3, DetailSlot::Timer(1)),
+            (4, DetailSlot::AddTimer),
+        ] {
+            app.detail_row = row;
+            assert!(detail_slot(&app, IP) == expected, "row {row}");
+        }
+    }
+
+    #[test]
+    fn a_row_past_the_end_does_not_select_a_timer_that_is_not_there() {
+        // Deleting the last timer leaves `detail_row` beyond the new end; the
+        // slot has to degrade to something harmless rather than index off it.
+        let mut app = app_with_switch(Some(SwitchAutoMode::Time), 0);
+        app.detail_row = 9;
+        assert!(detail_slot(&app, IP) == DetailSlot::AddTimer);
+
+        let mut app = app_with_switch(Some(SwitchAutoMode::Disabled), 0);
+        app.detail_row = 9;
+        assert!(detail_slot(&app, IP) == DetailSlot::Auto);
+    }
+
+    #[test]
+    fn a_device_with_no_switch_configuration_still_has_a_relay_row() {
+        let app = App::default();
+        assert_eq!(max_detail_row(&app, IP), 1);
+        assert!(detail_slot(&app, IP) == DetailSlot::Relay);
+    }
+
+    // ── KEBA mode cycling ─────────────────────────────────────────────────────
+
+    #[test]
+    fn enter_cycles_a_wallbox_through_every_mode_and_back() {
+        let mut app = App::default();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let next = toggled_keba_mode(&app, IP);
+            seen.push(next);
+            app.keba_modes.insert(IP, next);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ChargingMode::FullPower,
+                ChargingMode::Eco,
+                ChargingMode::EcoCarFirst,
+                ChargingMode::Disabled,
+            ],
+            "all four modes must be reachable, and the cycle must close"
+        );
+        // A fifth press returns to the start.
+        assert_eq!(toggled_keba_mode(&app, IP), ChargingMode::FullPower);
+    }
+
+    // ── Timer entry validation ────────────────────────────────────────────────
+
+    #[test]
+    fn a_well_formed_time_is_accepted() {
+        for s in ["00:00", "07:30", "23:59", "09:05"] {
+            assert!(is_valid_hhmm(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_or_malformed_time_is_rejected() {
+        for s in [
+            "24:00", "23:60", "99:99", // out of range
+            "7:30", "07:3", "073:0", "", "07:300", // wrong shape
+            "07-30", "0730", // wrong separator
+            "ab:cd", "07:cd", // not numbers
+        ] {
+            assert!(!is_valid_hhmm(s), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn a_multibyte_time_string_is_rejected_without_panicking() {
+        // `is_valid_hhmm` checks `len()` in bytes and then slices at 2 and 3, so
+        // it is worth pinning that a multi-byte character cannot make it slice
+        // through a character boundary. "é:00" is five *bytes* and passes the
+        // length check, and byte 2 really is ':' — which is also what makes it
+        // safe, since a ':' at index 2 can only follow whole characters.
+        assert_eq!("é:00".len(), 5);
+        assert!(!is_valid_hhmm("é:00"));
+        assert!(!is_valid_hhmm("0é:00"));
+        assert!(!is_valid_hhmm("»»"));
+    }
+
+    // ── View predicates and the energy list ───────────────────────────────────
+
+    #[test]
+    fn only_the_devices_view_uses_the_list_and_detail_layout() {
+        assert!(is_device_list_view(&View::Devices));
+        for v in [
+            View::Current,
+            View::Energy,
+            View::Network,
+            View::Statistics,
+            View::Environment,
+        ] {
+            assert!(!is_device_list_view(&v), "{:?}", std::mem::discriminant(&v));
+        }
+    }
+
+    #[test]
+    fn the_energy_list_holds_only_devices_that_are_reporting() {
+        let mut app = App::default();
+        let ips: Vec<IpAddr> = (1..=4)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, i)))
+            .collect();
+        for ip in &ips {
+            app.devices.push(crate::app::ScannedDevice {
+                ip: *ip,
+                latency_ms: 1.0,
+                open_ports: vec![],
+                name: None,
+                label: None,
+            });
+        }
+        // Built out rather than defaulted: none of the reading types implements
+        // `Default`, deliberately — a zeroed reading is indistinguishable from a
+        // device genuinely reporting zero.
+        let now = chrono::Utc::now();
+        app.readings.insert(
+            ips[0],
+            crate::app::LiveReading {
+                consumption_w: 400.0,
+                production_w: 0.0,
+                pac_w: 0.0,
+                rsoc: 50.0,
+                grid_w: 400.0,
+                remaining_kwh: 4.0,
+                capacity_kwh: 8.0,
+                updated_at: now,
+            },
+        );
+        app.switch_readings.insert(
+            ips[2],
+            crate::app::SwitchReading {
+                power_w: 12.0,
+                relay_on: true,
+                temperature_c: 24.0,
+                updated_at: now,
+            },
+        );
+        app.keba_readings.insert(
+            ips[3],
+            crate::app::KebaReading {
+                power_w: 0.0,
+                energy_session_kwh: 0.0,
+                energy_total_kwh: 100.0,
+                state: 2,
+                plug: 0,
+                curr_hw_ma: 16_000,
+                updated_at: now,
+            },
+        );
+
+        let listed: Vec<IpAddr> = energy_active_devices(&app).iter().map(|d| d.ip).collect();
+        // ips[1] has no reading of any kind, and the order follows app.devices.
+        assert_eq!(listed, vec![ips[0], ips[2], ips[3]]);
+    }
+
+    // ── Input bounds ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_text_input_stops_growing_once_it_is_full() {
+        // The rename buffer previously had no bound at all, so a held key grew
+        // it without limit and it was then written to the database.
+        let mut buf = String::new();
+        for _ in 0..MAX_INPUT_CHARS * 3 {
+            push_bounded(&mut buf, 'x');
+        }
+        assert_eq!(buf.chars().count(), MAX_INPUT_CHARS);
+    }
+
+    #[test]
+    fn the_input_bound_counts_characters_not_bytes() {
+        // A bound in bytes would cut a non-ASCII device name short at a third of
+        // the length an ASCII one gets.
+        let mut buf = String::new();
+        for _ in 0..MAX_INPUT_CHARS * 2 {
+            push_bounded(&mut buf, 'ä');
+        }
+        assert_eq!(buf.chars().count(), MAX_INPUT_CHARS);
+        assert_eq!(buf.len(), MAX_INPUT_CHARS * 2, "two bytes each");
+    }
 }

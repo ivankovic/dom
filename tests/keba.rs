@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 mod common;
@@ -23,6 +25,7 @@ mod common;
 use std::net::IpAddr;
 
 use dom::devices::keba;
+use dom::devices::keba::Supply;
 use dom::fingerprint::{Fingerprint, HttpProbe};
 
 // Captured live from a KEBA P30 (report 2/3) — see keba::Report2/Report3 for field meanings.
@@ -44,10 +47,12 @@ const WEBFIG_ROOT: &str = r#"<!DOCTYPE html><html><head><title>Wallbox</title></
 <body>Server: lwIP/1.3.2 (http://www.sics.se/~adam/lwip/)</body></html>"#;
 
 fn fp_with_root_body(ip: &str, open_ports: Vec<u16>, body: &str) -> Fingerprint {
+    let ip: std::net::IpAddr = ip.parse().unwrap();
     Fingerprint {
-        ip: ip.parse().unwrap(),
+        ip,
         open_ports,
         http: vec![HttpProbe {
+            ip,
             port: 80,
             url: "/".to_string(),
             raw: format!(
@@ -210,4 +215,51 @@ async fn keba_mode_defaults_to_disabled_and_persists() {
         .unwrap();
     let mode = dom::db::load_keba_mode(&pool, ip).await.unwrap();
     assert_eq!(mode, keba::ChargingMode::FullPower);
+}
+
+#[tokio::test]
+async fn the_site_supply_round_trips_and_falls_back_safely() {
+    let pool = common::db().await;
+
+    // Nothing stored: the default, which is what an existing installation gets.
+    assert_eq!(dom::db::get_supply(&pool).await, Supply::default());
+
+    let single = Supply {
+        volts: 230.0,
+        phases: 1.0,
+    };
+    dom::db::set_supply(&pool, single).await.unwrap();
+    assert_eq!(dom::db::get_supply(&pool).await, single);
+
+    // A value that cannot describe a building is refused rather than stored.
+    assert!(
+        dom::db::set_supply(
+            &pool,
+            Supply {
+                volts: 0.0,
+                phases: 3.0
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        dom::db::get_supply(&pool).await,
+        single,
+        "the good value stands"
+    );
+
+    // ...and one edited into the database by hand is ignored, not divided by.
+    // Eco divides by this on every tick, so it must never return a zero.
+    dom::db::set_config(&pool, "supply_phases", "0")
+        .await
+        .unwrap();
+    assert_eq!(dom::db::get_supply(&pool).await, Supply::default());
+
+    dom::db::set_config(&pool, "supply_phases", "not a number")
+        .await
+        .unwrap();
+    let recovered = dom::db::get_supply(&pool).await;
+    assert_eq!(recovered.phases, Supply::default().phases);
+    assert!(recovered.is_plausible());
 }

@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 //! Long-term energy statistics: which span is being looked at, and how the daily
@@ -58,28 +60,36 @@ pub struct Totals {
     pub production_kwh: f64,
     pub grid_import_kwh: f64,
     pub grid_export_kwh: f64,
+    /// Of what was imported, how much actually served the house — the rest went
+    /// into the battery, and is counted when it comes back out. See
+    /// `crate::energy` for why the two differ and when it matters.
+    pub grid_to_house_kwh: f64,
+    /// Imported energy that charged the battery rather than serving the house.
+    pub grid_to_battery_kwh: f64,
 }
 
 impl Totals {
     fn add(&mut self, d: &DailyEnergy) {
-        self.consumption_kwh += d.consumption_kwh;
-        self.production_kwh += d.production_kwh;
-        self.grid_import_kwh += d.grid_import_kwh;
-        self.grid_export_kwh += d.grid_export_kwh;
+        *self += &Totals::from(d);
     }
 
     /// Share of what was consumed that came from own production or the battery
     /// rather than from the grid, as a percentage.
+    ///
+    /// Measured against `grid_to_house_kwh`, not against everything imported.
+    /// The two are the same until the battery charges from the grid, and then
+    /// they are not: importing overnight to fill the battery is not the house
+    /// consuming grid energy, and discharging that energy the next morning is
+    /// not the house running on sunshine. Charging it is neither, and shows up
+    /// when it is used. See `crate::energy`.
     ///
     /// `None` when nothing was consumed in the period — a period with no data,
     /// or one before the battery was installed, has no meaningful ratio, and
     /// showing 0% would read as "bought everything from the grid" when the truth
     /// is "don't know".
     pub fn self_sufficiency_pct(&self) -> Option<f64> {
-        (self.consumption_kwh > 0.0).then(|| {
-            ((self.consumption_kwh - self.grid_import_kwh) / self.consumption_kwh * 100.0)
-                .clamp(0.0, 100.0)
-        })
+        (self.consumption_kwh > 0.0)
+            .then(|| (self.self_consumed_kwh() / self.consumption_kwh * 100.0).clamp(0.0, 100.0))
     }
 
     /// Share of own production that was used on site rather than exported.
@@ -91,9 +101,51 @@ impl Totals {
         })
     }
 
-    /// Energy that was consumed without being bought, in kWh.
+    /// Energy the house used that did not come from the grid, in kWh.
+    ///
+    /// The green part of each bar in the statistics view, and the numerator of
+    /// `self_sufficiency_pct`. Energy the battery took *from* the grid is not
+    /// subtracted here — it never reached the house — but it is subtracted when
+    /// the battery gives it back.
     pub fn self_consumed_kwh(&self) -> f64 {
-        (self.consumption_kwh - self.grid_import_kwh).max(0.0)
+        (self.consumption_kwh - self.grid_to_house_kwh).max(0.0)
+    }
+}
+
+/// How far back the view will step when it does not know where history begins.
+///
+/// Only reached with an empty database or a failed lookup — otherwise
+/// `Stats::back` stops at the oldest recorded day, which is always nearer. A
+/// hundred years in either window is far past anything real and still a bound.
+const MAX_OFFSET: u32 = 1200;
+
+impl std::ops::AddAssign<&Totals> for Totals {
+    /// The one place totals are summed.
+    ///
+    /// Folding a day into a bucket and folding buckets into a period used to be
+    /// two separate lists of fields, and adding a metric to one of them and not
+    /// the other produced a period total that silently disagreed with the days
+    /// it was made of.
+    fn add_assign(&mut self, o: &Self) {
+        self.consumption_kwh += o.consumption_kwh;
+        self.production_kwh += o.production_kwh;
+        self.grid_import_kwh += o.grid_import_kwh;
+        self.grid_export_kwh += o.grid_export_kwh;
+        self.grid_to_house_kwh += o.grid_to_house_kwh;
+        self.grid_to_battery_kwh += o.grid_to_battery_kwh;
+    }
+}
+
+impl From<&DailyEnergy> for Totals {
+    fn from(d: &DailyEnergy) -> Self {
+        Self {
+            consumption_kwh: d.consumption_kwh,
+            production_kwh: d.production_kwh,
+            grid_import_kwh: d.grid_import_kwh,
+            grid_export_kwh: d.grid_export_kwh,
+            grid_to_house_kwh: d.grid_to_house_kwh,
+            grid_to_battery_kwh: d.grid_to_battery_kwh,
+        }
     }
 }
 
@@ -125,26 +177,38 @@ pub struct Stats {
 }
 
 impl Stats {
-    /// Switches window. Pressing the same window's key again returns to the
-    /// current period, which is the cheapest way back after browsing.
+    /// Switches window, and returns to the current period.
+    ///
+    /// Pressing the same window's key again therefore does something useful
+    /// rather than nothing: it is the cheapest way back after browsing. Both
+    /// halves of that are one assignment — an earlier version branched on
+    /// whether the window was already selected, but the two arms did the same
+    /// thing, since assigning a value it already holds changes nothing.
     pub fn set_window(&mut self, window: StatsWindow) {
-        if self.window == window {
-            self.offset = 0;
-        } else {
-            self.window = window;
-            self.offset = 0;
-        }
+        self.window = window;
+        self.offset = 0;
     }
 
     /// Steps one period into the past, unless that would leave the range of days
     /// that have any data at all.
+    ///
+    /// `MAX_OFFSET` is the floor for when there is no data yet, or the query for
+    /// it failed, and `oldest_day` is therefore unknown. Without it the counter
+    /// simply kept rising: `range` clamps an impossible date back to today, so
+    /// the view stopped changing while every press still counted, and getting
+    /// back to the present took exactly as many presses of Right as had been
+    /// spent on Left.
     pub fn back(&mut self, today: NaiveDate) {
         let next = self.offset + 1;
-        if let Some(oldest) = self.oldest_day {
-            let (_, end) = range(self.window, next, today);
-            if end < oldest {
-                return;
+        match self.oldest_day {
+            Some(oldest) => {
+                let (_, end) = range(self.window, next, today);
+                if end < oldest {
+                    return;
+                }
             }
+            None if next > MAX_OFFSET => return,
+            None => {}
         }
         self.offset = next;
     }
@@ -304,10 +368,7 @@ pub async fn refresh(pool: &sqlx::SqlitePool, state: &crate::app::SharedState) {
 pub fn total(buckets: &[Bucket]) -> Totals {
     let mut t = Totals::default();
     for b in buckets {
-        t.consumption_kwh += b.totals.consumption_kwh;
-        t.production_kwh += b.totals.production_kwh;
-        t.grid_import_kwh += b.totals.grid_import_kwh;
-        t.grid_export_kwh += b.totals.grid_export_kwh;
+        t += &b.totals;
     }
     t
 }
@@ -320,6 +381,9 @@ mod tests {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
     }
 
+    /// A day where every imported watt-hour reached the house — which is every
+    /// day on an installation whose battery only ever charges from the sun, and
+    /// what the record held before the distinction existed.
     fn de(d: &str, consumption: f64, production: f64, import: f64, export: f64) -> DailyEnergy {
         DailyEnergy {
             day: day(d),
@@ -327,6 +391,8 @@ mod tests {
             production_kwh: production,
             grid_import_kwh: import,
             grid_export_kwh: export,
+            grid_to_house_kwh: import,
+            grid_to_battery_kwh: 0.0,
         }
     }
 
@@ -544,6 +610,8 @@ mod tests {
             production_kwh: 80.0,
             grid_import_kwh: 40.0,
             grid_export_kwh: 20.0,
+            grid_to_house_kwh: 40.0,
+            grid_to_battery_kwh: 0.0,
         };
         // 60 of 100 kWh consumed did not come from the grid.
         assert_eq!(t.self_sufficiency_pct(), Some(60.0));
@@ -565,6 +633,7 @@ mod tests {
         let no_solar = Totals {
             consumption_kwh: 10.0,
             grid_import_kwh: 10.0,
+            grid_to_house_kwh: 10.0,
             ..Default::default()
         };
         assert_eq!(no_solar.self_sufficiency_pct(), Some(0.0));
@@ -581,9 +650,130 @@ mod tests {
             production_kwh: 10.0,
             grid_import_kwh: 10.5,
             grid_export_kwh: 10.5,
+            grid_to_house_kwh: 10.5,
+            grid_to_battery_kwh: 0.0,
         };
         assert_eq!(noisy.self_sufficiency_pct(), Some(0.0));
         assert_eq!(noisy.self_consumption_pct(), Some(0.0));
         assert_eq!(noisy.self_consumed_kwh(), 0.0);
+    }
+
+    #[test]
+    fn a_periods_total_agrees_with_the_days_it_is_made_of() {
+        // Folding days into buckets and buckets into a period were two separate
+        // lists of fields, and a metric added to one and not the other made a
+        // period total silently disagree with its own bars.
+        let start = day("2026-07-01");
+        let end = day("2026-07-03");
+        let daily = vec![
+            de("2026-07-01", 20.0, 30.0, 1.0, 10.0),
+            de("2026-07-02", 22.0, 28.0, 2.0, 8.0),
+            de("2026-07-03", 18.0, 12.0, 7.0, 1.0),
+        ];
+        let period = total(&bucketize(StatsWindow::Month, start, end, &daily));
+
+        let mut by_hand = Totals::default();
+        for d in &daily {
+            by_hand += &Totals::from(d);
+        }
+        assert_eq!(period, by_hand, "every field, not just the ones drawn");
+    }
+
+    #[test]
+    fn charging_the_battery_from_the_grid_is_not_counted_until_it_is_used() {
+        // The winter night: 12 kWh imported, only 2 of it into the house, the
+        // other 10 into the battery. Measuring against everything imported would
+        // report −500%, clamped to 0, for a night that ran the house on the grid
+        // exactly as any other night does.
+        let night = Totals {
+            consumption_kwh: 2.0,
+            production_kwh: 0.0,
+            grid_import_kwh: 12.0,
+            grid_export_kwh: 0.0,
+            grid_to_house_kwh: 2.0,
+            grid_to_battery_kwh: 10.0,
+        };
+        assert_eq!(night.self_sufficiency_pct(), Some(0.0));
+        assert_eq!(night.self_consumed_kwh(), 0.0);
+
+        // The following day runs entirely off that battery, importing nothing.
+        // It is not self-sufficient: the energy was bought, a night earlier.
+        let day = Totals {
+            consumption_kwh: 10.0,
+            production_kwh: 0.0,
+            grid_import_kwh: 0.0,
+            grid_export_kwh: 0.0,
+            grid_to_house_kwh: 10.0,
+            grid_to_battery_kwh: 0.0,
+        };
+        assert_eq!(
+            day.self_sufficiency_pct(),
+            Some(0.0),
+            "measured against import alone this would read 100%"
+        );
+    }
+
+    #[test]
+    fn a_battery_charged_by_the_sun_is_self_sufficient_when_it_discharges() {
+        // The counterpart, and the summer behaviour that must not change: the
+        // battery gives back what the sun put in, and none of it was bought.
+        let evening = Totals {
+            consumption_kwh: 10.0,
+            production_kwh: 0.0,
+            grid_import_kwh: 0.0,
+            grid_export_kwh: 0.0,
+            grid_to_house_kwh: 0.0,
+            grid_to_battery_kwh: 0.0,
+        };
+        assert_eq!(evening.self_sufficiency_pct(), Some(100.0));
+        assert_eq!(evening.self_consumed_kwh(), 10.0);
+    }
+
+    // ── Browsing bounds ───────────────────────────────────────────────────────
+
+    #[test]
+    fn browsing_back_with_no_recorded_history_is_bounded() {
+        // The regression: with `oldest_day` unknown the counter rose without
+        // limit while the view stopped changing, so returning to the present
+        // took as many presses of Right as had been spent on Left.
+        let today = NaiveDate::from_ymd_opt(2026, 8, 23).unwrap();
+        let mut stats = Stats::default();
+        assert_eq!(stats.oldest_day, None);
+
+        for _ in 0..MAX_OFFSET + 500 {
+            stats.back(today);
+        }
+        assert_eq!(stats.offset, MAX_OFFSET);
+    }
+
+    #[test]
+    fn browsing_back_still_stops_at_the_oldest_recorded_day() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 23).unwrap();
+        let mut stats = Stats {
+            oldest_day: Some(NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()),
+            ..Default::default()
+        };
+        for _ in 0..50 {
+            stats.back(today);
+        }
+        // June, July, August: two steps back from August and no further.
+        assert_eq!(stats.offset, 2);
+        let (start, _) = stats.range(today);
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+    }
+
+    #[test]
+    fn selecting_the_window_already_shown_returns_to_the_current_period() {
+        let mut stats = Stats {
+            window: StatsWindow::Month,
+            offset: 7,
+            ..Default::default()
+        };
+        stats.set_window(StatsWindow::Month);
+        assert_eq!((stats.window, stats.offset), (StatsWindow::Month, 0));
+
+        stats.offset = 3;
+        stats.set_window(StatsWindow::Year);
+        assert_eq!((stats.window, stats.offset), (StatsWindow::Year, 0));
     }
 }

@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::collections::HashMap;
@@ -23,13 +25,12 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use sqlx::SqlitePool;
-use surge_ping::{Client, Config};
 use tokio::sync::Notify;
 
 use dom::app::{SharedState, SwitchAutoMode};
-use dom::{app, db, devices, fingerprint, online, stats, tui};
+use dom::{app, db, devices, fingerprint, logging, online, stats, tui};
 
 /// How long after startup the ICMP ping scan's one-time early follow-up runs,
 /// to catch devices that weren't up yet at the very first (t=0) scan.
@@ -44,6 +45,12 @@ const PING_SCAN_STEADY_INTERVAL_SECS: u64 = 4 * 60 * 60;
 /// How often devices are fingerprinted and the device list refreshed, from
 /// the union of the most recent ping-scan results and the router's DHCP
 /// leases (see `discovery_task`).
+///
+/// This is how *every* device is found, energy hardware included — a battery or
+/// wallbox that appears, or moves to a new address, only starts being polled once
+/// discovery notices it. Deliberately unchanged while the infrastructure polling
+/// around it was slowed down: this one is not chatter on behalf of a view, it is
+/// how the app learns what exists.
 const DISCOVERY_INTERVAL_SECS: u64 = 5 * 60;
 /// Cap on the in-memory (and bootstrap-loaded) network status event list
 /// shown in the Network view.
@@ -69,9 +76,41 @@ const ENVIRONMENT_HISTORY_DAYS: i64 = 21;
 /// 10-minute means on the same cadence, so polling faster only re-reads the same
 /// figure — and the insert ignores a repeat anyway.
 const WEATHER_INTERVAL_SECS: u64 = 10 * 60;
+/// How often the solar forecast is fetched. Open-Meteo reruns the Swiss models
+/// every three hours and republishes hourly, so half an hour keeps the outlook
+/// current without asking the same question of the same model run repeatedly.
+const SOLAR_INTERVAL_SECS: u64 = 30 * 60;
+/// How often scheduled switch timers are checked.
+const TIMER_TICK_SECS: u64 = 30;
+/// How far back a timer sweep will look after a gap.
+///
+/// A tick that arrives late — a suspended laptop, a stopped process — should
+/// still fire a timer it stepped over, but only a recent one: replaying a whole
+/// day's schedule on resume gets every switch into the state it should have
+/// reached hours ago, in the wrong order and all at once. Half an hour is enough
+/// to cover a sleep or a slow round of unreachable switches, and short enough
+/// that nothing surprising happens after a long absence.
+const MAX_TIMER_CATCHUP_MINUTES: i64 = 30;
+/// How many times a due timer is offered to a switch that will not take it.
+///
+/// Retrying matters — a switch briefly unreachable at the moment its timer came
+/// due used to be skipped for the whole day. Retrying *forever* does not: each
+/// attempt on an unreachable device costs a five-second connect timeout, and a
+/// handful of switches that are simply switched off at the wall would then spend
+/// most of every tick being asked again. After this many the timer is recorded
+/// as done for the day, with the reason in the log.
+const TIMER_MAX_ATTEMPTS: u32 = 5;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before anything else that might have something to say. The TUI takes the
+    // terminal a few lines below, after which nothing printed is visible, so a
+    // failure to open the log is reported here or not at all.
+    match dom::logging::init() {
+        Ok(path) => println!("logging to {}", path.display()),
+        Err(e) => eprintln!("warning: continuing without a log file — {e}"),
+    }
+
     let pool = db::init("sqlite://db.sqlite").await?;
     let state = app::new_shared();
 
@@ -84,6 +123,13 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .flatten();
     state.write().unwrap().theme_mode = tui::theme::resolve_mode_from_env(stored_theme.as_deref());
+
+    // Before anything records a measurement. A Raspberry Pi has no battery-backed
+    // clock, so it boots at whatever was last written to disk and jumps when NTP
+    // catches up — and a sample stamped with a date days in the past is rolled up
+    // into the wrong day, or into a day already marked done and therefore never
+    // rolled up at all, after which pruning removes it.
+    await_plausible_clock(&pool).await;
 
     // Pre-populate device list and start poll loops for devices known from a prior run.
     bootstrap_known_devices(&state, &pool).await;
@@ -101,12 +147,6 @@ async fn main() -> anyhow::Result<()> {
         rescan_notify.clone(),
     ));
 
-    // Background: per-device infrastructure health checks at custom intervals.
-    // Router and 5G modem: 3 packets every 10 seconds.
-    // Access points: 3 packets every 30 seconds.
-    // Other infrastructure devices: default intervals.
-    tokio::spawn(ping_infrastructure_task(state.clone()));
-
     // Background: prune RawDeviceMeasurements and old network status events, hourly.
     {
         let pool = pool.clone();
@@ -117,6 +157,13 @@ async fn main() -> anyhow::Result<()> {
                 ticker.tick().await;
                 let _ = db::prune_raw_measurements(&pool).await;
                 let _ = db::prune_network_status_events(&pool).await;
+                // Hand back what pruning freed. Without this the file only ever
+                // grows to its high-water mark — see `db::reclaim_free_pages`.
+                match db::reclaim_free_pages(&pool).await {
+                    Ok(0) => {}
+                    Ok(left) => log::info!("reclaimed free pages; {left} still on the free list"),
+                    Err(e) => log::warn!("reclaiming free pages failed: {e:#}"),
+                }
             }
         });
     }
@@ -158,13 +205,44 @@ async fn main() -> anyhow::Result<()> {
     // Background: outdoor temperature, if a location has been configured.
     tokio::spawn(weather_task(state.clone(), pool.clone()));
 
+    // Background: solar production forecast, and the calibration behind it.
+    tokio::spawn(solar_task(state.clone(), pool.clone()));
+
     // Background: keeps the daily energy rollup and the statistics view current.
     tokio::spawn(statistics_task(state.clone(), pool.clone()));
 
     // Background: fires scheduled switch timers every 30s.
     tokio::spawn(timer_job(state.clone()));
 
-    tui::run(state, pool, rescan_notify).await
+    match tui::run(state, pool, rescan_notify).await? {
+        tui::Interface::Closed => Ok(()),
+        tui::Interface::Unavailable(why) => {
+            // Headless: keep doing the work, with no interface to show it in.
+            // The background tasks are already running and are what actually
+            // collects; the log is the only thing to watch. See `logging`.
+            log::info!("no terminal to draw on ({why}); running headless");
+            println!(
+                "No terminal available ({why}) — running headless. Watch {}.",
+                logging::LOG_FILE
+            );
+            run_headless().await
+        }
+    }
+}
+
+/// Waits for a shutdown signal, doing nothing else.
+///
+/// Everything Dom does is already running in background tasks by the time this
+/// is reached; this only keeps the process alive and gives it somewhere to stop.
+/// Ctrl-C and `SIGTERM` are both honoured, the latter because that is what a
+/// service manager sends.
+async fn run_headless() -> anyhow::Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => log::info!("interrupted; shutting down"),
+        _ = term.recv() => log::info!("SIGTERM; shutting down"),
+    }
+    Ok(())
 }
 
 // ── Outdoor temperature ───────────────────────────────────────────────────────
@@ -186,6 +264,98 @@ async fn weather_task(state: SharedState, pool: SqlitePool) {
     loop {
         ticker.tick().await;
         online::weather::refresh(&pool, &state).await;
+    }
+}
+
+// ── Clock sanity ──────────────────────────────────────────────────────────────
+
+/// Longest Dom will wait at startup for the clock to become plausible.
+///
+/// Bounded because waiting forever is worse than recording with a suspect clock:
+/// a machine with no network would never start at all. On a Pi running
+/// `fake-hwclock` the shortfall is usually seconds, since the clock is restored
+/// from the last shutdown and only has to catch up to the last sample.
+const CLOCK_WAIT_LIMIT: Duration = Duration::from_secs(120);
+
+/// How often the clock is re-checked while waiting.
+const CLOCK_POLL: Duration = Duration::from_secs(2);
+
+/// Waits until the system clock is at least as late as the newest thing already
+/// recorded.
+///
+/// The database is the only evidence available that time has passed: a row
+/// stamped last Tuesday proves the clock once read last Tuesday. If it now reads
+/// earlier than that, it is wrong, and anything recorded meanwhile lands in the
+/// past — into a day the rollup has already marked done, which is then pruned
+/// without ever being summarised.
+///
+/// Does nothing at all on a machine whose clock is fine, which is every machine
+/// with a working RTC.
+async fn await_plausible_clock(pool: &SqlitePool) {
+    let newest = match db::newest_recorded_time(pool).await {
+        Ok(Some(t)) => t,
+        // Nothing recorded yet, so there is nothing to be inconsistent with.
+        Ok(None) => return,
+        Err(e) => {
+            log::warn!("could not check the clock against recorded data: {e:#}");
+            return;
+        }
+    };
+    if Utc::now() >= newest {
+        return;
+    }
+
+    log::warn!(
+        "the clock reads {}, before the newest recorded sample at {}; waiting up to {}s for it \
+         to be corrected",
+        Utc::now(),
+        newest,
+        CLOCK_WAIT_LIMIT.as_secs()
+    );
+    let deadline = tokio::time::Instant::now() + CLOCK_WAIT_LIMIT;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(CLOCK_POLL).await;
+        if Utc::now() >= newest {
+            log::info!(
+                "the clock is now {} and consistent with the record",
+                Utc::now()
+            );
+            return;
+        }
+    }
+    log::warn!(
+        "the clock is still behind the record after {}s; continuing anyway — measurements \
+         recorded now will be stamped in the past",
+        CLOCK_WAIT_LIMIT.as_secs()
+    );
+}
+
+// ── Solar production forecast ─────────────────────────────────────────────────
+
+/// Keeps the production forecast current, and the array calibration behind it.
+///
+/// Two jobs on one ticker because they are ordered: a calibration changes which
+/// plane the forecast is requested for, so refitting first means the fetch that
+/// follows already asks the right question.
+///
+/// The calibration is the expensive half and rarely needs doing —
+/// `forecast::calibrate` decides for itself whether the stored fit is stale, and
+/// how much of it to redo. Failures are logged and the loop continues: a fit that
+/// cannot be improved today is not a reason to stop forecasting with yesterday's.
+///
+/// Like `weather_task`, this is idle until the user sets a location.
+async fn solar_task(state: SharedState, pool: SqlitePool) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(SOLAR_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+
+        // `calibrate` decides for itself whether a refit is owed and how much of
+        // one, so this asks on every tick and usually gets an immediate no.
+        if let Err(e) = online::forecast::calibrate(&pool).await {
+            log::warn!("calibrating the solar array failed: {e:#}");
+        }
+        online::forecast::refresh(&pool, &state).await;
     }
 }
 
@@ -211,10 +381,20 @@ async fn statistics_task(state: SharedState, pool: SqlitePool) {
     stats::refresh(&pool, &state).await;
     loop {
         let rolled = db::rollup_history(&pool, ROLLUP_THROTTLE).await;
+        // Recorded in `App` as well as logged. A failing rollup stops pruning
+        // (below), and the database resumes growing by roughly a gigabyte a
+        // month — which is much too consequential to leave in a file nobody is
+        // watching. See `logging`.
         match &rolled {
-            Ok(0) => {}
-            Ok(n) => log::info!("rolled up {n} days of energy history"),
-            Err(e) => log::warn!("energy rollup failed: {e:#}"),
+            Ok(0) => state.write().unwrap().rollup_error = None,
+            Ok(n) => {
+                log::info!("rolled up {n} days of energy history");
+                state.write().unwrap().rollup_error = None;
+            }
+            Err(e) => {
+                log::warn!("energy rollup failed: {e:#}");
+                state.write().unwrap().rollup_error = Some(format!("{e:#}"));
+            }
         }
         stats::refresh(&pool, &state).await;
 
@@ -258,9 +438,10 @@ async fn statistics_task(state: SharedState, pool: SqlitePool) {
 /// `PING_SCAN_FOLLOWUP_SECS` (to catch devices that weren't up yet at t=0),
 /// then every `PING_SCAN_STEADY_INTERVAL_SECS` — or immediately whenever
 /// `rescan` is notified (the TUI's manual "rescan now" key). Independent of
-/// device discovery (`discovery_task`). Updates `ping_history` (used for the
-/// Network view's OK/SLOW/DEGRADED/LOST status) and, on success, the latest
-/// ping-reachable device list that `discovery_task` merges with DHCP leases.
+/// device discovery (`discovery_task`). On success it records the latest
+/// ping-reachable device list, which `discovery_task` merges with the router's
+/// DHCP leases; the round-trip time of each reply becomes that device's latency
+/// in the Devices view.
 /// A failure here (e.g. missing CAP_NET_RAW / ping_group_range on this host)
 /// only records `last_scan_error` for visibility — it must never block or
 /// delay DHCP-lease-based discovery, which needs only plain TCP, not ICMP.
@@ -284,131 +465,12 @@ async fn ping_scan_task(state: SharedState, rescan: Arc<Notify>) {
             Ok(scan_result) => {
                 let mut app = state.write().unwrap();
                 app.last_scan_error = None;
-                for device in &scan_result.successful {
-                    let history = app.ping_history.entry(device.ip).or_default();
-                    history.add(device.latency_ms, true);
-                }
-                for ip in &scan_result.failed {
-                    let history = app.ping_history.entry(*ip).or_default();
-                    history.add(0.0, false);
-                }
                 app.last_ping_devices = scan_result.successful;
             }
             Err(e) => {
                 state.write().unwrap().last_scan_error = Some(e.to_string());
             }
         }
-    }
-}
-
-// ── Per-device infrastructure ping ─────────────────────────────────────────────
-
-/// Per-device ping health checks at custom intervals based on device role.
-///
-/// - Router and 5G Modem: pinged every 10 seconds with 3 packets
-/// - Access Points: pinged every 30 seconds with 3 packets
-/// - Other devices: uses default configuration
-///
-/// This task runs on a 10-second interval (the GCD of 10 and 30) and checks
-/// which devices are due for pinging based on their individual intervals.
-async fn ping_infrastructure_task(state: SharedState) {
-    // Run on 10-second intervals (GCD of 10 and 30)
-    let mut ticker = tokio::time::interval(Duration::from_secs(10));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
-
-    // Track the last ping time for each device
-    let mut last_pinged: HashMap<IpAddr, chrono::DateTime<chrono::Utc>> = HashMap::new();
-
-    loop {
-        ticker.tick().await;
-
-        let now = chrono::Utc::now();
-        let devices: Vec<app::ScannedDevice>;
-
-        {
-            let app = state.read().unwrap();
-            devices = app.devices.clone();
-        }
-
-        // Classify devices using the same logic as classify_network_devices
-        let topology = app::classify_network_devices(&devices);
-        let routers = topology.routers;
-        let modems = topology.modems;
-        let access_points = topology.access_points;
-
-        // Build list of devices to ping with their configs
-        let mut devices_to_ping: Vec<(IpAddr, u8)> = Vec::new(); // (ip, packet_count)
-
-        // Router and 5G modem: every 10 seconds, 3 packets
-        for ip in routers.iter().chain(modems.iter()) {
-            if should_ping(*ip, 10, &last_pinged, now) {
-                devices_to_ping.push((*ip, 3));
-            }
-        }
-
-        // Access points: every 30 seconds, 3 packets
-        for ip in &access_points {
-            if should_ping(*ip, 30, &last_pinged, now) {
-                devices_to_ping.push((*ip, 3));
-            }
-        }
-
-        // Ping all due devices
-        if !devices_to_ping.is_empty() {
-            let client = match Client::new(&Config::default()) {
-                Ok(c) => Arc::new(c),
-                Err(_) => {
-                    // Failed to create ping client, skip this cycle
-                    continue;
-                }
-            };
-
-            let mut set = tokio::task::JoinSet::new();
-            for (ip, count) in devices_to_ping {
-                let c = Arc::clone(&client);
-                set.spawn(async move { (ip, devices::ping_device_multi(c, ip, count).await) });
-            }
-
-            // Collect results
-            while let Some(result) = set.join_next().await {
-                match result {
-                    Ok((ip, Some((avg_latency, successes, total)))) => {
-                        // All pings succeeded or partial success
-                        let success = successes == total;
-                        let mut app = state.write().unwrap();
-                        let history = app.ping_history.entry(ip).or_default();
-                        history.add(avg_latency, success);
-                        last_pinged.insert(ip, now);
-                    }
-                    Ok((ip, None)) => {
-                        // All pings failed
-                        let mut app = state.write().unwrap();
-                        let history = app.ping_history.entry(ip).or_default();
-                        history.add(0.0, false);
-                        last_pinged.insert(ip, now);
-                    }
-                    Err(_) => {
-                        // Task failed
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Check if a device should be pinged based on its interval and last ping time.
-fn should_ping(
-    ip: IpAddr,
-    interval_secs: u64,
-    last_pinged: &HashMap<IpAddr, chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    match last_pinged.get(&ip) {
-        Some(last) => {
-            let elapsed = now.signed_duration_since(*last).num_seconds();
-            elapsed >= interval_secs as i64
-        }
-        None => true, // Never pinged before
     }
 }
 
@@ -525,10 +587,14 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
             }
         }
 
-        // Automatically configure and add our own IP addresses as "Dom"
+        // Automatically configure and add our own IP addresses as "Dom", and
+        // drop any this machine no longer has — see `forget_stale_addresses`.
         let local_ips = devices::dom_local::detect_local_ips();
-        for local_ip in local_ips {
-            let _ = devices::dom_local::save_device(&pool, local_ip).await;
+        for local_ip in &local_ips {
+            let _ = devices::dom_local::save_device(&pool, *local_ip).await;
+        }
+        if let Err(e) = devices::dom_local::forget_stale_addresses(&pool, &local_ips).await {
+            log::warn!("could not tidy the local machine's old addresses: {e:#}");
         }
 
         // Update the device list: scan results ∪ known polled devices (never drop them)
@@ -837,19 +903,36 @@ async fn bootstrap_known_devices(state: &SharedState, pool: &SqlitePool) {
 /// Background task: every 30 s, checks wall-clock time against scheduled switch timers and fires
 /// any that match the current HH:MM and haven't already fired today.
 async fn timer_job(state: SharedState) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    let mut ticker = tokio::time::interval(Duration::from_secs(TIMER_TICK_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // (timer_id, "YYYY-MM-DD") pairs we've already fired — cleared when the date rolls over.
+
+    // (timer_id, "YYYY-MM-DD") pairs that have fired, and ones that came due but
+    // whose switch would not take the command. Both are cleared when the date
+    // rolls over.
     let mut fired: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+    // ...and how many attempts each pending one has already had, so a switch
+    // that is simply off does not get talked to for the rest of the day.
+    let mut pending: std::collections::HashMap<(i64, String), u32> =
+        std::collections::HashMap::new();
+
+    // Where the last sweep reached. Starts at "now" so timers earlier today do
+    // not all fire at once on startup — Dom coming up at six in the evening must
+    // not run the morning's schedule.
+    let mut swept_to = chrono::Local::now();
 
     loop {
         ticker.tick().await;
 
         let now = chrono::Local::now();
         let today = now.format("%Y-%m-%d").to_string();
-        let now_hhmm = now.format("%H:%M").to_string();
 
-        // Collect to-fire list under read lock, then drop before awaiting network calls.
+        // A timer fires when its time falls in the interval since the last
+        // sweep, rather than when it equals the current minute. Equality needed
+        // a tick to land inside the right minute, and a suspended machine or a
+        // slow poll meant the minute could pass unvisited — after which that
+        // firing was simply lost for the day.
+        let window = elapsed_window(swept_to, now);
+
         let to_fire: Vec<(IpAddr, i64, bool)> = {
             let app = state.read().unwrap();
             let mut actions = Vec::new();
@@ -857,12 +940,14 @@ async fn timer_job(state: SharedState) {
                 if *mode != SwitchAutoMode::Time {
                     continue;
                 }
-                if let Some(timers) = app.switch_timers.get(ip) {
-                    for t in timers {
-                        let key = (t.id, today.clone());
-                        if t.time_hhmm == now_hhmm && !fired.contains(&key) {
-                            actions.push((*ip, t.id, t.relay_on));
-                        }
+                for t in app.switch_timers.get(ip).into_iter().flatten() {
+                    let key = (t.id, today.clone());
+                    if fired.contains(&key) {
+                        continue;
+                    }
+                    // Either newly due, or due earlier and not yet accepted.
+                    if pending.contains_key(&key) || window.contains(&t.time_hhmm) {
+                        actions.push((*ip, t.id, t.relay_on));
                     }
                 }
             }
@@ -871,18 +956,101 @@ async fn timer_job(state: SharedState) {
 
         for (ip, timer_id, relay_on) in to_fire {
             let key = (timer_id, today.clone());
-            if fired.contains(&key) {
-                continue;
+            // Marked done only once the switch confirms it. A device that was
+            // briefly unreachable used to be recorded as fired and never retried.
+            match devices::mystrom_switch::set_relay(
+                ip,
+                devices::mystrom_switch::API_PORT,
+                relay_on,
+            )
+            .await
+            {
+                Ok(()) => {
+                    log::info!(
+                        "timer {timer_id} switched {ip} {}",
+                        if relay_on { "on" } else { "off" }
+                    );
+                    fired.insert(key.clone());
+                    pending.remove(&key);
+                }
+                Err(e) => {
+                    let attempts = pending.entry(key.clone()).or_insert(0);
+                    *attempts += 1;
+                    if *attempts >= TIMER_MAX_ATTEMPTS {
+                        log::warn!(
+                            "timer {timer_id} could not switch {ip} after {attempts} attempts \
+                             ({e:#}); giving up until tomorrow"
+                        );
+                        pending.remove(&key);
+                        // Recorded as fired so it is not attempted again today.
+                        // The switch never took the command, and the log says so;
+                        // what this prevents is retrying a device that is simply
+                        // off, every tick, for the rest of the day.
+                        fired.insert(key);
+                    } else {
+                        log::warn!(
+                            "timer {timer_id} could not switch {ip}: {e:#}; \
+                             attempt {attempts}, will retry"
+                        );
+                    }
+                }
             }
-            let _ =
-                devices::mystrom_switch::set_relay(ip, devices::mystrom_switch::API_PORT, relay_on)
-                    .await;
-            fired.insert(key);
         }
 
-        // Drop yesterday's fire records.
+        swept_to = now;
         fired.retain(|(_, date)| *date == today);
+        pending.retain(|(_, date), _| *date == today);
     }
+}
+
+/// The `HH:MM` minutes strictly after `from` and up to and including `to`.
+///
+/// This is what a timer is matched against, so that a firing is caught by
+/// whichever tick next runs rather than only by one that lands inside its own
+/// minute. Returns nothing when the two instants are in the same minute, so a
+/// timer fires once rather than on every tick of the minute it is due.
+///
+/// Bounded by `MAX_TIMER_CATCHUP_MINUTES`: after a long gap — a suspended
+/// machine, a process that was stopped overnight — only the recent past is
+/// swept. Firing a whole day of schedule at once on resume would be worse than
+/// missing it, since the point of a timer is *when* it happens.
+///
+/// A backwards jump (`to` before `from`) yields nothing, which is also what a
+/// clock stepped backwards by NTP produces.
+///
+/// Daylight saving is handled by the arithmetic rather than by this function:
+/// the subtraction is on `DateTime<Local>`, so an autumn fall-back sweeps the
+/// repeated hour's minutes a second time — but `fired` is keyed by timer and
+/// date, so a timer inside it still fires only once. In spring the skipped hour
+/// never occurs, and a timer set inside it does not fire that day; there is no
+/// instant at which it was due.
+///
+/// Both instants are truncated to the minute before being compared, and that is
+/// load-bearing rather than tidiness. Measuring the raw duration truncates
+/// towards zero, so two sweeps thirty seconds apart across a minute boundary —
+/// 07:00:30 to 07:01:00, which is exactly what a thirty-second tick produces —
+/// measure as zero minutes and the window comes back empty. The 07:01 firing
+/// would then be missed by the very mechanism meant to stop it being missed.
+fn elapsed_window(
+    from: chrono::DateTime<chrono::Local>,
+    to: chrono::DateTime<chrono::Local>,
+) -> Vec<String> {
+    let truncate =
+        |t: chrono::DateTime<chrono::Local>| t - chrono::Duration::seconds(i64::from(t.second()));
+    let (from, to) = (truncate(from), truncate(to));
+
+    let minutes = (to - from).num_minutes();
+    if minutes <= 0 {
+        return Vec::new();
+    }
+    let span = minutes.min(MAX_TIMER_CATCHUP_MINUTES);
+    (0..span)
+        .map(|back| {
+            (to - chrono::Duration::minutes(back))
+                .format("%H:%M")
+                .to_string()
+        })
+        .collect()
 }
 
 /// Returns true if `ip` already has a poll loop running.
@@ -991,10 +1159,18 @@ async fn maybe_spawn_keba_poll_loop(ip: IpAddr, pool: &SqlitePool, state: &Share
     });
 }
 
-fn ip_sort_key(ip: IpAddr) -> u32 {
+/// Orders addresses so the device list reads the way a person reads a subnet.
+///
+/// IPv4 sorts numerically and ahead of IPv6, which is what someone scanning a
+/// list of `172.16.x.y` expects. IPv6 sorts numerically among itself rather than
+/// collapsing to one value: the previous key mapped every v6 address to
+/// `u32::MAX`, so they all compared equal, and since the input arrives from a
+/// `HashSet` — whose iteration order is deliberately not stable — their relative
+/// order changed from run to run for no reason the user could see.
+fn ip_sort_key(ip: IpAddr) -> (u8, u128) {
     match ip {
-        IpAddr::V4(v4) => u32::from(v4),
-        IpAddr::V6(_) => u32::MAX,
+        IpAddr::V4(v4) => (0, u128::from(u32::from(v4))),
+        IpAddr::V6(v6) => (1, u128::from(v6)),
     }
 }
 
@@ -1077,5 +1253,152 @@ mod tests {
                 "192.168.1.101".parse().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn addresses_sort_numerically_with_ipv4_first() {
+        let mut ips: Vec<IpAddr> = [
+            "fe80::2",
+            "192.168.1.10",
+            "::1",
+            "192.168.1.2",
+            "fe80::1",
+            "10.0.0.1",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        ips.sort_by_key(|ip| ip_sort_key(*ip));
+
+        let as_text: Vec<String> = ips.iter().map(std::string::ToString::to_string).collect();
+        assert_eq!(
+            as_text,
+            vec![
+                "10.0.0.1",
+                "192.168.1.2",
+                "192.168.1.10",
+                "::1",
+                "fe80::1",
+                "fe80::2"
+            ],
+            "v4 numerically and first, then v6 numerically — not v4 lexically, \
+             and not every v6 address tied for last"
+        );
+    }
+
+    #[test]
+    fn ipv6_ordering_does_not_depend_on_the_order_it_was_discovered_in() {
+        // The regression: every v6 address used to map to the same key, so the
+        // stable sort preserved HashSet iteration order, which is not stable.
+        let ips: Vec<IpAddr> = ["fe80::3", "fe80::1", "fe80::2"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let sorted = |mut v: Vec<IpAddr>| {
+            v.sort_by_key(|ip| ip_sort_key(*ip));
+            v
+        };
+        let mut reversed = ips.clone();
+        reversed.reverse();
+        assert_eq!(sorted(ips), sorted(reversed));
+    }
+
+    // ── Timer sweep window ────────────────────────────────────────────────────
+
+    fn at(hhmm: &str) -> chrono::DateTime<chrono::Local> {
+        at_sec(hhmm, 0)
+    }
+
+    fn at_sec(hhmm: &str, second: u32) -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone;
+        let (h, m) = hhmm.split_once(':').unwrap();
+        chrono::Local
+            .with_ymd_and_hms(2026, 8, 23, h.parse().unwrap(), m.parse().unwrap(), second)
+            .earliest()
+            .unwrap()
+    }
+
+    #[test]
+    fn consecutive_ticks_across_a_minute_boundary_still_fire() {
+        // The case a raw duration gets wrong: thirty seconds apart is zero whole
+        // minutes, so measuring the gap rather than the minutes crossed returns
+        // an empty window and misses 07:01 entirely — which is the failure the
+        // window was introduced to prevent.
+        assert_eq!(
+            elapsed_window(at_sec("07:00", 30), at_sec("07:01", 0)),
+            vec!["07:01"]
+        );
+        // ...and two ticks inside one minute still fire nothing.
+        assert!(elapsed_window(at_sec("07:00", 0), at_sec("07:00", 30)).is_empty());
+    }
+
+    #[test]
+    fn every_minute_is_swept_exactly_once_over_a_run_of_ticks() {
+        // Walk a thirty-second tick across several minutes and check each minute
+        // is swept once and only once — no gaps, no repeats.
+        let mut swept_to = at_sec("06:59", 45);
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..10 {
+            let now = swept_to + chrono::Duration::seconds(TIMER_TICK_SECS as i64);
+            seen.extend(elapsed_window(swept_to, now));
+            swept_to = now;
+        }
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(seen.len(), unique.len(), "a minute fired twice: {seen:?}");
+        assert_eq!(
+            unique,
+            vec!["07:00", "07:01", "07:02", "07:03", "07:04"],
+            "every minute crossed must be swept: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_sweep_within_the_same_minute_fires_nothing() {
+        // Otherwise a 30-second tick would fire every timer twice.
+        assert!(elapsed_window(at("07:00"), at("07:00")).is_empty());
+    }
+
+    #[test]
+    fn a_normal_sweep_covers_the_minute_that_just_passed() {
+        assert_eq!(elapsed_window(at("06:59"), at("07:00")), vec!["07:00"]);
+    }
+
+    #[test]
+    fn a_tick_that_arrived_late_still_catches_the_minute_it_stepped_over() {
+        // The regression: matching on the current minute alone meant a tick that
+        // skipped 07:00 lost that firing for the whole day.
+        let window = elapsed_window(at("06:58"), at("07:03"));
+        assert!(window.contains(&"07:00".to_string()), "{window:?}");
+        assert_eq!(window.len(), 5, "07:03 back to 06:59 inclusive: {window:?}");
+    }
+
+    #[test]
+    fn a_long_absence_does_not_replay_the_whole_day() {
+        // Coming back after a suspend should not run every switch through the
+        // schedule it missed, all at once and out of order.
+        let window = elapsed_window(at("07:00"), at("19:00"));
+        assert_eq!(window.len(), MAX_TIMER_CATCHUP_MINUTES as usize);
+        assert!(window.contains(&"19:00".to_string()));
+        assert!(
+            !window.contains(&"07:00".to_string()),
+            "far past is not swept"
+        );
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_fires_nothing() {
+        assert!(elapsed_window(at("07:00"), at("06:00")).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_always_reaches_at_least_as_far_back_as_one_tick() {
+        // Whatever the tick interval, a timer due between two ticks has to land
+        // inside the window the later one sweeps.
+        let tick = chrono::Duration::seconds(TIMER_TICK_SECS as i64);
+        let now = at("07:00");
+        let window = elapsed_window(now - tick * 3, now);
+        assert!(window.contains(&"07:00".to_string()), "{window:?}");
     }
 }

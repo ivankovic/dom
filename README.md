@@ -1,8 +1,15 @@
 # Dom
 
-Smarthome app.
+Dom - Croatian word meaning "home".
 
-Robust. Efficient. Old school.
+A smarthome automation app.
+
+This is Personal Software. I built it for me. If anyone else benefits from it, great. As such
+this is open source software available under the anti-capitalist Software License v1.4.
+
+**There is no paid licence, and no way to buy an exemption.**
+
+If you do not meet the conditions of the licence, you have no licence to this software at all.
 
 # Usage
 
@@ -24,7 +31,7 @@ information available to make the correct choice, and the dark theme is used.
 
 ## Views
 
-There are five views:
+There are six views:
 
 - **Current** ('c'): the overview — energy gauges plus the state of your network infrastructure.
 - **Energy** ('e'): consumption, production, grid and battery in detail.
@@ -53,6 +60,7 @@ do not exist.
 | v | Environment view |
 | a | In Environment: set your location by address |
 | Left, Right | In Statistics: previous/next period |
+| k | In Network: accept a device's changed TLS certificate |
 | s | Rescan now (wakes the ping scan and discovery immediately) |
 | r | Rename the selected device |
 | Tab | Move between the device list and the detail panel |
@@ -81,18 +89,87 @@ The health of your network infrastructure: routers first, then 5G modems, then a
 are assigned from device labels where they say "router", "modem"/"5g" or "ap", and any remaining
 MikroTik devices fill whichever roles are still empty.
 
-Each device shows a status derived from its last five pings:
+If Dom is talking to any of them insecurely, a **Security** panel appears saying so. It is absent
+when everything is fine, rather than showing a permanent "all clear" that the eye learns to skip.
+See "Talking to your routers" below.
+
+Each device shows a status derived from its own poll — whether Dom can actually talk to it:
 
 | Status | Meaning |
 |--------|---------|
-| OK | All five pings answered, all under 50 ms |
-| SLOW | All answered, but at least one took 50 ms or more |
-| DEGRADED | At least one ping was lost |
-| LOST | No successful pings |
-| UNKNOWN | Ping scanning itself is broken (e.g. missing `CAP_NET_RAW`), so health is genuinely unknown rather than assumed fine |
+| OK | The last poll succeeded, promptly |
+| SLOW | It succeeded, but the device took 750 ms or more to answer |
+| DEGRADED | Polls are failing, but not yet given up on |
+| LOST | The device has stopped answering |
+| UNKNOWN | Nothing has polled it, so its health is genuinely unknown rather than assumed fine |
+
+This is measured on requests Dom was making anyway. There is no separate health check: an earlier
+version pinged routers and modems three times every ten seconds and access points three times every
+thirty, purely to fill in this column — about a packet a second, all day, to answer a question the
+poll loop was already answering. It was also the worse answer, since a device can return a ping
+while its API is unreachable or refusing credentials, and it is the API that Dom needs.
 
 Alongside is a log of recent status changes, kept across restarts, and a chart of the modem's
-Internet-facing traffic for today.
+Internet-facing traffic for today, in half-hour bars.
+
+### How often Dom touches the network
+
+| What | How often |
+|---|---|
+| ICMP sweep of the local subnets and ARP cache | at startup, again after 5 minutes, then every 4 hours |
+| Device discovery (fingerprinting) | every 5 minutes |
+| MikroTik REST poll (DHCP leases, firewall rules, traffic counters) | every 30 minutes |
+
+Everything the MikroTik poll fetches is slow-moving or coarse: leases that discovery reads out of
+memory whenever it happens to run, firewall rules that change when a person changes them, and
+cumulative byte counters where a longer interval costs resolution rather than accuracy. The traffic
+chart's bar width follows the poll interval, so each bar is exactly one poll.
+
+Discovery is deliberately *not* slowed with it. It is how every device is found, energy hardware
+included — a battery or wallbox that appears, or moves to a new address, only starts being polled
+once discovery notices.
+
+None of this affects measurement. The battery and switches are polled every two seconds and the
+wallbox every five, because what they report is a rate that has to be integrated: a missed sample is
+energy that cannot be recovered afterwards. A router reports state, which can be sampled whenever.
+
+Both the sweep and discovery run once at startup, and 's' forces both at any time, so these intervals
+only govern how long an *unattended* change takes to show up.
+
+### Talking to your routers
+
+Dom administers MikroTik devices over their REST API, which means presenting the router
+administrator password on every poll — six devices every ten seconds.
+
+It uses HTTPS where the device offers it, and **pins the certificate**: the first time Dom connects
+it records the certificate the device presented, and every connection after that must present the
+same one. A router has no certificate signed by a public authority — RouterOS generates its own, and
+it is reached by IP rather than by name — so there is nothing to check it against except what it
+showed last time.
+
+That is trust on first use. It is weaker than a public certificate authority, because a device
+already being impersonated the first time Dom connects would be trusted. It is much stronger than
+what it replaces. After that first connection nothing on the network can read or alter the traffic
+without the device's private key, and an attempt to substitute a certificate fails **before** the
+password is written to the socket.
+
+If a certificate changes, Dom cannot tell a reinstalled router from an impersonated one, so it does
+not guess: it stops polling that device, does not send its password, and says so in the Network view
+with both fingerprints. If you did reset or reinstall it, press 'k' to accept the new one — polling
+resumes on the next cycle.
+
+**RouterOS does not serve HTTPS out of the box.** Until you enable it, Dom falls back to plain HTTP
+and tells you it is doing so, naming the devices. To fix that, on each device:
+
+```
+/certificate add name=dom common-name=dom
+/certificate sign dom
+/ip service set www-ssl certificate=dom disabled=no
+```
+
+Dom picks this up by itself — it tries HTTPS on every poll and only falls back when nothing answers,
+so there is nothing to configure on this side. The failed attempt costs well under a millisecond on a
+local network.
 
 ## Devices view
 
@@ -101,9 +178,42 @@ the selected one. Press 'r' to give a device your own label, which takes precede
 learned from DHCP.
 
 For a myStrom switch the detail panel also allows toggling the relay, switching auto-mode between
-disabled and time-based, and adding or deleting scheduled timers. For a KEBA wallbox it allows
-switching the charging mode between disabled and full power — the new mode is only shown as fact once
-the wallbox confirms it.
+disabled and time-based, and adding or deleting scheduled timers.
+
+For a KEBA wallbox, Enter cycles the charging mode through four settings — the new mode is only shown
+as fact once the wallbox confirms it:
+
+| Mode | What the car draws |
+|---|---|
+| **Disabled** | Nothing. |
+| **Full power** | Whatever the wallbox's hardware limit allows, regardless of where it comes from. |
+| **Eco** | Only solar surplus, after the house battery has taken its share. The battery has priority. |
+| **Eco (car first)** | Only solar surplus, but the car claims it before the battery does. |
+
+The two Eco modes are a control loop, not a switch: every ten seconds Dom estimates how much solar
+power is genuinely spare and sets the car's charging current to match, so the car tracks the sun
+instead of pulling from the grid.
+
+Grid export cannot be used to measure "spare" directly — the battery absorbs surplus before any of it
+reaches the grid, so the export figure reads near zero whether there is surplus or not. Dom
+reconstructs it from production, house consumption and the battery's own power instead.
+
+Two things are held back deliberately. A 10% margin is kept in reserve, so an ordinary fluctuation — a
+cloud, a kettle — costs a little unclaimed export rather than tipping the car into buying from the
+grid. And once charging, Dom rides out a dip below the 6 A minimum rather than stopping the instant it
+is crossed, because a target hovering at that boundary would otherwise switch the charger on and off
+every ten seconds.
+
+**Eco mode needs to know your electrical supply.** It defaults to 230 V across three phases. If yours
+differs, set it before using Eco — the current Dom commands is scaled by this, so a single-phase site
+left on the default would be asked for three times what it should be:
+
+```bash
+sqlite3 db.sqlite "INSERT OR REPLACE INTO Config VALUES ('supply_volts','230'),('supply_phases','1');"
+```
+
+The change takes effect on the next ten-second cycle; there is no need to restart. A value that
+cannot describe a real supply is ignored in favour of the default rather than used.
 
 ## Statistics view
 
@@ -120,10 +230,39 @@ The top shows period totals — consumption, production, grid import, grid expor
 Both read as a dash rather than 0% when there is nothing to divide by, so a period with no data is
 never mistaken for a period where you bought everything from the grid.
 
+**Consumption is the house alone.** Energy going into the battery is not consumption — it shows up
+when it comes back out. And self-sufficiency counts imported energy against the period it reached the
+house in, not the period it was bought in: a winter night spent charging the battery from the grid is
+not self-sufficient, and neither is the next morning that runs on it. If the battery is charged from
+the grid at all, the totals panel says how much of the import went there rather than to the house.
+
 Below is one bar per day (per month, in the yearly window). Each bar's length is that period's
-consumption relative to the largest in view, split into the part covered by your own production and
-the part imported, so the self-sufficiency of each day is visible without reading the numbers. A day
-with no recorded data is marked as such rather than drawn as a zero.
+consumption relative to the largest in view, split into the part covered by your own generation and
+the part imported, so the self-sufficiency of each day is visible without reading the numbers:
+
+```
+      ┃━━━━┃ own generation   ┃━━━━┃ imported
+                                        consumed     produced     self
+  1   ┃━━━━━━━━━━━━━━━━━━━━━━━━━━━┃     30.0 kWh     40.0 kWh  100.0 %
+  2   ┃━━━━━━━━━━━━━┃┃━━━━━━━┃          24.0 kWh     18.0 kWh   62.5 %
+  3   ┃━━┃┃━━━━━━━━━━━━━━━━━━━━━━┃      28.0 kWh      4.0 kWh   10.7 %
+```
+
+The three figures after each bar are that period's **consumed** total, what it **produced**, and its
+**self**-sufficiency — the share of what it used that did not come from the grid, which is the same
+thing the green part of the bar shows.
+
+Each part is drawn with a mark at both ends rather than as a solid block, so where one stops and the
+next begins is unambiguous — the two ends meeting in the middle (`┃┃`) say plainly that the imported
+part is stacked on top of your own generation rather than measured from zero.
+
+Note that the bar is **consumption**, not production. A day that generated far more than it used
+looks the same as one that generated exactly what it used — both are entirely own-generation. The
+`prod` figure beside the bar is what tells them apart, and bar lengths are scaled against the largest
+consumption *or* production in view, so an export-heavy period leaves every bar short of the full
+width.
+
+A day with no recorded data is marked as such rather than drawn as a zero.
 
 The current period is partial: this month means the 1st to today, not the 1st to the 31st.
 
@@ -200,11 +339,25 @@ There are no packages currently available.
 Dom takes no command-line arguments. Running it starts the TUI.
 
 Device discovery, polling and storage all run as background tasks alongside the TUI, so simply
-leaving the app running is what collects data. There is no separate headless mode.
+leaving the app running is what collects data.
+
+**Headless works.** With no terminal to draw on — under systemd, over ssh without a TTY — Dom says so
+and keeps collecting, with the log as the only output. It stops on Ctrl-C or `SIGTERM`. Nothing about
+polling, integrating or rolling up needs a screen.
 
 State lives in `db.sqlite` in the working directory: discovered devices and their credentials,
 measurement history at several resolutions, and application settings such as the chosen theme (in
 the `Config` table).
+
+**Those credentials are stored in plain text**, because Dom has to present them to your devices
+unattended. The database is therefore created readable only by the user running Dom (mode `0600`,
+including its `-wal` and `-shm` files), and an existing one is tightened to match on every start.
+There is no encryption at rest: the key would have to live on the same machine, within reach of the
+same process, which moves the secret rather than protecting it.
+
+Diagnostics go to `dom.log` beside the database — not to the terminal, which the TUI owns for as long
+as it runs. It is rotated to `dom.log.1` at startup once it passes 5 MB, so a restart never destroys
+the log of what happened before it. `RUST_LOG=debug` raises the level.
 
 ### How long measurements are kept
 
@@ -230,9 +383,14 @@ up has not yet summarised — so a rollup problem can never turn into lost histo
 minute is recorded before the raw samples go, since that is the one figure a coarser tier cannot
 reconstruct.
 
-**Reclaiming the space is a manual step.** SQLite's `DELETE` returns pages to an internal free list
-rather than shrinking the file, so after the first prune the file will be no smaller (briefly
-larger). To actually reclaim it, stop Dom and run:
+**Space is reclaimed gradually, in the background.** SQLite's `DELETE` returns pages to an internal
+free list rather than shrinking the file, so a prune on its own makes the file no smaller. The hourly
+prune hands a bounded number of those pages back as it goes, which needs no lock and runs while Dom
+does.
+
+That only applies to databases Dom created. One made before this existed has the wrong file format
+recorded in it, and needs a one-off full `VACUUM` to convert — after which the background reclaim
+keeps it that way. `VACUUM` rewrites the whole file under an exclusive lock, so stop Dom and run:
 
 ```bash
 sqlite3 db.sqlite "PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"
@@ -243,24 +401,56 @@ rewrites the whole database under an exclusive lock, which is why Dom has to be 
 
 ## Online services
 
-Dom talks only to your own network, with two optional exceptions — both used solely by the
-Environment view, and neither contacted at all until you set a location:
+Dom talks only to your own network, with three optional exceptions — all used solely by the
+Environment view, and none contacted at all until you set a location:
 
 | Service | Used for | Data sent |
 |---|---|---|
 | [swisstopo SearchServer](https://api3.geo.admin.ch) | Turning an address into coordinates | The address you type, once, when you set it |
 | [MeteoSwiss Open Data](https://www.meteoswiss.admin.ch/services-and-publications/service/open-data.html) | Outdoor temperature | Nothing — it is a fixed nationwide file, fetched whole |
+| [Open-Meteo](https://open-meteo.com) | Solar irradiance forecast, for predicted production | Your coordinates, and the array's tilt and azimuth |
 
 Note the second column of the second row: the temperature file covers all of Switzerland, so Dom
 downloads the same document everyone else does and picks the nearest station locally. Your location is
 never sent to MeteoSwiss.
 
-Both are free federal services needing no account or API key. Weather data is MeteoSwiss Open
-Government Data — free of charge and reusable, including commercially, with the source attributed.
+The first two are free federal services needing no account or API key. Weather data is MeteoSwiss
+Open Government Data — free of charge and reusable, including commercially, with the source
+attributed.
+
+Open-Meteo needs no key either, and its data is CC BY 4.0 — the credit is shown in the Environment
+view. It is the one service whose terms bind **you** rather than just this program: the free tier is
+non-commercial, and explicitly names personal home automation as a permitted use. Running Dom in your
+own house is squarely within it. Selling Dom or running it as part of a business — which the licence
+below permits a worker-owned co-operative to do — would need an Open-Meteo API plan, or self-hosting
+their open-source server.
+
+It is used rather than MeteoSwiss's own forecast because of size, not preference: MeteoSwiss
+publishes point forecasts as open data, but as one file per parameter covering every location in the
+country — 32.5 MB an hour to read one house's numbers. The same request to Open-Meteo is about 7 KB,
+and it serves MeteoSwiss's own ICON-CH1 and ICON-CH2 models, so it is the same forecast.
 
 ## Platform Support
 
 Only Linux is supported. Support for macOS and Windows is a non-goal.
+
+### Small machines
+
+Dom is meant to sit on something cheap and always-on, and is written for that: a Raspberry Pi 2 —
+32-bit ARMv7, 900 MHz, 1 GB of RAM — is the machine the following were chosen against.
+
+- **Writes are batched.** Each poll commits once rather than once per measurement, and the database
+  runs `synchronous=NORMAL`, so commits do not flush the disk individually. On an SD card that is the
+  difference between a card that lasts and one that does not.
+- **The today-charts read the per-minute tier**, not the two-second series, which is an index range
+  scan rather than a full table scan — measured at 0.003 s against 0.498 s.
+- **Startup waits for a plausible clock.** A Pi has no battery-backed clock and boots at whatever was
+  last written to disk; measurements stamped in the past are rolled into the wrong day, or into one
+  already summarised and therefore never summarised again. Dom waits, briefly and boundedly, for the
+  clock to catch up with the newest thing it has already recorded.
+
+Cross-compile rather than building on the device: `ring` and `libsqlite3-sys` need a C toolchain, and
+the release profile's fat LTO will likely exhaust 1 GB of RAM on the Pi itself.
 
 # Contact
 
@@ -268,38 +458,28 @@ You can contact me at [marko@ivankovic.me](marko@ivankovic.me).
 
 # License
 
-Copyright (C) 2026 Marko Ivankovic
+Copyright © 2026 Marko Ivankovic
 
-Licensed under the [Prosperity Public License 3.0.0](https://prosperitylicense.com/versions/3.0.0).
+Licensed under the [Anti-Capitalist Software License v1.4](https://anticapitalist.software/).
 
-- **Noncommercial use is free.** Personal use, hobby projects, study, research and
-  experiment are all unrestricted. So is use by charities, educational institutions,
-  public research bodies, public safety and health organizations, environmental
-  protection organizations and government institutions — regardless of how they are
-  funded.
-- **Commercial use gets a thirty-day trial.** One trial per company, covering all
-  personnel, not one trial per person. Past that, you need a license.
-- **Contributions back don't count as commercial use.** Feedback, changes and additions
-  contributed back under a standard permissive license (Blue Oak, Apache-2.0, MIT,
-  BSD-2-Clause) are free to develop.
+This is anti-capitalist software, released for free use by individuals and organizations that do not
+operate by capitalist principles. **There is no paid licence, and no way to buy an exemption.** If you
+do not meet the conditions below, you have no licence to this software at all.
 
-See the [LICENSE](LICENSE) file for the full terms.
+You may use, modify, distribute and even sell copies of it, provided you are:
 
-Note that this is deliberately **not** an open source license: it does not meet the OSI
-definition, and it is not free software in the FSF sense. That is the intent.
+- an individual person, labouring for yourself; or
+- a non-profit organization; or
+- an educational institution; or
+- an organization that seeks shared profit for all of its members and lets non-members set the cost
+  of their labour.
 
-## Need a commercial license?
+And, if you are an organization:
 
-Commercial licensing is available, for individually negotiated compensation.
+- all owners are workers and all workers are owners, with equal equity and/or equal vote; and
+- you are not law enforcement or military, nor working for or under either.
 
-[Contact me](mailto:marko@ivankovic.me) for options.
-
-## Previously AGPL-3.0
-
-Up until August 2026, this project was published under AGPL-3.0 from a repository hosted
-on Codeberg. That grant is irrevocable for the versions it was made under — anyone who
-obtained the code under AGPL-3.0 keeps their AGPL-3.0 rights to those versions. The
-Prosperity license applies to this repository and everything going forward.
+See the [LICENSE](LICENSE) file for the exact terms, which are what actually govern.
 
 # For Developers, human or otherwise
 

@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::net::{IpAddr, SocketAddr};
@@ -39,6 +41,9 @@ const HTTP_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HttpProbe {
+    /// Address the request went to. Usually the device being fingerprinted, but
+    /// a redirect can move it — which is why the loop guard below compares it.
+    pub ip: IpAddr,
     pub port: u16,
     /// Path (and optional query string) that was requested, e.g. "/" or "/admin/login".
     pub url: String,
@@ -94,6 +99,7 @@ async fn probe_http(ip: IpAddr, port: u16, initial_path: &str, probes: &mut Vec<
         };
 
         probes.push(HttpProbe {
+            ip: cur_ip,
             port: cur_port,
             url: cur_path.clone(),
             raw,
@@ -104,11 +110,15 @@ async fn probe_http(ip: IpAddr, port: u16, initial_path: &str, probes: &mut Vec<
             break;
         };
 
+        // Cycle guard: stop when this exact request has already been made.
+        // The address is part of "exact" because `resolve_redirect` can change
+        // it — comparing only port and path treated a redirect to the same
+        // resource on a *different* host as a loop and refused to follow it.
         if probes
             .iter()
-            .any(|p| p.port == next_port && p.url == next_path)
+            .any(|p| p.ip == next_ip && p.port == next_port && p.url == next_path)
         {
-            break; // cycle guard
+            break;
         }
 
         cur_ip = next_ip;
@@ -344,5 +354,71 @@ mod tests {
         assert_eq!(resolve_redirect("https://172.16.20.9/a", IP, 80), None);
         assert_eq!(resolve_redirect("ftp://172.16.20.9/a", IP, 80), None);
         assert_eq!(resolve_redirect("", IP, 80), None);
+    }
+
+    // ── Redirect loop guard ───────────────────────────────────────────────────
+
+    fn probe(ip: &str, port: u16, url: &str) -> HttpProbe {
+        HttpProbe {
+            ip: ip.parse().unwrap(),
+            port,
+            url: url.to_string(),
+            raw: String::new(),
+        }
+    }
+
+    /// The guard as `probe_http` applies it: has this exact request been made?
+    fn already_probed(probes: &[HttpProbe], ip: IpAddr, port: u16, path: &str) -> bool {
+        probes
+            .iter()
+            .any(|p| p.ip == ip && p.port == port && p.url == path)
+    }
+
+    #[test]
+    fn a_redirect_back_to_something_already_fetched_is_a_loop() {
+        let probes = vec![
+            probe("172.16.20.5", 80, "/"),
+            probe("172.16.20.5", 80, "/login"),
+        ];
+        assert!(already_probed(
+            &probes,
+            "172.16.20.5".parse().unwrap(),
+            80,
+            "/"
+        ));
+    }
+
+    #[test]
+    fn the_same_path_on_a_different_host_is_not_a_loop() {
+        // The regression: the guard compared only port and path, so a device
+        // redirecting to the same resource on another host looked like a cycle
+        // and the real page was never fetched.
+        let probes = vec![probe("172.16.20.5", 80, "/")];
+        assert!(!already_probed(
+            &probes,
+            "172.16.20.9".parse().unwrap(),
+            80,
+            "/"
+        ));
+    }
+
+    #[test]
+    fn the_same_path_on_a_different_port_is_still_not_a_loop() {
+        let probes = vec![probe("172.16.20.5", 80, "/")];
+        assert!(!already_probed(
+            &probes,
+            "172.16.20.5".parse().unwrap(),
+            8080,
+            "/"
+        ));
+    }
+
+    #[test]
+    fn a_redirect_that_changes_host_is_resolved_to_that_host() {
+        // What makes the guard above need the address at all.
+        let original: IpAddr = "172.16.20.5".parse().unwrap();
+        let (ip, port, path) = resolve_redirect("http://172.16.20.9/setup", original, 80).unwrap();
+        assert_eq!(ip, "172.16.20.9".parse::<IpAddr>().unwrap());
+        assert_eq!((port, path.as_str()), (80, "/setup"));
     }
 }

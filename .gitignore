@@ -32,3 +32,7 @@ target
 # Added by cargo
 
 /target
+
+# Diagnostics, written beside the database. See src/logging.rs.
+dom.log
+dom.log.1

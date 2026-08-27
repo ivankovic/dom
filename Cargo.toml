@@ -2,8 +2,8 @@
 name = "dom"
 version = "0.1.0"
 edition = "2024"
-# Prosperity Public License 3.0.0 has no SPDX identifier, so point at the file
-# rather than the `license` field, which only accepts valid SPDX expressions.
+# The Anti-Capitalist Software License has no SPDX identifier, so point at the
+# file rather than the `license` field, which only accepts valid SPDX expressions.
 license-file = "LICENSE"
 
 [dependencies]
@@ -11,11 +11,10 @@ license-file = "LICENSE"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync", "net", "io-util", "signal"] }
 anyhow = "1"
 
-# Logging
+# Logging. Diagnostics go to a file, not the terminal — the TUI owns that,
+# for its whole life. See src/logging.rs.
 log = "0.4"
 env_logger = "0.11"
-ctrlc = "3.4"
-dirs = "5.0"
 
 # SQLite database
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "chrono"] }
@@ -46,12 +45,14 @@ futures = "0.3.32"
 # rather than the default aws-lc-rs provider so the build needs no cmake/nasm.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
+# Already in the tree as tokio-rustls's crypto provider; named directly for
+# SHA-256, which is how a router's certificate is pinned. See src/devices/tls.rs.
+ring = "0.17"
 
 [dev-dependencies]
-# Temporary file creation for tests
+# Real directories for the tests that exercise file creation and permissions,
+# named uniquely so concurrent runs of the suite cannot collide.
 tempfile = "3"
-# Snapshot testing
-insta = "1.39"
 
 [profile.dev]
 opt-level = 1

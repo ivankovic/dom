@@ -1,21 +1,23 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 use std::collections::{HashMap, HashSet};
@@ -88,7 +90,7 @@ pub struct EnergyChartData {
     pub grid_exported_kwh: f64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub enum ConnStatus {
     /// Waiting for first successful poll or recovering after failures.
     #[default]
@@ -112,86 +114,61 @@ pub struct OutdoorReading {
     pub measured_at: DateTime<Utc>,
 }
 
-/// Result of a single ping to a device.
-#[derive(Clone, Debug)]
-pub struct PingResult {
-    pub latency_ms: f64,
-    pub success: bool,
-}
-
-/// Ping history for a device - stores up to 5 most recent pings.
+/// Everything the Environment view says about solar production: what is expected,
+/// what actually happened, and how well the two have matched.
+///
+/// Assembled by `online::forecast::refresh` rather than during render, like the
+/// statistics and temperature history — the view stays a pure function of state.
+///
+/// Empty until a location is set. Predictions additionally need a calibration,
+/// so between the first location and the first fit the weather is known and the
+/// power is not; the two are separate `Option`s for exactly that reason.
 #[derive(Clone, Debug, Default)]
-pub struct PingHistory {
-    pub results: Vec<PingResult>,
+pub struct SolarOutlook {
+    /// The fitted array response, or `None` before the first calibration.
+    pub calibration: Option<crate::solar::Calibration>,
+    /// Expected production for the whole of today, kWh: what has already been
+    /// measured plus what is still forecast. Not a pure forecast, and
+    /// deliberately so — half of today is no longer a prediction.
+    pub today_kwh: Option<f64>,
+    /// Predicted production for tomorrow, kWh — the question this all answers.
+    pub tomorrow_kwh: Option<f64>,
+    /// What has actually been produced so far today, kWh.
+    pub today_actual_kwh: f64,
+    /// Tomorrow's predicted power in kW against hour of local day, for the chart.
+    pub tomorrow_curve: Vec<(f64, f64)>,
+    /// Mean cloud cover over tomorrow's daylight hours, percent. Shown because it
+    /// is what a person reads off a forecast; deliberately not part of the model,
+    /// which would otherwise count cloud twice — see `crate::solar`.
+    pub tomorrow_cloud_pct: Option<f64>,
+    /// Days that are over: (day, predicted kWh, actual kWh), oldest first.
+    pub recent: Vec<(chrono::NaiveDate, f64, f64)>,
+    /// How those days turned out, in aggregate.
+    pub accuracy: crate::solar::Accuracy,
+    /// Why the last forecast fetch failed, if it did.
+    pub last_error: Option<String>,
 }
 
-impl PingHistory {
-    pub fn new() -> Self {
-        Self {
-            results: Vec::new(),
-        }
-    }
-
-    pub fn add(&mut self, latency_ms: f64, success: bool) {
-        self.results.push(PingResult {
-            latency_ms,
-            success,
-        });
-        if self.results.len() > 5 {
-            self.results.remove(0);
-        }
-    }
-
-    /// Calculate device status based on the last 5 pings.
-    pub fn status(&self) -> NetworkDeviceStatus {
-        // If we have no successful pings, device is lost
-        if self.results.is_empty() {
-            return NetworkDeviceStatus::Lost;
-        }
-
-        // Check if any ping failed (packet loss)
-        let has_packet_loss = self.results.iter().any(|r| !r.success);
-
-        if has_packet_loss {
-            return NetworkDeviceStatus::Degraded;
-        }
-
-        // All pings were successful, check latencies
-        let all_fast = self.results.iter().all(|r| r.latency_ms < 50.0);
-
-        if all_fast && self.results.len() >= 5 {
-            return NetworkDeviceStatus::Ok;
-        }
-
-        // If we have successful pings but any are slow (> 50ms)
-        let any_slow = self.results.iter().any(|r| r.latency_ms >= 50.0);
-        if any_slow {
-            return NetworkDeviceStatus::Slow;
-        }
-
-        // Not enough pings yet, or mixed but none slow - consider OK if online
-        NetworkDeviceStatus::Ok
-    }
+/// A device presenting a TLS certificate other than the one pinned for it.
+///
+/// Dom cannot tell a router that was reset or reinstalled apart from something
+/// impersonating one, so it does not guess: the connection is refused, no
+/// credential is sent, and this is put in front of a person to decide.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CertAlert {
+    /// The fingerprint Dom trusts for this device.
+    pub expected: String,
+    /// The one it presented instead.
+    pub observed: String,
 }
 
-/// Configuration for per-device ping health checks.
-#[derive(Clone, Debug)]
-pub struct PingConfig {
-    /// How often to ping this device (seconds).
-    pub interval_secs: u64,
-    /// Number of ICMP packets to send per ping check.
-    pub packet_count: u8,
-}
-
-impl Default for PingConfig {
-    fn default() -> Self {
-        // Default: ping every 5 minutes with 1 packet (legacy behavior)
-        Self {
-            interval_secs: 300,
-            packet_count: 1,
-        }
-    }
-}
+/// How long a device may take to answer a poll before it is called slow, in
+/// milliseconds.
+///
+/// A REST round-trip is a heavier thing than an ICMP echo, so this is looser than
+/// the 50 ms the ping-based check used: it is measuring "the device is labouring",
+/// not network latency.
+pub const SLOW_POLL_MS: f64 = 750.0;
 
 /// Status for network infrastructure devices.
 #[derive(Clone, Debug, PartialEq)]
@@ -344,10 +321,10 @@ pub struct App {
     /// Human-readable cause of the most recent poll failure per device, shown
     /// in the UI while a device is Connecting or Lost. Cleared on success.
     pub last_error: HashMap<IpAddr, String>,
-    /// Ping history for each device (last 5 pings) for network infrastructure health status.
-    pub ping_history: HashMap<IpAddr, PingHistory>,
-    /// Per-device ping configuration (interval and packet count).
-    pub ping_configs: HashMap<IpAddr, PingConfig>,
+    /// How long each device's last successful poll took, in milliseconds. Fills
+    /// in the Network view's slow/ok distinction without any traffic of its own —
+    /// see `network_status`.
+    pub poll_latency_ms: HashMap<IpAddr, f64>,
     pub view: View,
     pub focus: Focus,
     pub selected: usize,
@@ -400,6 +377,26 @@ pub struct App {
     pub temperature_history: Vec<crate::db::DailyTemperature>,
     /// Highlighted row in the Environment view's sensor list.
     pub env_selected: usize,
+    /// Predicted solar production, and how past predictions turned out. Empty
+    /// until a location is set; see `SolarOutlook`.
+    pub solar: SolarOutlook,
+    /// Devices whose TLS certificate no longer matches the pinned one. While a
+    /// device is in here its credentials are not being sent at all — see
+    /// `devices::tls`. Cleared when the connection succeeds again, which
+    /// accepting the new certificate causes.
+    pub cert_alerts: HashMap<IpAddr, CertAlert>,
+    /// Devices Dom is talking to over plain HTTP because they are not serving
+    /// HTTPS. Their credentials cross the network readable by anything that can
+    /// see the traffic, which is worth saying out loud rather than leaving as
+    /// the silent default it used to be.
+    pub cleartext_devices: HashSet<IpAddr>,
+    /// Why the last energy rollup pass failed, if it did.
+    ///
+    /// Surfaced rather than only logged because of what it costs: a failing
+    /// rollup also stops pruning, and the measurement series resumes growing by
+    /// about a gigabyte a month. That is not something to discover from a file
+    /// weeks later — see `crate::logging`.
+    pub rollup_error: Option<String>,
     /// Which colour palette to draw with. Auto-detected from the terminal at
     /// startup unless the user has stored an explicit choice, and toggled with
     /// 't' — see `tui::theme`. Stored as the mode rather than a built `Theme`
@@ -437,8 +434,7 @@ impl App {
         self.keba_readings.remove(ip);
         self.keba_modes.remove(ip);
         self.polled_ips.remove(ip);
-        self.ping_history.remove(ip);
-        self.ping_configs.remove(ip);
+        self.poll_latency_ms.remove(ip);
         self.device_energy_today.remove(ip);
         self.switch_auto_modes.remove(ip);
         self.switch_timers.remove(ip);
@@ -454,15 +450,30 @@ impl App {
     /// fallback is only used when scanning is healthy but just hasn't
     /// reached this particular device yet (e.g. right after startup, or a
     /// device outside the ping-scanned subnets).
+    /// How an infrastructure device is doing, as its own poll loop sees it.
+    ///
+    /// Derived from whether Dom can actually talk to the device, not from ICMP.
+    /// There used to be a task pinging routers and modems three times every ten
+    /// seconds and access points three times every thirty, purely to fill this
+    /// in — a packet a second, all day, to answer a question the poll loop was
+    /// already answering for free every time it fetched anything.
+    ///
+    /// It is also a better answer. A device can return a ping while its API is
+    /// unreachable or refusing credentials, and it is the API that Dom needs.
+    ///
+    /// `Slow` reflects how long the device took to answer its last poll, which
+    /// is measured on a request that was going to happen regardless.
     pub fn network_status(&self, ip: IpAddr) -> NetworkDeviceStatus {
-        match self.ping_history.get(&ip) {
-            Some(h) => h.status(),
-            None if self.last_scan_error.is_some() => NetworkDeviceStatus::Unknown,
-            None => match self.conn_status.get(&ip) {
-                Some(ConnStatus::Online) => NetworkDeviceStatus::Ok,
-                Some(ConnStatus::Lost) => NetworkDeviceStatus::Lost,
+        match self.conn_status.get(&ip) {
+            Some(ConnStatus::Lost) => NetworkDeviceStatus::Lost,
+            Some(ConnStatus::Connecting) => NetworkDeviceStatus::Degraded,
+            Some(ConnStatus::Online) => match self.poll_latency_ms.get(&ip) {
+                Some(ms) if *ms >= SLOW_POLL_MS => NetworkDeviceStatus::Slow,
                 _ => NetworkDeviceStatus::Ok,
             },
+            // Nothing has polled it: a device Dom recognises but does not know
+            // how to talk to, or one whose loop has not run yet.
+            None => NetworkDeviceStatus::Unknown,
         }
     }
 
@@ -474,41 +485,6 @@ impl App {
 
     pub fn selected_device(&self) -> Option<&ScannedDevice> {
         self.visible_devices().get(self.selected).copied()
-    }
-
-    /// Get the ping configuration for a device based on its label/role.
-    /// Router and 5G modem: 3 packets every 10 seconds.
-    /// Access points: 3 packets every 30 seconds.
-    /// All other devices: default (300 seconds, 1 packet).
-    pub fn get_ping_config(&self, device: &ScannedDevice) -> PingConfig {
-        if let Some(label) = &device.label {
-            let label_lower = label.to_lowercase();
-            // Router and 5G modem get high-frequency pings
-            if label_lower.contains("router")
-                || label_lower.contains("modem")
-                || label_lower.contains("5g")
-            {
-                return PingConfig {
-                    interval_secs: 10,
-                    packet_count: 3,
-                };
-            }
-            // Access points get medium-frequency pings
-            if label_lower.contains("ap") || label_lower.contains("access point") {
-                return PingConfig {
-                    interval_secs: 30,
-                    packet_count: 3,
-                };
-            }
-        }
-        // Default for all other devices (including MikroTik devices without explicit labels)
-        // Check if this is a MikroTik device that should be classified
-        if device.name == Some(crate::devices::mikrotik::NAME) {
-            // For unlabeled MikroTik devices, we'll use the classification logic
-            // But we can't do that here without the full device list, so return default
-            // and let the caller handle it
-        }
-        PingConfig::default()
     }
 }
 
@@ -674,49 +650,67 @@ mod tests {
     // ── App::network_status ─────────────────────────────────────────────────
 
     #[test]
-    fn network_status_is_unknown_when_scan_broken_and_never_ping_scanned() {
-        // No ping_history entry for this IP, and the ping scan is currently
-        // failing (e.g. missing CAP_NET_RAW): must not silently report OK
-        // just because app-level (HTTP/TCP) polling happens to be healthy.
+    fn a_device_nothing_has_polled_yet_is_unknown_rather_than_ok() {
+        // Reporting OK for a device Dom has never spoken to would be a guess
+        // dressed as a measurement.
         let ip: IpAddr = "192.168.1.1".parse::<Ipv4Addr>().unwrap().into();
-        let mut app = App {
-            last_scan_error: Some("permission denied".to_string()),
-            ..Default::default()
-        };
-        app.conn_status.insert(ip, ConnStatus::Online);
-
-        assert_eq!(app.network_status(ip), NetworkDeviceStatus::Unknown);
+        assert_eq!(
+            App::default().network_status(ip),
+            NetworkDeviceStatus::Unknown
+        );
     }
 
     #[test]
-    fn network_status_falls_back_to_conn_status_when_scan_is_healthy() {
-        // No ping_history entry yet, but the ping scan itself isn't broken —
-        // e.g. right after startup, or a device outside the scanned subnets.
-        // Falling back to app-level connectivity is still reasonable here.
+    fn status_follows_whether_the_poll_loop_can_reach_the_device() {
+        // Derived from the poll loop rather than from ICMP: a device can answer
+        // a ping while its API is unreachable, and it is the API Dom needs.
+        let ip: IpAddr = "192.168.1.1".parse::<Ipv4Addr>().unwrap().into();
+        for (conn, expected) in [
+            (ConnStatus::Online, NetworkDeviceStatus::Ok),
+            (ConnStatus::Connecting, NetworkDeviceStatus::Degraded),
+            (ConnStatus::Lost, NetworkDeviceStatus::Lost),
+        ] {
+            let mut app = App::default();
+            app.conn_status.insert(ip, conn.clone());
+            assert_eq!(app.network_status(ip), expected, "{conn:?}");
+        }
+    }
+
+    #[test]
+    fn a_device_that_answers_slowly_is_reported_slow() {
         let ip: IpAddr = "192.168.1.1".parse::<Ipv4Addr>().unwrap().into();
         let mut app = App::default();
         app.conn_status.insert(ip, ConnStatus::Online);
 
+        app.poll_latency_ms.insert(ip, SLOW_POLL_MS - 1.0);
         assert_eq!(app.network_status(ip), NetworkDeviceStatus::Ok);
+
+        app.poll_latency_ms.insert(ip, SLOW_POLL_MS);
+        assert_eq!(app.network_status(ip), NetworkDeviceStatus::Slow);
     }
 
     #[test]
-    fn network_status_prefers_ping_history_even_when_scan_broken() {
-        // A stale ping_history entry from before the scan broke must still
-        // win over the Unknown fallback — it's real (if aging) ping data.
+    fn a_slow_reading_never_outranks_being_unreachable() {
+        // Latency is only meaningful for a device that answered; a stale figure
+        // must not soften "Dom cannot talk to this at all".
+        let ip: IpAddr = "192.168.1.1".parse::<Ipv4Addr>().unwrap().into();
+        let mut app = App::default();
+        app.poll_latency_ms.insert(ip, 10.0);
+        app.conn_status.insert(ip, ConnStatus::Lost);
+        assert_eq!(app.network_status(ip), NetworkDeviceStatus::Lost);
+    }
+
+    #[test]
+    fn a_broken_ping_scan_no_longer_affects_infrastructure_status() {
+        // It used to force Unknown, because status came from ICMP and a scan
+        // that could not run meant no data. Status now comes from the poll loop,
+        // which does not need CAP_NET_RAW.
         let ip: IpAddr = "192.168.1.1".parse::<Ipv4Addr>().unwrap().into();
         let mut app = App {
             last_scan_error: Some("permission denied".to_string()),
             ..Default::default()
         };
-        let mut history = PingHistory::new();
-        history.add(5.0, true);
-        history.add(5.0, true);
-        history.add(5.0, true);
-        history.add(5.0, true);
-        history.add(5.0, true);
-        app.ping_history.insert(ip, history);
-
+        app.conn_status.insert(ip, ConnStatus::Online);
         assert_eq!(app.network_status(ip), NetworkDeviceStatus::Ok);
     }
 }

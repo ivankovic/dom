@@ -1,24 +1,47 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 mod common;
+
+/// A REST session against the mock server.
+///
+/// Nothing is listening on 443, so every one of these exercises the real
+/// behaviour: TLS is tried, found unavailable, and the request falls back to
+/// plain HTTP — which is what happens against a RouterOS device that has not had
+/// `www-ssl` enabled.
+fn session<'a>(
+    ip: std::net::IpAddr,
+    port: u16,
+    username: &'a str,
+    password: &'a str,
+) -> dom::devices::mikrotik::Session<'a> {
+    dom::devices::mikrotik::Session {
+        ip,
+        port,
+        username,
+        password,
+        pin: None,
+    }
+}
 
 use std::net::IpAddr;
 
@@ -38,10 +61,12 @@ const FIREWALL_JSON: &str = r#"[
 const WEBFIG_ROOT: &str = r#"<!doctype html><title>RouterOS</title><div class="credits"><a href="https://mikrotik.com/">© MikroTik</a></div>"#;
 
 fn fp_with_root_body(ip: &str, open_ports: Vec<u16>, body: &str) -> Fingerprint {
+    let ip: std::net::IpAddr = ip.parse().unwrap();
     Fingerprint {
-        ip: ip.parse().unwrap(),
+        ip,
         open_ports,
         http: vec![HttpProbe {
+            ip,
             port: 80,
             url: "/".to_string(),
             raw: format!("HTTP/1.1 200 OK\r\n\r\n{body}"),
@@ -76,9 +101,15 @@ async fn fetch_dhcp_leases_parses_valid_response() {
     let server = common::MockHttp::start(200, LEASES_JSON).await;
     let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
-    let leases = mikrotik::fetch_dhcp_leases(ip, server.port, "admin", "pass")
+    let (leases, transport) = session(ip, server.port, "admin", "pass")
+        .dhcp_leases()
         .await
         .unwrap();
+    assert_eq!(
+        transport,
+        dom::devices::mikrotik::Transport::Cleartext,
+        "nothing is serving TLS here, so the request must have fallen back"
+    );
 
     assert_eq!(leases.len(), 2);
     assert_eq!(leases[0].address, "192.168.1.50");
@@ -93,7 +124,9 @@ async fn fetch_dhcp_leases_errors_on_invalid_json() {
     let server = common::MockHttp::start(200, "not json at all").await;
     let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
-    let result = mikrotik::fetch_dhcp_leases(ip, server.port, "admin", "pass").await;
+    let result = session(ip, server.port, "admin", "pass")
+        .dhcp_leases()
+        .await;
 
     assert!(result.is_err());
 }
@@ -103,7 +136,9 @@ async fn fetch_dhcp_leases_reports_http_status_on_unauthorized() {
     let server = common::MockHttp::start(401, r#"{"error":401,"message":"Unauthorized"}"#).await;
     let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
-    let result = mikrotik::fetch_dhcp_leases(ip, server.port, "admin", "wrong").await;
+    let result = session(ip, server.port, "admin", "wrong")
+        .dhcp_leases()
+        .await;
 
     let err = result.unwrap_err().to_string();
     assert!(
@@ -121,7 +156,8 @@ async fn fetch_firewall_rules_accepts_string_and_numeric_counters() {
     let server = common::MockHttp::start(200, FIREWALL_JSON).await;
     let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
-    let rules = mikrotik::fetch_firewall_rules(ip, server.port, "admin", "pass")
+    let rules = session(ip, server.port, "admin", "pass")
+        .firewall_rules()
         .await
         .unwrap();
 
@@ -140,7 +176,8 @@ async fn fetch_sends_basic_auth_header() {
     let server = common::MockHttp::start(200, "[]").await;
     let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
-    mikrotik::fetch_dhcp_leases(ip, server.port, "admin", "pass")
+    session(ip, server.port, "admin", "pass")
+        .dhcp_leases()
         .await
         .unwrap();
 
@@ -230,8 +267,47 @@ async fn fetch_then_db_end_to_end() {
     let devices = mikrotik::load_all(&pool).await.unwrap();
     assert_eq!(devices.len(), 1);
 
-    let leases = mikrotik::fetch_dhcp_leases(ip, server.port, "admin", "pass")
+    let (leases, transport) = session(ip, server.port, "admin", "pass")
+        .dhcp_leases()
         .await
         .unwrap();
+    assert_eq!(
+        transport,
+        dom::devices::mikrotik::Transport::Cleartext,
+        "nothing is serving TLS here, so the request must have fallen back"
+    );
     assert_eq!(leases.len(), 2);
+}
+
+#[tokio::test]
+async fn a_devices_certificate_pin_round_trips() {
+    let pool = common::db().await;
+    let ip: std::net::IpAddr = "172.16.0.1".parse().unwrap();
+    register_device(&pool, ip).await;
+
+    // Nothing pinned until the first successful TLS connection.
+    assert_eq!(dom::db::get_tls_pin(&pool, ip).await.unwrap(), None);
+
+    let first = dom::devices::tls::fingerprint(b"the router's certificate");
+    dom::db::set_tls_pin(&pool, ip, &first).await.unwrap();
+    assert_eq!(
+        dom::db::get_tls_pin(&pool, ip).await.unwrap(),
+        Some(first.clone())
+    );
+
+    // Accepting a new certificate replaces it rather than adding one.
+    let second = dom::devices::tls::fingerprint(b"a reinstalled router");
+    dom::db::set_tls_pin(&pool, ip, &second).await.unwrap();
+    assert_eq!(dom::db::get_tls_pin(&pool, ip).await.unwrap(), Some(second));
+
+    // An address Dom has never seen has no pin, rather than inheriting one.
+    let other: std::net::IpAddr = "172.16.0.99".parse().unwrap();
+    assert_eq!(dom::db::get_tls_pin(&pool, other).await.unwrap(), None);
+}
+
+/// Registers a MikroTik row without needing its credentials.
+async fn register_device(pool: &sqlx::SqlitePool, ip: std::net::IpAddr) {
+    dom::db::upsert_device(pool, "mikrotik", "MikroTik RouterOS", ip, 10, None)
+        .await
+        .unwrap();
 }

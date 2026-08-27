@@ -1,22 +1,26 @@
 /*  This file is part of the Dom smarthome app.
  *
- *  Copyright (C) 2026 Marko Ivankovic
+ *  Copyright © 2026 Marko Ivankovic
  *
- *  Licensed under the Prosperity Public License 3.0.0: free to use and share
- *  for noncommercial purposes, and free to try for commercial purposes for
- *  thirty days. Continued commercial use requires a license negotiated with
- *  the contributor.
+ *  This is anti-capitalist software, released for free use by individuals and
+ *  organizations that do not operate by capitalist principles. Use is permitted
+ *  by individuals working for themselves, non-profits, educational institutions,
+ *  and organizations whose owners are all workers with equal equity and vote —
+ *  and is not permitted to law enforcement or the military.
  *
- *  Contributor: Marko Ivankovic <marko@ivankovic.me>
+ *  Licensed under the Anti-Capitalist Software License v1.4. See the LICENSE
+ *  file for the full terms and conditions, which you must satisfy to have any
+ *  licence at all.
+ *
  *  Source Code: https://github.com/ivankovic/dom
  *
- *  See the LICENSE file for the full terms.
- *
- *  As far as the law allows, this software comes as is, without any warranty
- *  or condition, and the contributor won't be liable to anyone for any
- *  damages related to this software or this license, under any kind of legal
- *  claim.
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY
+ *  KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ *  OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+
+mod common;
 
 use dom::devices::dom_local;
 
@@ -67,4 +71,79 @@ async fn test_is_local_ip_function() {
     // Test that a known non-local IP is not considered local
     let non_local: std::net::IpAddr = "8.8.8.8".parse().unwrap();
     assert!(!dom_local::is_local_ip(non_local));
+}
+
+#[tokio::test]
+async fn addresses_this_machine_no_longer_has_are_dropped() {
+    // A `dom_local` row left behind after an address moves — or after the
+    // definition of "this machine" is narrowed, which is what excluded the Docker
+    // and libvirt bridges — shows in the Devices view as another copy of the
+    // machine Dom runs on.
+    let pool = common::db().await;
+    let lan: std::net::IpAddr = "172.16.0.3".parse().unwrap();
+    let docker: std::net::IpAddr = "172.17.0.1".parse().unwrap();
+    let bridge: std::net::IpAddr = "192.168.0.1".parse().unwrap();
+
+    for ip in [lan, docker, bridge] {
+        dom::devices::dom_local::save_device(&pool, ip)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        dom::devices::dom_local::load_all(&pool)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let removed = dom::devices::dom_local::forget_stale_addresses(&pool, &[lan])
+        .await
+        .unwrap();
+
+    assert_eq!(removed, 2);
+    let left: Vec<std::net::IpAddr> = dom::devices::dom_local::load_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.ip)
+        .collect();
+    assert_eq!(left, vec![lan]);
+}
+
+#[tokio::test]
+async fn a_local_row_that_holds_measurements_is_kept() {
+    // Nothing polls the local machine today, so this cannot happen yet — which is
+    // exactly why it is worth pinning before something starts to.
+    let pool = common::db().await;
+    let ip: std::net::IpAddr = "172.16.0.3".parse().unwrap();
+    dom::devices::dom_local::save_device(&pool, ip)
+        .await
+        .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM Devices WHERE ip = ?")
+        .bind(ip.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO RawDeviceMeasurements (device_id, timestamp, metric, value)
+         VALUES (?, '2026-08-01 12:00:00', 'temperature', 40.0)",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let removed = dom::devices::dom_local::forget_stale_addresses(&pool, &[])
+        .await
+        .unwrap();
+
+    assert_eq!(removed, 0, "history must not be deleted along with the row");
+    assert_eq!(
+        dom::devices::dom_local::load_all(&pool)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }

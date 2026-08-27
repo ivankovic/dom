@@ -1,19 +1,62 @@
 # Pending
 
-Remaining findings from the repository-wide code health pass (2026-08-17). The other
-findings from that pass have since been fixed; see SPECS.md for the decisions taken.
+Findings from the repository-wide code health passes. The other findings from those passes
+have since been fixed; see SPECS.md for the decisions taken.
 
-## `src/tui/mod.rs` has no test module
+# From the pass of 2026-08-23
 
-README.md asks every file in `src/` to end with its own test module. `src/tui/mod.rs`
-(the terminal event loop) has none, and it is the one remaining file where that is a
-real gap rather than a formality — `src/lib.rs` is only `pub mod` declarations.
+Eighteen of the findings from this pass were fixed on 2026-08-23 and removed from below;
+see SPECS.md, "Code health pass" for the decisions. What remains is what needed a
+judgement call or a larger change.
 
-The loop mutates `App` in response to `crossterm` events, so testing it needs a way to
-feed synthetic events without a terminal. That is a test-harness change rather than a
-unit test, which is why it was not done as part of a health pass. Everything the loop
-*decides* is currently untested: which key maps to which view, that Escape cancels
-rather than commits a rename, that the theme toggle persists.
+Every file in `src/` was read for this pass. It was preceded by a lint sweep — `clippy`
+with `pedantic` and `nursery`, plus `await_holding_lock` and `significant_drop_tightening`
+specifically — which found nothing: no lock is held across an `await`, and the numeric
+casts in the render and chart code are all clamped or saturating. Everything below came
+from reading.
+
+## The older half of `src/` has no module documentation
+
+`solar.rs`, `stats.rs`, `theme.rs` and all of `online/` open with a `//!` block explaining
+what the module is for and which decisions are load-bearing — they are the most readable
+files in the project, and that is why.
+
+`db.rs`, `app.rs`, `main.rs`, `fingerprint.rs`, `tui/mod.rs`, `tui/render.rs` and all five
+device modules have none: not a reduced one, zero `//!` lines. `db.rs` is 3,482 lines and
+`render.rs` 2,849, and both open directly on `use` statements. The per-item documentation
+inside them is genuinely good, which makes the missing orientation more noticeable rather
+than less — there is nothing that says what the file as a whole is responsible for.
+
+## `main` spawns two tasks inline and the rest as named functions
+
+Nine background tasks are spawned from `main`. Seven are named `async fn`s with doc
+comments explaining their schedule; two — the hourly prune of `RawDeviceMeasurements` and
+network status events, and the 60-second chart refresh — are anonymous `async move` blocks
+inline in `main`, inside bare `{ }` scopes that exist only to shadow `pool` and `state`.
+
+Separately, and cutting across that split rather than along it: seven of the nine drive
+their loop with `interval` and `MissedTickBehavior::Skip`, while two — the inline chart
+refresh and the named `statistics_task` — end with a bare `sleep`, so their period drifts
+by however long the work above them took. That is defensible for `statistics_task`, whose
+pass is deliberately throttled and of variable length, but it is not stated anywhere, and
+nothing at the call site distinguishes any of the nine from the others.
+
+
+# From the pass of 2026-08-17
+
+## `src/tui/mod.rs`'s event dispatch is still untested
+
+Partly addressed on 2026-08-23: the file now has a test module, and the six pure helpers
+it had all along — the detail-panel slot model, KEBA mode cycling, `is_valid_hhmm`, the
+energy device list, the view predicate, and the input bound — are covered by eleven tests.
+That was the cheap half, and it was cheap only because nothing had ever opened the file to
+look.
+
+What remains is the part the original finding was really about: `event_loop` itself decides
+which key maps to which view, that Escape cancels rather than commits a rename, and that
+the theme toggle persists — and none of it is exercised. It mutates `App` in response to
+`crossterm` events, so testing it needs a way to feed synthetic events without a terminal.
+That is a harness change rather than a unit test.
 
 ## The today-queries still read the 2-second tier
 
