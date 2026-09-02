@@ -326,6 +326,30 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Which cluster node held the `Active` role during which wall-clock interval — see
+    // SPECS.md, "High availability: a two-node active/standby cluster". `ended_at IS NULL`
+    // means the epoch is still open. This is the mechanism a future reconciliation reads
+    // through to decide whose measurements are canonical for a given range; it does not hold
+    // any measurements itself, the same relationship `RollupProgress` above has to `EnergyDaily`.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS LeadershipEpochs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id     TEXT NOT NULL,
+            started_at  TEXT NOT NULL,
+            ended_at    TEXT
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    // "Find the currently-open epoch" is the hot query (every role transition runs it); a
+    // partial index keeps it to the one row that matters rather than scanning the whole table.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_leadershipepochs_open
+         ON LeadershipEpochs (ended_at) WHERE ended_at IS NULL",
+    )
+    .execute(&pool)
+    .await?;
+
     // Outdoor temperature readings from the nearest MeteoSwiss station.
     //
     // The station's own measurement time is the primary key, so re-fetching a
@@ -481,6 +505,173 @@ pub async fn set_config(pool: &SqlitePool, key: &str, value: &str) -> anyhow::Re
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ── Cluster: node identity and the leadership log ─────────────────────────────
+//
+// See SPECS.md, "High availability: a two-node active/standby cluster", and `crate::cluster`
+// for the decision logic these support.
+
+const CLUSTER_NODE_ID_KEY: &str = "cluster_node_id";
+
+/// This installation's stable identity, generated once and persisted thereafter.
+///
+/// Every `LeadershipEpochs` row, and every future replication message, is stamped with this —
+/// it has to survive reboots and IP changes, which is why it lives in `Config` rather than being
+/// derived from anything about the network. A plain random hex string is enough: it only ever
+/// has to be distinct from one specific peer's own id, not globally unique, so this reaches for
+/// `rand` (already a dependency — `devices::ping_once` is another user of it) rather than a UUID
+/// crate.
+pub async fn get_or_create_cluster_node_id(pool: &SqlitePool) -> anyhow::Result<String> {
+    if let Some(id) = get_config(pool, CLUSTER_NODE_ID_KEY).await? {
+        return Ok(id);
+    }
+    let id: String = (0..8)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect();
+    set_config(pool, CLUSTER_NODE_ID_KEY, &id).await?;
+    Ok(id)
+}
+
+const CLUSTER_KEYPAIR_KEY: &str = "cluster_keypair_pkcs8";
+
+/// This installation's persistent Ed25519 identity, generated once and reloaded thereafter —
+/// what every `cluster::HeartbeatReply` is signed with, and what a peer pins to recognize this
+/// node again. Distinct from `get_or_create_cluster_node_id`: `node_id` is just a label, easy to
+/// spoof; this keypair is what makes a heartbeat reply worth trusting once pinned (see
+/// `cluster::verify_reply`). Stored as the PKCS8 document `ring` produces, hex-encoded — the same
+/// unencrypted-at-rest trust level as every other secret this app already stores in `Config`
+/// (`SUPPLY_KEYS`) or `Devices` (API keys, TLS pins), not a new, weaker link.
+pub async fn get_or_create_cluster_keypair(
+    pool: &SqlitePool,
+) -> anyhow::Result<ring::signature::Ed25519KeyPair> {
+    if let Some(hex) = get_config(pool, CLUSTER_KEYPAIR_KEY).await? {
+        let pkcs8 = crate::cluster::from_hex(&hex)
+            .ok_or_else(|| anyhow::anyhow!("stored keypair is not valid hex"))?;
+        return ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .map_err(|e| anyhow::anyhow!("stored keypair is invalid: {e}"));
+    }
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|_| anyhow::anyhow!("could not generate a cluster keypair"))?;
+    set_config(
+        pool,
+        CLUSTER_KEYPAIR_KEY,
+        &crate::cluster::to_hex(pkcs8.as_ref()),
+    )
+    .await?;
+    ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+        .map_err(|e| anyhow::anyhow!("just-generated keypair is invalid: {e}"))
+}
+
+/// Records that `node_id` became `Active` at `at`, closing whatever epoch was previously open.
+///
+/// Closing-then-opening in one call rather than two separate operations means a role transition
+/// is always exactly one call, and a previous crash that left an epoch open (no matching "closed"
+/// ever written) self-heals on the very next transition rather than needing its own recovery
+/// path — there should only ever be one open epoch, but nothing here assumes that stayed true.
+pub async fn open_leadership_epoch(
+    pool: &SqlitePool,
+    node_id: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<()> {
+    let t = crate::devices::ts(at);
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE LeadershipEpochs SET ended_at = ? WHERE ended_at IS NULL")
+        .bind(&t)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO LeadershipEpochs (node_id, started_at, ended_at) VALUES (?, ?, NULL)")
+        .bind(node_id)
+        .bind(&t)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Which node held the `Active` role at `at`, or `None` if `at` falls outside every recorded
+/// epoch (before the cluster's first election, or a gap left by a crash that lost its close).
+///
+/// Not read by anything yet — there is no replicated data to reconcile until a peer connection
+/// exists — but this is the primitive a future reconciliation query reads through: never blend
+/// two nodes' measurements for the same range, always take that range's data from whichever node
+/// this returns. See SPECS.md for why blending is the one thing this design rules out.
+pub async fn query_leadership_epoch_at(
+    pool: &SqlitePool,
+    at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Option<String>> {
+    let t = crate::devices::ts(at);
+    Ok(sqlx::query_scalar(
+        "SELECT node_id FROM LeadershipEpochs
+         WHERE started_at <= ? AND (ended_at IS NULL OR ended_at > ?)
+         ORDER BY started_at DESC
+         LIMIT 1",
+    )
+    .bind(&t)
+    .bind(&t)
+    .fetch_optional(pool)
+    .await?)
+}
+
+const CLUSTER_PEER_ADDR_KEY: &str = "cluster_peer_addr";
+const CLUSTER_IS_PRIMARY_KEY: &str = "cluster_is_primary";
+
+/// The paired peer's heartbeat address (`host:port`), or `None` if this node has no peer
+/// configured — that absence is what keeps every existing single-node install in solo mode.
+///
+/// Checks the `DOM_CLUSTER_PEER_ADDR` environment variable first, falling back to `Config`. Set
+/// automatically by `main::cluster_discovery_task` once a human confirms a discovered peer (see
+/// `set_cluster_peer_pubkey`) — manual `Config`/env-var setting remains a fallback for a peer
+/// discovery can't reach (a different subnet, say), the same manually-set, no-UI pattern
+/// `SUPPLY_KEYS` already uses.
+pub async fn cluster_peer_addr(pool: &SqlitePool) -> anyhow::Result<Option<String>> {
+    if let Ok(addr) = std::env::var("DOM_CLUSTER_PEER_ADDR") {
+        return Ok(Some(addr));
+    }
+    get_config(pool, CLUSTER_PEER_ADDR_KEY).await
+}
+
+/// Sets the paired peer's address — called on first pairing and whenever
+/// `main::cluster_discovery_task` finds the pinned peer key at a new IP. Writing here never
+/// touches `DOM_CLUSTER_PEER_ADDR`, which stays a separate, standing override for the harness.
+pub async fn set_cluster_peer_addr(pool: &SqlitePool, addr: &str) -> anyhow::Result<()> {
+    set_config(pool, CLUSTER_PEER_ADDR_KEY, addr).await
+}
+
+/// Whether this node is the statically designated primary — the tie-break `cluster::decide_role`
+/// uses for a fresh election or a still-establishing peer. Explicit rather than derived (e.g. by
+/// comparing node ids) because whoever pairs two nodes already has an opinion on which is which,
+/// and deriving it would need the peer's id before it could ever be known, which is exactly the
+/// bootstrap ordering problem `PeerStatus::Establishing` exists to avoid. Defaults to `false`
+/// (backup) when unset, since `true` on both sides is a real, permanent split brain, while
+/// `false` on both is only a lesser failure — see the pairing setup note in SPECS.md: with
+/// neither side flagged primary, both lose every tie-break and sit `Standby` forever once paired,
+/// silently (`Establishing`'s escalation only fires on heartbeat *failure*, and these heartbeats
+/// succeed) — worth setting explicitly on the intended primary rather than relying on this
+/// default. See `cluster_peer_addr` for the env var/`Config` pattern.
+pub async fn cluster_is_primary(pool: &SqlitePool) -> anyhow::Result<bool> {
+    if let Ok(v) = std::env::var("DOM_CLUSTER_IS_PRIMARY") {
+        return Ok(v == "true");
+    }
+    Ok(get_config(pool, CLUSTER_IS_PRIMARY_KEY).await?.as_deref() == Some("true"))
+}
+
+const CLUSTER_PEER_PUBKEY_KEY: &str = "cluster_peer_pubkey";
+
+/// The pinned peer identity — a paired node's own hex-encoded Ed25519 public key
+/// (`cluster::public_key_hex`) — or `None` if nothing is pinned yet. This, not `cluster_peer_addr`,
+/// is the actual trust anchor: `main::cluster_discovery_task` updates the address on its own when
+/// the pinned key is found at a new IP, exactly because the key is what identifies the peer and
+/// the address is not (see `cluster::verify_reply` and `cluster::AlarmCondition::PeerIdentityMismatch`).
+pub async fn cluster_peer_pubkey(pool: &SqlitePool) -> anyhow::Result<Option<String>> {
+    get_config(pool, CLUSTER_PEER_PUBKEY_KEY).await
+}
+
+/// Pins `public_key` as the peer identity — called only from the one place a human (or, in the
+/// Docker test harness, `DOM_CLUSTER_AUTO_PAIR`) confirms pairing. See `cluster_peer_pubkey`.
+pub async fn set_cluster_peer_pubkey(pool: &SqlitePool, public_key: &str) -> anyhow::Result<()> {
+    set_config(pool, CLUSTER_PEER_PUBKEY_KEY, public_key).await
 }
 
 // ── Daily energy rollup ───────────────────────────────────────────────────────
@@ -1611,10 +1802,10 @@ pub async fn load_switch_configs(
             continue;
         };
         let mode_str: String = row.get("auto_mode");
-        let mode = if mode_str == "time" {
-            crate::app::SwitchAutoMode::Time
-        } else {
-            crate::app::SwitchAutoMode::Disabled
+        let mode = match mode_str.as_str() {
+            "time" => crate::app::SwitchAutoMode::Time,
+            "eco" => crate::app::SwitchAutoMode::Eco,
+            _ => crate::app::SwitchAutoMode::Disabled,
         };
         modes.insert(ip, mode);
     }
@@ -1656,6 +1847,7 @@ pub async fn set_switch_auto_mode(
     let mode_str = match mode {
         crate::app::SwitchAutoMode::Disabled => "disabled",
         crate::app::SwitchAutoMode::Time => "time",
+        crate::app::SwitchAutoMode::Eco => "eco",
     };
     sqlx::query("UPDATE Devices SET auto_mode = ? WHERE ip = ?")
         .bind(mode_str)
@@ -2541,6 +2733,59 @@ pub async fn query_production_15min(
         }
     }
     Ok(out)
+}
+
+/// Average power, in W, that `device_id` reported for `metric`, bucketed by
+/// quarter-hour-of-day in local time (index 0..`mystrom_switch::STEPS_PER_DAY`,
+/// 15-minute steps from local midnight) and averaged over the `days` local
+/// days before `today` — `today` itself is excluded, since it is not yet a
+/// complete day to average.
+///
+/// Used by Eco mode (`devices::mystrom_switch::choose_window`) to build both
+/// sides of its scoring: the switch's own typical draw, and — subtracted from
+/// whole-house consumption by the caller — the household's typical *other*
+/// load. A quarter-hour with no samples in the window is simply absent from
+/// the map rather than defaulted to zero, so the caller can tell "never
+/// measured" apart from "measured at zero".
+pub async fn query_avg_power_by_local_quarter_hour(
+    pool: &SqlitePool,
+    device_id: i64,
+    metric: &str,
+    today: chrono::NaiveDate,
+    days: i64,
+) -> anyhow::Result<std::collections::HashMap<usize, f64>> {
+    let Some(from) = today.checked_sub_signed(chrono::Duration::days(days)) else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let (Some((from_start, _)), Some((today_start, _))) =
+        (local_day_bounds_utc(from), local_day_bounds_utc(today))
+    else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let rows: Vec<(i64, f64, f64)> = sqlx::query_as(
+        "SELECT
+             CAST(strftime('%H', minute, 'localtime') AS INTEGER) * 4
+                 + CAST(strftime('%M', minute, 'localtime') AS INTEGER) / 15 AS step,
+             SUM(energy_ws) AS total_ws,
+             SUM(span_secs) AS total_secs
+         FROM EnergyMinute
+         WHERE device_id = ? AND metric = ?
+           AND minute >= ? AND minute < ?
+         GROUP BY step
+         HAVING total_secs > 0",
+    )
+    .bind(device_id)
+    .bind(metric)
+    .bind(&from_start)
+    .bind(&today_start)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter(|(step, ..)| *step >= 0)
+        .map(|(step, total_ws, total_secs)| (step as usize, total_ws / total_secs))
+        .collect())
 }
 
 /// Production in kWh for each local day in `from..=to` that has any, from the
@@ -4098,5 +4343,152 @@ mod tests {
             .await
             .unwrap();
         assert!(device_moved(&pool, id, ip).await.unwrap());
+    }
+
+    // ── Cluster ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_cluster_node_id_is_generated_once_and_then_stable() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let first = get_or_create_cluster_node_id(&pool).await.unwrap();
+        assert_eq!(first.len(), 16, "16 hex characters from 8 random bytes");
+        let second = get_or_create_cluster_node_id(&pool).await.unwrap();
+        assert_eq!(first, second, "a second call must not generate a new id");
+
+        // Surviving a fresh read of `Config` directly, not just the in-process cache.
+        let stored = get_config(&pool, CLUSTER_NODE_ID_KEY).await.unwrap();
+        assert_eq!(stored, Some(first));
+    }
+
+    #[tokio::test]
+    async fn opening_a_new_epoch_closes_whatever_was_open() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::minutes(30);
+
+        open_leadership_epoch(&pool, "node-a", t0).await.unwrap();
+        let open_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM LeadershipEpochs WHERE ended_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(open_count, 1);
+
+        open_leadership_epoch(&pool, "node-b", t1).await.unwrap();
+        let open_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM LeadershipEpochs WHERE ended_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(open_count, 1, "the previous epoch must have been closed");
+
+        let still_open: String =
+            sqlx::query_scalar("SELECT node_id FROM LeadershipEpochs WHERE ended_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_open, "node-b");
+    }
+
+    #[tokio::test]
+    async fn leadership_at_a_given_instant_reads_the_covering_epoch() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let t0 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t1 = t0 + chrono::Duration::hours(1);
+        let t2 = t0 + chrono::Duration::hours(2);
+
+        // Before any epoch exists, nothing is known.
+        assert_eq!(query_leadership_epoch_at(&pool, t0).await.unwrap(), None);
+
+        open_leadership_epoch(&pool, "node-a", t0).await.unwrap();
+        assert_eq!(
+            query_leadership_epoch_at(&pool, t0 + chrono::Duration::minutes(30))
+                .await
+                .unwrap(),
+            Some("node-a".to_string()),
+            "still inside node-a's open epoch"
+        );
+
+        open_leadership_epoch(&pool, "node-b", t1).await.unwrap();
+        assert_eq!(
+            query_leadership_epoch_at(&pool, t0 + chrono::Duration::minutes(30))
+                .await
+                .unwrap(),
+            Some("node-a".to_string()),
+            "a past instant must still resolve to whoever held it then, not the current holder"
+        );
+        assert_eq!(
+            query_leadership_epoch_at(&pool, t2).await.unwrap(),
+            Some("node-b".to_string()),
+            "node-b's epoch is still open, so a later instant is covered too"
+        );
+    }
+
+    // The `DOM_CLUSTER_PEER_ADDR`/`DOM_CLUSTER_IS_PRIMARY` environment-variable override is not
+    // exercised here: mutating process environment in a test that runs alongside others on the
+    // default multi-threaded test runner would be a source of real flakiness, not a meaningful
+    // check — the override itself is a one-line `std::env::var` read.
+
+    #[tokio::test]
+    async fn cluster_peer_addr_is_none_until_configured_then_reads_it_back() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        assert_eq!(cluster_peer_addr(&pool).await.unwrap(), None);
+        set_config(&pool, CLUSTER_PEER_ADDR_KEY, "dom-b:7878")
+            .await
+            .unwrap();
+        assert_eq!(
+            cluster_peer_addr(&pool).await.unwrap(),
+            Some("dom-b:7878".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_is_primary_defaults_to_false() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        assert!(!cluster_is_primary(&pool).await.unwrap());
+        set_config(&pool, CLUSTER_IS_PRIMARY_KEY, "true")
+            .await
+            .unwrap();
+        assert!(cluster_is_primary(&pool).await.unwrap());
+        set_config(&pool, CLUSTER_IS_PRIMARY_KEY, "false")
+            .await
+            .unwrap();
+        assert!(!cluster_is_primary(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_cluster_keypair_is_generated_once_and_then_stable() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        let first = get_or_create_cluster_keypair(&pool).await.unwrap();
+        let second = get_or_create_cluster_keypair(&pool).await.unwrap();
+        assert_eq!(
+            crate::cluster::public_key_hex(&first),
+            crate::cluster::public_key_hex(&second),
+            "a second call must reload the same key, not generate a new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_cluster_peer_addr_writes_what_cluster_peer_addr_reads_back() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        assert_eq!(cluster_peer_addr(&pool).await.unwrap(), None);
+        set_cluster_peer_addr(&pool, "192.168.1.42:7878")
+            .await
+            .unwrap();
+        assert_eq!(
+            cluster_peer_addr(&pool).await.unwrap(),
+            Some("192.168.1.42:7878".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_peer_pubkey_is_none_until_pinned_then_reads_it_back() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        assert_eq!(cluster_peer_pubkey(&pool).await.unwrap(), None);
+        set_cluster_peer_pubkey(&pool, "abcd1234").await.unwrap();
+        assert_eq!(
+            cluster_peer_pubkey(&pool).await.unwrap(),
+            Some("abcd1234".to_string())
+        );
     }
 }

@@ -1385,7 +1385,9 @@ fn switch_reading_lines(lines: &mut Vec<Line>, r: &SwitchReading, app: &App, ip:
     let theme = app.theme();
     let focused = app.focus == Focus::Detail;
     let row = app.detail_row;
-    let is_time = matches!(app.switch_auto_modes.get(&ip), Some(SwitchAutoMode::Time));
+    let mode = app.switch_auto_modes.get(&ip);
+    let is_time = matches!(mode, Some(SwitchAutoMode::Time));
+    let is_eco = matches!(mode, Some(SwitchAutoMode::Eco));
     let timers = app.switch_timers.get(&ip);
 
     let relay = if r.relay_on { "● ON" } else { "○ OFF" };
@@ -1395,14 +1397,43 @@ fn switch_reading_lines(lines: &mut Vec<Line>, r: &SwitchReading, app: &App, ip:
         &theme,
     ));
 
-    let mode_str = if is_time { "Time" } else { "Disabled" };
+    let mode_str = match mode {
+        Some(SwitchAutoMode::Time) => "Time",
+        Some(SwitchAutoMode::Eco) => "Eco",
+        _ => "Disabled",
+    };
     lines.push(highlighted_line(
         format!("  Auto     {mode_str}"),
         focused && row == 1,
         &theme,
     ));
 
-    if is_time {
+    if is_eco {
+        let text = match app.switch_eco_plans.get(&ip) {
+            Some(plan) => {
+                let on = plan.on_at.with_timezone(&chrono::Local).format("%H:%M");
+                let off = plan.off_at.with_timezone(&chrono::Local).format("%H:%M");
+                match plan.predicted_grid_wh {
+                    Some(wh) => format!(
+                        "  Eco      today {on}\u{2013}{off}, ~{:.1} kWh from grid",
+                        wh / 1000.0
+                    ),
+                    // The timer fallback — say so, rather than dressing the
+                    // user's own clock times up as something Eco chose.
+                    None => format!(
+                        "  Eco      today {on}\u{2013}{off} — timer fallback, not enough data to plan"
+                    ),
+                }
+            }
+            // Only reachable with no on/off pair at all: `eco_job` skips a
+            // switch without one before it ever plans, and every other
+            // shortfall now lands on the fallback above.
+            None => "  Eco      no plan yet — needs an on/off timer pair".to_string(),
+        };
+        lines.push(Line::from(text));
+    }
+
+    if is_time || is_eco {
         if let Some(ts) = timers {
             for (i, t) in ts.iter().enumerate() {
                 let action = if t.relay_on { "→ ON " } else { "→ OFF" };
@@ -1934,6 +1965,7 @@ fn render_network_view(f: &mut Frame, area: Rect, app: &App) {
     let total_devices = router_devices.len() + modem_devices.len() + ap_devices.len();
     let list_h = total_devices.max(1) as u16 + 2;
     let security = security_lines(app, &app.theme());
+    let cluster = cluster_lines(app, &app.theme());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1942,6 +1974,11 @@ fn render_network_view(f: &mut Frame, area: Rect, app: &App) {
                 0
             } else {
                 security.len() as u16 + 2
+            }),
+            Constraint::Length(if cluster.is_empty() {
+                0
+            } else {
+                cluster.len() as u16 + 2
             }),
             Constraint::Min(0),
         ])
@@ -1964,10 +2001,18 @@ fn render_network_view(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 
+    if !cluster.is_empty() {
+        f.render_widget(
+            Paragraph::new(cluster)
+                .block(Block::default().borders(Borders::ALL).title(" Cluster ")),
+            rows[2],
+        );
+    }
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[2]);
+        .split(rows[3]);
 
     render_network_status_history(f, cols[0], app);
     render_internet_traffic_chart(f, cols[1], app);
@@ -2035,6 +2080,50 @@ fn security_lines<'a>(app: &'a App, theme: &Theme) -> Vec<Line<'a>> {
         ));
     }
     lines
+}
+
+/// A discovered (or re-identified) cluster peer awaiting one explicit pairing confirmation — see
+/// `App::cluster_pairing_prompt`. Empty, and so not drawn at all, once nothing is pending — same
+/// "absent when nominal" shape as `security_lines`.
+fn cluster_lines<'a>(app: &'a App, theme: &Theme) -> Vec<Line<'a>> {
+    let Some(prompt) = &app.cluster_pairing_prompt else {
+        return Vec::new();
+    };
+
+    let heading = if prompt.replaces_pin {
+        format!(
+            "A peer at {} answers with a different identity than the one pinned",
+            prompt.addr
+        )
+    } else {
+        format!("Found a Dom instance at {}", prompt.addr)
+    };
+    let instruction = if prompt.replaces_pin {
+        "    If this is expected (the peer was reinstalled or reset), press 'p' to re-pair. If \
+         not, leave it — an unrecognized identity is never trusted automatically."
+    } else {
+        "    If this is your other Dom instance, press 'p' to pair with it."
+    };
+
+    vec![
+        Line::from(vec![
+            Span::from("  "),
+            Span::from(heading).style(
+                Style::default()
+                    .fg(theme.status_lost)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(
+            Span::from(format!(
+                "    node {}   key {}",
+                prompt.node_id,
+                crate::devices::tls::short_fingerprint(&prompt.public_key),
+            ))
+            .style(Style::default().fg(theme.inactive)),
+        ),
+        Line::from(Span::from(instruction).style(Style::default().fg(theme.level_warn))),
+    ]
 }
 
 fn render_network_infrastructure_health(
@@ -3342,5 +3431,78 @@ mod tests {
         let screen = draw(&app, 140, 30);
         assert!(screen.contains("Security"), "{screen}");
         assert!(screen.contains("in the clear"), "{screen}");
+    }
+
+    // ── Cluster pairing prompt ──────────────────────────────────────────────
+
+    fn cluster_text(app: &App) -> String {
+        let theme = app.theme();
+        cluster_lines(app, &theme)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn nothing_is_said_when_no_pairing_is_pending() {
+        assert!(cluster_lines(&net_app(), &net_app().theme()).is_empty());
+    }
+
+    #[test]
+    fn a_fresh_candidate_invites_pairing_without_implying_one_already_existed() {
+        let mut app = net_app();
+        app.cluster_pairing_prompt = Some(crate::app::ClusterPairingPrompt {
+            addr: "192.168.1.50:7878".to_string(),
+            node_id: "deadbeef".to_string(),
+            public_key: "a".repeat(64),
+            replaces_pin: false,
+        });
+        let out = cluster_text(&app);
+        assert!(out.contains("192.168.1.50:7878"), "{out}");
+        assert!(out.contains("Found a Dom instance"), "{out}");
+        assert!(out.contains("press 'p' to pair"), "{out}");
+        assert!(!out.contains("re-pair"), "{out}");
+        assert!(out.contains("aaaa:aaaa"), "{out}");
+    }
+
+    #[test]
+    fn a_mismatched_pin_is_worded_as_re_pairing_and_warns_against_blind_acceptance() {
+        let mut app = net_app();
+        app.cluster_pairing_prompt = Some(crate::app::ClusterPairingPrompt {
+            addr: "192.168.1.50:7878".to_string(),
+            node_id: "deadbeef".to_string(),
+            public_key: "c".repeat(64),
+            replaces_pin: true,
+        });
+        let out = cluster_text(&app);
+        assert!(
+            out.contains("different identity than the one pinned"),
+            "{out}"
+        );
+        assert!(out.contains("press 'p' to re-pair"), "{out}");
+        assert!(out.contains("never trusted automatically"), "{out}");
+    }
+
+    #[test]
+    fn the_network_view_draws_the_cluster_panel_only_when_a_prompt_is_pending() {
+        let mut app = net_app();
+        app.cluster_pairing_prompt = Some(crate::app::ClusterPairingPrompt {
+            addr: "192.168.1.50:7878".to_string(),
+            node_id: "deadbeef".to_string(),
+            public_key: "a".repeat(64),
+            replaces_pin: false,
+        });
+        let screen = draw(&app, 140, 30);
+        assert!(screen.contains("Cluster"), "{screen}");
+        assert!(screen.contains("192.168.1.50:7878"), "{screen}");
+
+        let screen = draw(&net_app(), 140, 30);
+        assert!(!screen.contains("Cluster"), "{screen}");
     }
 }

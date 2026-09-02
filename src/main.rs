@@ -30,7 +30,7 @@ use sqlx::SqlitePool;
 use tokio::sync::Notify;
 
 use dom::app::{SharedState, SwitchAutoMode};
-use dom::{app, db, devices, fingerprint, logging, online, stats, tui};
+use dom::{alarm, app, cluster, db, devices, fingerprint, logging, online, solar, stats, tui};
 
 /// How long after startup the ICMP ping scan's one-time early follow-up runs,
 /// to catch devices that weren't up yet at the very first (t=0) scan.
@@ -100,6 +100,35 @@ const MAX_TIMER_CATCHUP_MINUTES: i64 = 30;
 /// most of every tick being asked again. After this many the timer is recorded
 /// as done for the day, with the reason in the log.
 const TIMER_MAX_ATTEMPTS: u32 = 5;
+/// How many days of history Eco mode averages over to estimate a switch's
+/// typical draw, and the household's typical load without it (see
+/// `compute_eco_plan`). Long enough to smooth over one unusual day, short
+/// enough to track a season change within a couple of weeks.
+const ECO_HISTORY_DAYS: i64 = 14;
+
+/// How many of today's 96 quarter-hour forecast steps must be on hand before
+/// Eco will place a window against them, rather than deferring to the
+/// configured timer. Open-Meteo serves the whole day at 15-minute resolution
+/// in one document (see `online::forecast`), so a normal day has all 96 and
+/// anything far short of that means the fetch has not landed — not that the
+/// day is dark. Half a day is the loosest reading of "enough to tell morning
+/// from afternoon".
+const ECO_MIN_FORECAST_STEPS: usize = 48;
+/// TCP port the cluster heartbeat listens on — see `cluster_heartbeat_listener_task` and
+/// `cluster_task`.
+const CLUSTER_HEARTBEAT_PORT: u16 = 7878;
+/// How often a paired node attempts to reach its peer. Faster than `TIMER_TICK_SECS` because
+/// failover latency (`CLUSTER_HEARTBEAT_INTERVAL_SECS * CLUSTER_PEER_LOST_AFTER_FAILURES`)
+/// matters here in a way it doesn't for the other background tasks.
+const CLUSTER_HEARTBEAT_INTERVAL_SECS: u64 = 5;
+/// Consecutive heartbeat failures tolerated before a peer that was previously reachable is
+/// declared `Unreachable`. Mirrors `devices::LOST_AFTER_FAILURES`'s reasoning: one dropped
+/// packet must not trigger a failover on a healthy cluster.
+const CLUSTER_PEER_LOST_AFTER_FAILURES: u32 = 3;
+/// Per-operation timeout for a single heartbeat connect/write/read, on both the initiating and
+/// the listening side. Short relative to `CLUSTER_HEARTBEAT_INTERVAL_SECS` so one hung attempt
+/// cannot delay the next tick.
+const CLUSTER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -213,6 +242,53 @@ async fn main() -> anyhow::Result<()> {
 
     // Background: fires scheduled switch timers every 30s.
     tokio::spawn(timer_job(state.clone()));
+
+    // Background: computes and fires each Eco-mode switch's daily on/off plan.
+    tokio::spawn(eco_job(state.clone(), pool.clone()));
+
+    // This node's cluster identity, keypair, and peer address — read/generated once here,
+    // ahead of all three tasks below, rather than each establishing them independently.
+    let cluster_node_id = db::get_or_create_cluster_node_id(&pool).await?;
+    let cluster_keypair = db::get_or_create_cluster_keypair(&pool).await?;
+    let cluster_peer_addr = db::cluster_peer_addr(&pool).await?;
+
+    // Seeded synchronously, before either cluster task spawns: the heartbeat
+    // listener answers from this field the moment it starts accepting
+    // connections, so it must never observe `Role::default()`'s `Active` for
+    // a paired node even for the single tick it would take `cluster_task` to
+    // correct it — a peer that heartbeats in that window would see a false
+    // `claims_active: true` and could wrongly demote itself. See
+    // `App::cluster_role`'s doc.
+    state.write().unwrap().cluster_role = if cluster_peer_addr.is_some() {
+        cluster::Role::Standby
+    } else {
+        cluster::Role::Active
+    };
+
+    // Background: this node's cluster role — solo/Active until pairing exists.
+    tokio::spawn(cluster_task(
+        cluster_node_id.clone(),
+        cluster_peer_addr,
+        state.clone(),
+        pool.clone(),
+    ));
+
+    // Background: answers heartbeat/discovery connections. Spawned
+    // unconditionally, like cluster_task — see cluster_heartbeat_listener_task.
+    tokio::spawn(cluster_heartbeat_listener_task(
+        cluster_node_id.clone(),
+        cluster_keypair,
+        state.clone(),
+    ));
+
+    // Background: looks for an unpaired (or re-identified) Dom peer on the LAN, reusing the same
+    // scan infrastructure and rescan trigger as `discovery_task` rather than a second mechanism.
+    tokio::spawn(cluster_discovery_task(
+        cluster_node_id,
+        state.clone(),
+        pool.clone(),
+        rescan_notify.clone(),
+    ));
 
     match tui::run(state, pool, rescan_notify).await? {
         tui::Interface::Closed => Ok(()),
@@ -1053,6 +1129,799 @@ fn elapsed_window(
         .collect()
 }
 
+/// The UTC instant for a given quarter-hour-of-day step on a local calendar
+/// day — the inverse of the local-time bucketing `db::
+/// query_avg_power_by_local_quarter_hour` groups by.
+fn datetime_from_step(day: chrono::NaiveDate, step: usize) -> Option<chrono::DateTime<Utc>> {
+    use chrono::TimeZone;
+    let step = u32::try_from(step).ok()?;
+    let naive = day.and_hms_opt(step / 4, (step % 4) * 15, 0)?;
+    chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Computes today's Eco-mode plan for one myStrom switch, or `None` if there
+/// is not yet enough to plan from: no solar calibration, too little of today's
+/// forecast, or too little recorded history for the switch's own draw and the
+/// house around it. Called once per local day per Eco-mode device by
+/// `eco_job`, which answers `None` with `timer_fallback_plan`.
+///
+/// `on_hhmm`/`off_hhmm` are the device's own configured timer pair — Eco mode
+/// reads only their *length* (`duration_steps_from_timers`), not their clock
+/// time, which is what it replaces each day. See
+/// `devices::mystrom_switch`'s "Eco mode" section for the algorithm.
+async fn compute_eco_plan(
+    pool: &SqlitePool,
+    switch_device_id: i64,
+    on_hhmm: &str,
+    off_hhmm: &str,
+    today: chrono::NaiveDate,
+) -> Option<app::EcoPlan> {
+    use devices::mystrom_switch::{STEPS_PER_DAY, duration_steps_from_timers, step_of_hhmm};
+
+    let duration_steps = duration_steps_from_timers(on_hhmm, off_hhmm)?;
+    let on_step = step_of_hhmm(on_hhmm)?;
+
+    let calibration = db::get_calibration(pool).await.ok().flatten()?;
+
+    let forecast = db::query_forecast(pool, today, today).await.ok()?;
+    let mut production_w = [0.0; STEPS_PER_DAY];
+    let mut forecast_steps = 0usize;
+    for point in &forecast {
+        let local = point.valid_at.with_timezone(&chrono::Local);
+        if local.date_naive() != today {
+            continue;
+        }
+        let step = local.hour() as usize * 4 + local.minute() as usize / 15;
+        if let Some(slot) = production_w.get_mut(step) {
+            *slot = solar::predict_wh(point.gti_w_m2, point.temperature_c, calibration.k)
+                * solar::STEPS_PER_HOUR;
+            forecast_steps += 1;
+        }
+    }
+    // A day the forecast barely covers scores as if the sun never rose, since
+    // every unfilled step stays at zero production. That is indistinguishable
+    // from a genuinely overcast day — which is a *legitimate* all-tied result
+    // that `choose_window` is meant to break at random (see `TIE_EPSILON_WH`)
+    // — so the two cannot be told apart after the fact, only here, by asking
+    // how many steps actually arrived. Too few and there is no solar signal to
+    // place a window against at all; defer to the configured timer instead of
+    // rolling dice.
+    if forecast_steps < ECO_MIN_FORECAST_STEPS {
+        return None;
+    }
+
+    let house_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM Devices WHERE type = 'sonnen_eco8' LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let house_id = house_id?;
+
+    let switch_curve = db::query_avg_power_by_local_quarter_hour(
+        pool,
+        switch_device_id,
+        "power",
+        today,
+        ECO_HISTORY_DAYS,
+    )
+    .await
+    .ok()?;
+    let house_curve = db::query_avg_power_by_local_quarter_hour(
+        pool,
+        house_id,
+        "consumption",
+        today,
+        ECO_HISTORY_DAYS,
+    )
+    .await
+    .ok()?;
+
+    // The single gate on "is there enough history to plan against". It also
+    // guarantees `switch_curve` is non-empty below, since it needs steps from
+    // both curves to count one as known.
+    let baseline_w = devices::mystrom_switch::baseline_from_curves(&house_curve, &switch_curve)?;
+
+    // Typical power while running: averaged over the switch's own historical
+    // on-window where there is data for it, falling back to its overall
+    // average — a switch that was just moved into Eco from a differently
+    // timed Time-mode schedule still has *some* history to start from.
+    let in_window: Vec<f64> = (0..duration_steps)
+        .filter_map(|i| switch_curve.get(&((on_step + i) % STEPS_PER_DAY)).copied())
+        .collect();
+    let typical_power_w = if in_window.is_empty() {
+        switch_curve.values().sum::<f64>() / switch_curve.len() as f64
+    } else {
+        in_window.iter().sum::<f64>() / in_window.len() as f64
+    };
+    if typical_power_w <= 0.0 {
+        return None;
+    }
+
+    let (start, predicted_grid_wh) = devices::mystrom_switch::choose_window(
+        duration_steps,
+        typical_power_w,
+        &production_w,
+        &baseline_w,
+    )?;
+
+    let on_at = datetime_from_step(today, start)?;
+    let off_step_abs = start + duration_steps;
+    let off_day = if off_step_abs >= STEPS_PER_DAY {
+        today.succ_opt()?
+    } else {
+        today
+    };
+    let off_at = datetime_from_step(off_day, off_step_abs % STEPS_PER_DAY)?;
+
+    Some(app::EcoPlan {
+        date: today,
+        on_at,
+        off_at,
+        predicted_grid_wh: Some(predicted_grid_wh),
+        on_fired: false,
+        off_fired: false,
+    })
+}
+
+/// Today's plan for a switch whose day Eco could not score: its own configured
+/// timer pair, at the clock times the user set, fired through the same path an
+/// Eco plan is.
+///
+/// Eco replaces the timer's *placement*, and it can only do that on a day it
+/// can actually predict. Without a forecast or enough history it has no more
+/// idea when the sun will shine than the timer does — and the timer at least
+/// carries the user's own judgement about when the tank should be hot. Leaving
+/// the relay untouched instead, which is what this used to do, is the one
+/// option that serves nobody: the water goes cold for a reason nothing in the
+/// house can act on.
+///
+/// This is not the "night fallback" SPECS.md rejected. That one would have
+/// invented its own clock window out of a tariff signal that does not exist
+/// here; this one defers to a schedule the user configured and can see.
+fn timer_fallback_plan(
+    on_hhmm: &str,
+    off_hhmm: &str,
+    today: chrono::NaiveDate,
+) -> Option<app::EcoPlan> {
+    use devices::mystrom_switch::{STEPS_PER_DAY, duration_steps_from_timers, step_of_hhmm};
+
+    let on_step = step_of_hhmm(on_hhmm)?;
+    let duration_steps = duration_steps_from_timers(on_hhmm, off_hhmm)?;
+
+    let on_at = datetime_from_step(today, on_step)?;
+    let off_step_abs = on_step + duration_steps;
+    let off_day = if off_step_abs >= STEPS_PER_DAY {
+        today.succ_opt()?
+    } else {
+        today
+    };
+    let off_at = datetime_from_step(off_day, off_step_abs % STEPS_PER_DAY)?;
+
+    Some(app::EcoPlan {
+        date: today,
+        on_at,
+        off_at,
+        predicted_grid_wh: None,
+        on_fired: false,
+        off_fired: false,
+    })
+}
+
+/// Sends the on/off command for one leg of an Eco plan, and records the
+/// result — mirroring `timer_job`'s retry-then-give-up handling (see
+/// `TIMER_MAX_ATTEMPTS`) so a switch that is briefly unreachable is retried
+/// rather than skipped, but one that is simply off at the wall does not get
+/// hammered for the rest of the day.
+async fn fire_eco_leg(
+    state: &SharedState,
+    ip: IpAddr,
+    relay_on: bool,
+    attempts: &mut HashMap<IpAddr, u32>,
+) {
+    let leg = if relay_on { "on" } else { "off" };
+    match devices::mystrom_switch::set_relay(ip, devices::mystrom_switch::API_PORT, relay_on).await
+    {
+        Ok(()) => {
+            log::info!("eco {ip} switched {leg}");
+            attempts.remove(&ip);
+            let mut app = state.write().unwrap();
+            if let Some(plan) = app.switch_eco_plans.get_mut(&ip) {
+                if relay_on {
+                    plan.on_fired = true;
+                } else {
+                    plan.off_fired = true;
+                }
+            }
+        }
+        Err(e) => {
+            let count = attempts.entry(ip).or_insert(0);
+            *count += 1;
+            if *count >= TIMER_MAX_ATTEMPTS {
+                log::warn!(
+                    "eco could not switch {ip} {leg} after {count} attempts ({e:#}); giving up for today"
+                );
+                attempts.remove(&ip);
+                let mut app = state.write().unwrap();
+                if let Some(plan) = app.switch_eco_plans.get_mut(&ip) {
+                    if relay_on {
+                        plan.on_fired = true;
+                    } else {
+                        plan.off_fired = true;
+                    }
+                }
+            } else {
+                log::warn!("eco could not switch {ip} {leg}: {e:#}; attempt {count}, will retry");
+            }
+        }
+    }
+}
+
+/// Background task: for every myStrom switch in Eco mode, keeps a plan for
+/// today (recomputing it once the local day rolls over, or once one exists
+/// at all — see `compute_eco_plan`) and fires its on/off instants as they
+/// come due.
+///
+/// Unlike `timer_job`'s sweep, a plan has exactly one on and one off instant,
+/// so there is no minute-window to catch: "now is at or past `on_at` and it
+/// has not fired yet" is its own catch-up, self-healing after any gap.
+/// `MAX_TIMER_CATCHUP_MINUTES` (shared with `timer_job`) only bounds how late
+/// a catch-up is still worth attempting, so a multi-hour outage does not fire
+/// an hours-old "on" with almost none of its window left.
+async fn eco_job(state: SharedState, pool: SqlitePool) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(TIMER_TICK_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut on_attempts: HashMap<IpAddr, u32> = HashMap::new();
+    let mut off_attempts: HashMap<IpAddr, u32> = HashMap::new();
+
+    loop {
+        ticker.tick().await;
+        let now = Utc::now();
+        let today = now.with_timezone(&chrono::Local).date_naive();
+
+        // Eco-mode switches and the on/off timer pair that gives their
+        // window its length — see `compute_eco_plan`. If more than one of
+        // either exists, the first found (earliest, since `switch_timers` is
+        // loaded in time order) is the one read; Eco plans exactly one window
+        // a day, so a device with several timer pairs configured only lends
+        // its first pair's length.
+        let candidates: Vec<(IpAddr, String, String)> = {
+            let app = state.read().unwrap();
+            app.switch_auto_modes
+                .iter()
+                .filter(|(_, mode)| matches!(mode, SwitchAutoMode::Eco))
+                .filter_map(|(ip, _)| {
+                    let timers = app.switch_timers.get(ip)?;
+                    let on = timers.iter().find(|t| t.relay_on)?;
+                    let off = timers.iter().find(|t| !t.relay_on)?;
+                    Some((*ip, on.time_hhmm.clone(), off.time_hhmm.clone()))
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            continue;
+        }
+
+        let Ok(switches) = devices::mystrom_switch::load_all(&pool).await else {
+            continue;
+        };
+
+        for (ip, on_hhmm, off_hhmm) in candidates {
+            let Some(device_id) = switches.iter().find(|d| d.ip == ip).map(|d| d.id) else {
+                continue;
+            };
+
+            let needs_plan = !matches!(
+                state.read().unwrap().switch_eco_plans.get(&ip),
+                Some(p) if p.date == today
+            );
+            if needs_plan {
+                on_attempts.remove(&ip);
+                off_attempts.remove(&ip);
+                // A day Eco cannot score falls back to the device's own timer
+                // pair rather than leaving the relay untouched — see
+                // `timer_fallback_plan`. Either way the day now has a plan, so
+                // `needs_plan` goes false and this is not recomputed until
+                // tomorrow. That stickiness is what makes the fallback safe:
+                // re-deciding mid-day would build a fresh plan with
+                // `on_fired: false` and switch a tank that had already been
+                // heated back on.
+                let plan =
+                    match compute_eco_plan(&pool, device_id, &on_hhmm, &off_hhmm, today).await {
+                        Some(plan) => Some(plan),
+                        None => timer_fallback_plan(&on_hhmm, &off_hhmm, today),
+                    };
+                let mut app = state.write().unwrap();
+                match plan {
+                    Some(plan) => {
+                        app.switch_eco_plans.insert(ip, plan);
+                    }
+                    None => {
+                        app.switch_eco_plans.remove(&ip);
+                    }
+                }
+            }
+
+            let Some(plan) = state.read().unwrap().switch_eco_plans.get(&ip).cloned() else {
+                continue;
+            };
+            let catchup = chrono::Duration::minutes(MAX_TIMER_CATCHUP_MINUTES);
+
+            if !plan.on_fired && now >= plan.on_at && now - plan.on_at <= catchup {
+                fire_eco_leg(&state, ip, true, &mut on_attempts).await;
+            }
+            if !plan.off_fired && now >= plan.off_at && now - plan.off_at <= catchup {
+                fire_eco_leg(&state, ip, false, &mut off_attempts).await;
+            }
+        }
+    }
+}
+
+/// Whether a heartbeat reply's claimed identity should be trusted: always, when nothing is pinned
+/// yet (`cluster_task` warns about that state once at startup); otherwise only when it matches.
+fn identity_ok(pinned_peer_key: &Option<String>, replied_key: &str) -> bool {
+    match pinned_peer_key {
+        None => true,
+        Some(pin) => pin == replied_key,
+    }
+}
+
+/// The `PeerStatus` for one failed-or-untrusted heartbeat attempt — mirrors
+/// `devices::ConnStatus::Connecting`'s reasoning: report the last known claim until
+/// `CLUSTER_PEER_LOST_AFTER_FAILURES` consecutive attempts have failed, rather than flipping
+/// straight to `Unreachable` on a single dropped or mismatched heartbeat.
+fn degrade(
+    consecutive_failures: u32,
+    ever_reachable: bool,
+    last_claims_active: bool,
+) -> cluster::PeerStatus {
+    if consecutive_failures >= CLUSTER_PEER_LOST_AFTER_FAILURES {
+        cluster::PeerStatus::Unreachable
+    } else if ever_reachable {
+        cluster::PeerStatus::Reachable {
+            claims_active: last_claims_active,
+        }
+    } else {
+        cluster::PeerStatus::Establishing
+    }
+}
+
+/// Background task: decides and maintains this node's cluster role — see
+/// `cluster::decide_role` and SPECS.md, "High availability: a two-node
+/// active/standby cluster", for the design.
+///
+/// With no peer configured (`peer_addr` is `None`, true of every existing
+/// single-node install), this runs exactly as before: 30s tick,
+/// `PeerStatus::NotPaired`, always `Active`, nothing observable beyond the
+/// one startup leadership epoch. A configured peer switches this to a faster
+/// heartbeat cadence (`CLUSTER_HEARTBEAT_INTERVAL_SECS`) and drives
+/// `peer`/`self_is_designated_primary` from real state — see `heartbeat_once`
+/// for the wire exchange and `db::cluster_is_primary` for the designation.
+///
+/// `peer_addr` is the *starting* value, read once in `main()` because
+/// `state.cluster_role` has to be seeded from the same value *before*
+/// `cluster_heartbeat_listener_task` starts answering connections (see
+/// `App::cluster_role`'s doc) — but pairing/re-pairing now happens live (a
+/// TUI keypress, or `DOM_CLUSTER_AUTO_PAIR`), so every tick re-reads
+/// `cluster_peer_addr`/`cluster_peer_pubkey`/`cluster_is_primary` from
+/// `Config` rather than trusting the value this task was handed at startup —
+/// otherwise a node paired after boot would never notice and would sit in
+/// `NotPaired` forever until restarted. An address change specifically (not
+/// just a pin update at the same address) resets this task's local tracking
+/// to the same cold-start-safe values a process boot would use — the peer
+/// relationship is effectively new, and carrying over a stale `role`/
+/// `currently_active` from whatever this node was doing before pairing
+/// existed would reopen the exact cold-start hazard `PeerStatus::Establishing`
+/// exists to close.
+///
+/// Gateway reachability reuses `App::network_status` (already computed for
+/// the Network view) against whichever device `classify_network_devices`
+/// names as the router, rather than adding a second ping mechanism.
+async fn cluster_task(
+    node_id: String,
+    mut peer_addr: Option<String>,
+    state: SharedState,
+    pool: SqlitePool,
+) {
+    use alarm::AlarmSink;
+
+    // Both assigned unconditionally at the top of every loop iteration below, not just once here
+    // — see this function's doc for why pairing can no longer be treated as fixed for the task's
+    // whole lifetime.
+    let mut self_is_designated_primary;
+    let mut pinned_peer_key: Option<String>;
+    // Logged once, the first tick a peer address exists without a pinned identity — not on every
+    // tick, which would just be noise for a state that (once it's true) tends to stay true until
+    // a human pairs. See `db::cluster_peer_pubkey`'s doc for why this fallback exists at all.
+    let mut warned_no_pin = false;
+
+    let alarm_sink = alarm::LogAlarm;
+    let mut alarmed = false;
+    // A configured peer starts this node at `Standby`, not `Role::default()`
+    // (`Active`) — this is the other half of the cold-start fix alongside
+    // `PeerStatus::Establishing`: `currently_active` must start honest, not
+    // optimistic, or two nodes booting together could both feed `true` into
+    // `decide_role` before either has heard from the other. See SPECS.md.
+    let mut role = if peer_addr.is_some() {
+        cluster::Role::Standby
+    } else {
+        cluster::Role::Active
+    };
+    // Forces the very first tick to log/act even when `decide_role`'s answer
+    // matches `role`'s initial value (e.g. a solo node starting and staying
+    // `Active`) — distinct from "has this node ever opened a leadership
+    // epoch", which for a node that starts and stays `Standby` would never
+    // become true and would otherwise re-log every single tick forever.
+    let mut started = false;
+    let mut consecutive_failures: u32 = 0;
+    let mut ever_reachable = false;
+    let mut last_claims_active = false;
+
+    let tick_secs = |paired: bool| {
+        Duration::from_secs(if paired {
+            CLUSTER_HEARTBEAT_INTERVAL_SECS
+        } else {
+            TIMER_TICK_SECS
+        })
+    };
+    let mut ticker = tokio::time::interval(tick_secs(peer_addr.is_some()));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+
+        let fresh_peer_addr = db::cluster_peer_addr(&pool).await.unwrap_or(None);
+        if fresh_peer_addr != peer_addr {
+            log::info!(
+                "cluster: peer configuration changed ({peer_addr:?} -> {fresh_peer_addr:?})"
+            );
+            peer_addr = fresh_peer_addr;
+            role = if peer_addr.is_some() {
+                cluster::Role::Standby
+            } else {
+                cluster::Role::Active
+            };
+            state.write().unwrap().cluster_role = role;
+            started = false;
+            consecutive_failures = 0;
+            ever_reachable = false;
+            last_claims_active = false;
+            ticker = tokio::time::interval(tick_secs(peer_addr.is_some()));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        }
+        self_is_designated_primary = match &peer_addr {
+            Some(_) => db::cluster_is_primary(&pool).await.unwrap_or(false),
+            None => true,
+        };
+        pinned_peer_key = match &peer_addr {
+            Some(_) => db::cluster_peer_pubkey(&pool).await.unwrap_or(None),
+            None => None,
+        };
+        if peer_addr.is_some() && pinned_peer_key.is_none() && !warned_no_pin {
+            warned_no_pin = true;
+            log::warn!(
+                "cluster: a peer address is configured but no identity is pinned — heartbeats \
+                 will trust whoever answers at that address. Pair via the TUI to pin an identity."
+            );
+        } else if pinned_peer_key.is_some() {
+            warned_no_pin = false;
+        }
+
+        let (currently_active, gateway_reachable) = {
+            let app = state.read().unwrap();
+            let topology = app::classify_network_devices(&app.devices);
+            let reachable = topology.routers.first().is_some_and(|ip| {
+                matches!(
+                    app.network_status(*ip),
+                    app::NetworkDeviceStatus::Ok | app::NetworkDeviceStatus::Slow
+                )
+            });
+            (matches!(role, cluster::Role::Active), reachable)
+        };
+
+        let peer = match &peer_addr {
+            None => cluster::PeerStatus::NotPaired,
+            Some(addr) => match heartbeat_once(addr, &node_id).await {
+                Ok(reply) if identity_ok(&pinned_peer_key, &reply.public_key) => {
+                    log::debug!(
+                        "cluster: heartbeat to {addr} ok, peer {} claims_active={}",
+                        reply.node_id,
+                        reply.claims_active
+                    );
+                    consecutive_failures = 0;
+                    ever_reachable = true;
+                    last_claims_active = reply.claims_active;
+                    cluster::PeerStatus::Reachable {
+                        claims_active: last_claims_active,
+                    }
+                }
+                Ok(reply) => {
+                    // Internally valid, signed reply — just not from the key that's pinned.
+                    // Never trust its claim, but this is a distinct, actionable situation from an
+                    // ordinary network failure (most plausibly: the peer was reinstalled and
+                    // generated a new keypair), so it gets its own alarm and a re-pair prompt
+                    // rather than silently degrading like a dropped connection would.
+                    consecutive_failures += 1;
+                    log::warn!(
+                        "cluster: heartbeat to {addr} answered by an identity that doesn't match \
+                         the pin (got {}) — treating as unreachable until re-paired",
+                        reply.public_key
+                    );
+                    alarm_sink.raise(cluster::AlarmCondition::PeerIdentityMismatch);
+                    state.write().unwrap().cluster_pairing_prompt =
+                        Some(app::ClusterPairingPrompt {
+                            addr: addr.clone(),
+                            node_id: reply.node_id,
+                            public_key: reply.public_key,
+                            replaces_pin: true,
+                        });
+                    degrade(consecutive_failures, ever_reachable, last_claims_active)
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    log::debug!(
+                        "cluster: heartbeat to {addr} failed ({consecutive_failures} in a row): {e:#}"
+                    );
+                    degrade(consecutive_failures, ever_reachable, last_claims_active)
+                }
+            },
+        };
+
+        let decision = cluster::decide_role(
+            currently_active,
+            self_is_designated_primary,
+            gateway_reachable,
+            peer,
+        );
+
+        if let Some(condition) = decision.alarm {
+            alarm_sink.raise(condition);
+            alarmed = true;
+        } else if alarmed {
+            alarm_sink.clear();
+            alarmed = false;
+        }
+
+        if decision.role != role || !started {
+            started = true;
+            log::info!("cluster: role is now {:?}", decision.role);
+            role = decision.role;
+            state.write().unwrap().cluster_role = role;
+            if role == cluster::Role::Active
+                && let Err(e) = db::open_leadership_epoch(&pool, &node_id, Utc::now()).await
+            {
+                log::warn!("cluster: could not record a leadership epoch: {e:#}");
+            }
+        }
+    }
+}
+
+/// One heartbeat round: connects to `addr`, sends a fresh-nonce request, and returns the peer's
+/// signed reply — used both for an ongoing paired heartbeat and for an unpaired discovery probe
+/// (`cluster_discovery_task`); the only difference is what the caller does with the identity in
+/// the result. Verifies the reply is internally consistent (`cluster::verify_reply`) and actually
+/// answers *this* request (`request_nonce` matches the nonce just sent — without that check, a
+/// captured old reply could be replayed forever to mask a dead peer, which would be worse than no
+/// authentication at all) before returning it; a caller that needs the identity to match a pin
+/// still has to check that itself, since this function has no pin to check against for a
+/// discovery probe. Every I/O step is individually timeout-bound (`CLUSTER_HEARTBEAT_TIMEOUT`) so
+/// one unresponsive peer cannot stall a whole tick.
+async fn heartbeat_once(addr: &str, node_id: &str) -> anyhow::Result<cluster::HeartbeatReply> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let stream = tokio::time::timeout(
+        CLUSTER_HEARTBEAT_TIMEOUT,
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await??;
+
+    let nonce = cluster::random_nonce_hex();
+    let mut outgoing = serde_json::to_string(&cluster::HeartbeatRequest {
+        node_id: node_id.to_string(),
+        nonce: nonce.clone(),
+    })?;
+    outgoing.push('\n');
+
+    let mut reader = BufReader::new(stream);
+    tokio::time::timeout(
+        CLUSTER_HEARTBEAT_TIMEOUT,
+        reader.get_mut().write_all(outgoing.as_bytes()),
+    )
+    .await??;
+
+    let mut line = String::new();
+    tokio::time::timeout(CLUSTER_HEARTBEAT_TIMEOUT, reader.read_line(&mut line)).await??;
+
+    let reply: cluster::HeartbeatReply = serde_json::from_str(&line)?;
+    anyhow::ensure!(
+        reply.request_nonce == nonce,
+        "reply did not echo this request's nonce"
+    );
+    anyhow::ensure!(
+        cluster::verify_reply(&reply),
+        "reply signature did not verify"
+    );
+    Ok(reply)
+}
+
+/// Background task: answers heartbeat connections — from a paired peer, or from any node running
+/// `cluster_discovery_task`'s probe — with this node's signed identity and current role claim.
+/// Always spawned, even before any peer is configured: a probe that arrives before pairing is
+/// mutual still gets a truthful, self-signed (but not yet *trusted* by anyone) answer, which is
+/// exactly what makes discovery possible in the first place. See `cluster_task`/
+/// `cluster_discovery_task` for the initiating half, and `cluster::verify_reply`'s doc for why an
+/// unpinned reply proves less than it might look like it does.
+async fn cluster_heartbeat_listener_task(
+    node_id: String,
+    keypair: ring::signature::Ed25519KeyPair,
+    state: SharedState,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", CLUSTER_HEARTBEAT_PORT)).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!(
+                "cluster: could not bind the heartbeat port ({CLUSTER_HEARTBEAT_PORT}), a \
+                 configured peer will always see this node as unreachable: {e:#}"
+            );
+            return;
+        }
+    };
+    let keypair = std::sync::Arc::new(keypair);
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::debug!("cluster: heartbeat accept failed: {e:#}");
+                continue;
+            }
+        };
+        let node_id = node_id.clone();
+        let keypair = keypair.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if tokio::time::timeout(CLUSTER_HEARTBEAT_TIMEOUT, reader.read_line(&mut line))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let Ok(request) = serde_json::from_str::<cluster::HeartbeatRequest>(&line) else {
+                return;
+            };
+            let claims_active = state.read().unwrap().cluster_role == cluster::Role::Active;
+            let reply = cluster::sign_reply(&keypair, &node_id, claims_active, &request.nonce);
+            let Ok(mut reply_line) = serde_json::to_string(&reply) else {
+                return;
+            };
+            reply_line.push('\n');
+            let _ = tokio::time::timeout(
+                CLUSTER_HEARTBEAT_TIMEOUT,
+                reader.get_mut().write_all(reply_line.as_bytes()),
+            )
+            .await;
+        });
+    }
+}
+
+/// Background task: looks for a Dom peer on the LAN by probing every candidate IP the existing
+/// ping-scan/DHCP-lease discovery already gathers — the same candidate source `discovery_task`
+/// uses, reused rather than adding a second discovery mechanism (SPECS.md explains why mDNS was
+/// rejected for this). Not folded into `discovery_task`/`fingerprint.rs`/`devices::detect_type`:
+/// a peer isn't a sensor to add to `Devices` and poll, it's a cluster relationship that needs a
+/// human's explicit confirmation before anything trusts it (`App::cluster_pairing_prompt`) —
+/// except in the Docker test harness (`DOM_CLUSTER_AUTO_PAIR=true`), which has no TTY to confirm
+/// anything with.
+///
+/// A probe reply means one of two things: an identity that isn't the pinned one (or nothing is
+/// pinned yet) becomes a pairing prompt; the *already-pinned* identity answering at a new address
+/// updates `cluster_peer_addr` on its own, no human involved — the pinned key, not the address,
+/// is the trust anchor, exactly like existing MAC-based device IP-migration
+/// (`db::upsert_device`).
+async fn cluster_discovery_task(
+    node_id: String,
+    state: SharedState,
+    pool: SqlitePool,
+    rescan: Arc<Notify>,
+) {
+    let auto_pair = std::env::var("DOM_CLUSTER_AUTO_PAIR").as_deref() == Ok("true");
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(DISCOVERY_INTERVAL_SECS));
+    // Burst, matching discovery_task: if a probe round takes longer than the interval, the
+    // scheduler catches up with one extra run rather than skipping it — a missed candidate
+    // is a missed pairing opportunity, not just a stale reading.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+
+    loop {
+        // Also wakes on a manual rescan ('s'), same as discovery_task — a person triggering a
+        // rescan is very plausibly doing it because they just brought the peer online.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = rescan.notified() => {}
+        }
+
+        let paired_addr = db::cluster_peer_addr(&pool).await.unwrap_or(None);
+        let pinned_key = db::cluster_peer_pubkey(&pool).await.unwrap_or(None);
+
+        let devs: Vec<devices::Device> = {
+            let app = state.read().unwrap();
+            app.last_ping_devices.clone()
+        };
+        let lease_ips: Vec<IpAddr> = {
+            let app = state.read().unwrap();
+            app.mikrotik_readings
+                .values()
+                .flat_map(|r| r.leases.iter())
+                .filter_map(|lease| lease.address.parse().ok())
+                .collect()
+        };
+        let candidates = merge_scan_targets(&devs, lease_ips);
+
+        let mut set = tokio::task::JoinSet::new();
+        for ip in candidates {
+            let addr = format!("{ip}:{CLUSTER_HEARTBEAT_PORT}");
+            if Some(&addr) == paired_addr.as_ref() {
+                // Already covered by cluster_task's own heartbeat every tick — no reason to
+                // double-probe the peer's listener from two tasks every cycle.
+                continue;
+            }
+            let node_id = node_id.clone();
+            set.spawn(async move { (addr.clone(), heartbeat_once(&addr, &node_id).await) });
+        }
+
+        while let Some(res) = set.join_next().await {
+            let Ok((addr, Ok(reply))) = res else {
+                continue;
+            };
+            if reply.node_id == node_id {
+                // This node's own IP was among the candidates — not a peer.
+                continue;
+            }
+
+            if pinned_key.as_deref() == Some(reply.public_key.as_str()) {
+                if paired_addr.as_deref() != Some(addr.as_str()) {
+                    log::info!("cluster: peer's address changed to {addr}");
+                    if let Err(e) = db::set_cluster_peer_addr(&pool, &addr).await {
+                        log::warn!("cluster: could not record the peer's new address: {e:#}");
+                    }
+                }
+                continue;
+            }
+
+            if auto_pair {
+                log::info!(
+                    "cluster: DOM_CLUSTER_AUTO_PAIR set — pinning discovered peer at {addr} \
+                     automatically (test harness only; a real install confirms in the TUI)"
+                );
+                if let Err(e) = db::set_cluster_peer_addr(&pool, &addr).await {
+                    log::warn!("cluster: could not record the discovered peer's address: {e:#}");
+                }
+                if let Err(e) = db::set_cluster_peer_pubkey(&pool, &reply.public_key).await {
+                    log::warn!("cluster: could not pin the discovered peer's identity: {e:#}");
+                }
+            } else {
+                log::info!(
+                    "cluster: found a candidate peer at {addr} — awaiting pairing confirmation"
+                );
+                state.write().unwrap().cluster_pairing_prompt = Some(app::ClusterPairingPrompt {
+                    addr,
+                    node_id: reply.node_id,
+                    public_key: reply.public_key,
+                    replaces_pin: pinned_key.is_some(),
+                });
+            }
+        }
+    }
+}
+
 /// Returns true if `ip` already has a poll loop running.
 fn already_polled(ip: IpAddr, state: &SharedState) -> bool {
     state.read().unwrap().polled_ips.contains(&ip)
@@ -1316,6 +2185,52 @@ mod tests {
             .with_ymd_and_hms(2026, 8, 23, h.parse().unwrap(), m.parse().unwrap(), second)
             .earliest()
             .unwrap()
+    }
+
+    /// The local day the fallback tests place their plans in.
+    fn a_day() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 3, 14).unwrap()
+    }
+
+    fn local_hhmm(t: chrono::DateTime<Utc>) -> String {
+        t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+    }
+
+    #[test]
+    fn the_timer_fallback_runs_at_the_users_own_clock_times() {
+        let plan = timer_fallback_plan("09:00", "18:00", a_day()).unwrap();
+        assert_eq!(local_hhmm(plan.on_at), "09:00");
+        assert_eq!(local_hhmm(plan.off_at), "18:00");
+        assert_eq!(plan.date, a_day());
+        // Nothing was predicted — this window was placed by the clock, not
+        // scored, and the TUI reads exactly this to say so.
+        assert_eq!(plan.predicted_grid_wh, None);
+        assert!(!plan.on_fired && !plan.off_fired);
+    }
+
+    #[test]
+    fn a_timer_fallback_across_midnight_lands_on_the_next_day() {
+        let plan = timer_fallback_plan("22:00", "05:00", a_day()).unwrap();
+        assert_eq!(local_hhmm(plan.on_at), "22:00");
+        assert_eq!(local_hhmm(plan.off_at), "05:00");
+        assert!(
+            plan.off_at > plan.on_at,
+            "the off leg should be the following morning, not the same one"
+        );
+        assert_eq!(
+            plan.off_at - plan.on_at,
+            chrono::Duration::hours(7),
+            "a wrapping pair should keep the length its timers imply"
+        );
+    }
+
+    #[test]
+    fn a_zero_length_timer_pair_has_no_fallback_to_offer() {
+        // `duration_steps_from_timers` rejects it, and there is nothing
+        // sensible to invent — this is the one case that still leaves the
+        // relay alone.
+        assert!(timer_fallback_plan("09:00", "09:00", a_day()).is_none());
+        assert!(timer_fallback_plan("not a time", "18:00", a_day()).is_none());
     }
 
     #[test]

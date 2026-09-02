@@ -1106,3 +1106,440 @@ table so that adding a setting needs no migration. A stored choice wins over det
 subsequent start — detection only decides for a user who has never chosen. Absence of the key
 is what "never chosen" means, so `get_config` returning `None` is an ordinary result and not an
 error.
+
+## Eco mode for myStrom switches (2026-08-30)
+
+### Problem
+The heat pump ("Hot Water Heatpump", a myStrom switch) was run by a fixed 09:00–18:00 timer
+pair. That is a manual guess at when solar production is likely, not a response to it, and on a
+cloudy day it draws from the grid exactly as readily as on a sunny one.
+
+Two shapes were considered and rejected before landing on the one below. First, a fixed
+"night" fallback for days without enough sun, priced against the local off-peak (HT/NT) tariff:
+rejected because no general Swiss open-data source publishes HT/NT clock windows — they are set
+per grid operator and published only as an annual PDF specific to that operator, unlike the
+federal, standardised sources (swisstopo, MeteoSwiss, Open-Meteo) everything else in `online/`
+uses. It would also have been moot: EKZ's own 2026 tariff (the operator for this installation)
+abolishes the HT/NT split entirely, replacing it with a flat rate that varies by calendar
+quarter, not by hour of day — so even a perfect scraper would have had no daily price signal to
+report. Second, a live-surplus-chasing control loop shaped like `keba::eco_loop`: rejected
+because a compressor is not a variable current — flicking a relay on and off every tick the way
+Eco chases a wallbox's target current would short-cycle it.
+
+### Decision: predict, once a day, which single window minimizes grid import
+Eco mode picks one on/off window per local day, computed once (not re-evaluated as the forecast
+updates through the day — a day with a cloudy morning and a clear afternoon does not get a
+second chance once the day's plan is set) and fired exactly like a `SwitchTimers` pair. The
+window's *length* is not invented as new configuration: it is read from the device's own two
+existing timers (their clock-time gap), so enabling Eco still requires a timer pair to exist —
+only their placement stops mattering, since Eco recomputes where that same length runs best.
+
+Scoring slides that fixed-length window across the day in 15-minute steps (the forecast's native
+resolution) and, for each candidate start, sums the switch's typical power draw minus whatever
+solar surplus is left over after the rest of the household's typical load — floored at zero, and
+never crediting more surplus than the switch can use. This is the same "reconstruct what's
+actually spare" arithmetic `keba::eco_decision` uses for the wallbox, reapplied to a placement
+decision instead of a live current. "Typical power" and "typical other load" both come from up
+to fourteen days of the device's own recorded history (`EnergyMinute`), not a manually configured
+energy target — a fixed load times a fixed duration already reconstructs the daily energy figure
+that config would have named, without a second number that could disagree with the first.
+
+### Ties are the expected outcome, not an edge case
+On a day with no solar surplus at all, every candidate window scores identically — the switch's
+full draw for its full duration, regardless of when it runs. Rather than inventing a tiebreaker
+(earliest hour, latest hour, an assumed cheap-tariff window that the tariff research above showed
+does not reliably exist), Eco mode picks uniformly at random among every window within a small
+tolerance of the best score. A single "night" branch would have needed its own justification for
+*which* hours count as night; picking at random among truly-equivalent options needs none.
+
+### A day Eco cannot score falls back to the device's own timer (2026-09-01)
+Eco originally did nothing at all on a day it could not plan — no forecast, no calibration, or
+no recorded history for the switch. `timer_job` skips non-`Time` switches and `eco_job` skipped a
+switch with no plan, so the relay was left wherever it happened to be, indefinitely. On a new
+install that is a deadlock: the tank never heats because there is no history, and history never
+accumulates because the tank never heats.
+
+The fallback is now the device's own configured on/off pair, at the clock times the user set,
+synthesized as an `EcoPlan` with `predicted_grid_wh: None` and fired through the same path a
+scored plan is. This is **not** the "night fallback" rejected above: that one would have invented
+a clock window out of an off-peak tariff signal that does not exist for this operator. This one
+defers to a schedule the user configured, can see, and already trusted before Eco was switched
+on — Eco replaces the timer's *placement*, so on a day it cannot place anything, the placement it
+was replacing is the honest answer. The TUI labels it "timer fallback" rather than presenting the
+user's own clock times as something Eco chose.
+
+A fallback plan is sticky for the local day, like a scored one. Retrying through the day and
+upgrading to a real plan on arrival of data would build a fresh `EcoPlan` with `on_fired: false`
+and switch a tank that had already been heated back on.
+
+### Missing history means "unknown", never "idle"
+`query_avg_power_by_local_quarter_hour` omits a quarter-hour entirely when no `EnergyMinute` row
+covers it across the whole lookback — the device was unreachable, or not yet added. That is not
+the same as a step that averaged zero: a switch sitting off is still polled, and its `energy_ws
+= 0` is written like any other reading. The baseline used to read both through `unwrap_or(0.0)`,
+which asserted the rest of the house drew nothing during the hours there was no data for — so
+those hours showed the full forecast production as spare surplus, and the window was biased
+straight toward whichever part of the day was least observed. The bias is sharpest where an
+unrecorded step still has sun on it: a hazy unrecorded morning would beat a strong midday whose
+heavy house load was actually measured.
+
+Steps are now known only where both curves have them, unknown steps are imputed with the mean of
+the known ones, and a curve with fewer than half the day's steps known produces no baseline at
+all — deferring to the timer rather than planning against mostly-guesswork.
+
+The same reasoning applies to the forecast, in the one place it is genuinely ambiguous: a missing
+forecast and a fully overcast day both score every window identically, but they want opposite
+answers — the second is the designed random tie-break above, the first has no solar signal to
+place anything against. They are indistinguishable after scoring, so Eco counts how many of the
+day's 96 steps actually arrived and falls back below half. Open-Meteo serves the whole day at
+15-minute resolution in one document, so a normal day has all 96 and a short count means the
+fetch has not landed, not that the sky is dark.
+
+## High availability: a two-node active/standby cluster (2026-08-30)
+
+### Status
+Designed, not yet implemented. This is the decision log for a future feature: running two Dom
+instances — two Raspberry Pis, or a Pi and a server — as an active/standby pair that discovers
+its own peer, elects which side actuates hardware, fails over automatically, and reconciles its
+own data, with no user input after the one-time setup that pairs them. The design target is ten
+years of unattended operation. Nothing below exists in the code yet; it is recorded ahead of
+implementation because the decisions here — particularly the reconciliation mechanism — shape the
+schema and the write path in ways that are much cheaper to settle before code exists than after.
+
+### Problem
+Dom runs as a single process against a single SQLite file. Today that file, and the machine under
+it, is a single point of failure for something that increasingly matters continuously: the heat
+pump's schedule, the wallbox's Eco control loop, the network health log. A second machine removes
+the single point of failure only if it can take over *without anyone present to tell it to* — the
+premise is explicitly that nobody is watching for a decade at a time.
+
+### Decision: split-brain is designed around, not solved
+Two nodes with no third arbiter cannot, in general, distinguish "my peer has failed" from "I
+cannot reach my peer" — this is not a gap to be engineered away, it is the two-node impossibility
+result, and any design that claims to solve it outright is wrong. The mitigation here leans on a
+fact specific to this application rather than a general consensus protocol: every actuation Dom
+performs is an idempotent level-command ("relay on", "set current to N") rather than a
+transaction. Two nodes both deciding to send the same command is harmless; the only real hazard is
+two nodes *disagreeing* — one commanding on, the other off — which manifests as a flapping relay,
+not corrupted state. That is a materially smaller problem than general-purpose HA needs to solve.
+
+Each node treats reachability of the LAN gateway as the partition discriminator. A node that can
+reach the gateway but not its peer concludes the peer is down and may take over. A node that
+cannot reach the gateway at all cannot tell the two cases apart, and must not guess — it demotes
+itself and stops actuating (while continuing to measure; see the ambiguity decision below) until
+connectivity returns. This is backed by a static priority between the two nodes to remove
+ambiguity in the case where both can reach each other and the gateway.
+
+Fencing — forcibly power-cycling a presumed-dead peer, which this project could plausibly do via a
+myStrom switch, since it already drives them — was considered and rejected. It would add a
+physical wiring dependency between the two nodes that itself has to survive a decade unattended,
+which is a worse bet against "no user input for ten years" than the residual flapping risk it
+would remove.
+
+### Decision: reconciliation is "one canonical source per time range", never a blend
+Both nodes measure independently and continuously (see the polling decision below), so after any
+period where both were active — a genuine partition, or simply both booting before the first
+election completes — two divergent readings exist for the same stretch of wall-clock time.
+Reconciling them by merging or averaging the two series was rejected outright: this codebase has
+already learned, once, exactly how dangerous that is. `devices::max_integration_gap_ms` and the
+incident in its own documentation — a stalled poll loop that smeared 10.8 kWh into a single row
+and inflated a day's total by 23% while looking entirely plausible — exist because interpolating
+or blending across an uncertain interval invents energy that nothing actually measured. Averaging
+two nodes' independently-jittered readings of the same instant is the cluster-scale version of the
+same mistake.
+
+Instead, the design adds one small, load-bearing, replicated table: an append-only log of which
+node held primary during which wall-clock interval (node, start, end — analogous in spirit to
+`RollupProgress`, a small table that exists purely to make a policy answerable rather than to hold
+measurements itself). Every query that reads energy history for a given range reads through this
+log first and takes that range's data from whichever node was primary at the time, full stop. The
+standby's parallel stream is a fallback for when the primary's own data has a hole — a card
+failure mid-day, say — not a second vote to be averaged in. Without this log, "whose reading is
+authoritative for 14:00–14:30 last Tuesday" becomes unanswerable after the fact; with it, the
+question never needs asking live, only recorded once and read back.
+
+### Decision: both nodes poll every device at full rate
+The standby polls the Sonnen at 2 s and the wallbox at 5 s exactly as the primary does, rather than
+at a reduced rate or buffering unwritten — chosen for zero data gap at failover, at a stated cost:
+the README sizes those intervals against a Raspberry Pi 2 and an SD card's write endurance, and
+says the 2-second series alone grows the database by roughly 1 GB a month before rollup. Running
+two nodes at full rate is two SD cards independently absorbing that same load, not a shared one.
+Accepted as the trade-off worth making; a node whose hardware cannot sustain it is expected to be
+sized up front (a server-class backup, or a card rated for the write volume) rather than the
+software silently degrading its resolution.
+
+### Decision: failback is sticky
+When a demoted primary recovers, it does not automatically reclaim primary — whichever node is
+currently active stays active, and the returning node rejoins as standby. It only takes over again
+if the *currently* active node later fails. A static-priority scheme where the designated primary
+always reclaims was considered and rejected: it guarantees a second disruptive role-flip
+immediately after the first, on every single recovery, in exchange for a predictability this
+household-scale deployment does not need.
+
+### Decision: ambiguity pauses actuation, not measurement, and raises a local alarm
+A node that cannot confirm it is safely the sole actuator (gateway unreachable, or the brief window
+right after a partition heals) stops sending commands to hardware but keeps polling and recording
+— losing a stretch of automated heating control is a minor inconvenience; two systems disagreeing
+about a relay is the hazard this whole design exists to avoid, so silence is the safe default.
+
+That silence has to be visible to a person, which is a new concern for Dom: nothing today alerts a
+human to anything (the README lists Household/alarm devices as an explicitly unimplemented
+category). The state machine here raises one of a small set of conditions — actuation paused,
+peer unreachable, replication protocol mismatch (see below), or a split-brain interval discovered
+after the fact via an overlap in the leadership log — through a signal call the HA logic itself
+does not interpret. A `LogAlarm` (`log::error!`, always available, no hardware dependency) is the
+floor every node has; a `LedAlarm` — Raspberry Pi GPIO — is the natural first real one, chosen
+because it is local and needs no other system to be working. That locality is load-bearing: a
+cloud or push-notification channel cannot be the *only* one, because network trouble is one of the
+very conditions the alarm exists to report, and the node most in need of alerting is often the one
+that cannot reach anything external. The TUI gets an analogous panel to the Network view's
+Security panel — absent when nominal, present the moment it is not — so the same fact is visible
+locally on screen as well as through whatever alarm hardware exists.
+
+### Decision: what must replicate for a failover to actually be seamless
+Checked before assuming measurements alone would do: TLS pinning (`Devices.tls_fingerprint`) and
+the solar calibration (`Config`) are learned locally per database. A backup that only received
+measurement history would, on promotion, refuse every MikroTik it has never connected to (trust-
+on-first-use has nothing to trust yet) and predict zero solar production (no fitted array
+response). Replication therefore has to cover device identity and credentials (`Devices`:
+API keys, TLS pins, auto-mode, timers) and site configuration (`Config`: calibration, location,
+electrical supply) — not only the `Energy`/`EnergyMinute`/`RawDeviceMeasurements` series — or
+"fully automatic takeover" would be true for the dashboard and false for half the hardware.
+
+### Decision: a schema/protocol version mismatch demotes rather than merges
+Over a decade the two nodes will not always run the same build — an unattended update to one and
+not the other is the ordinary case this design has to survive, not an edge case. A node that sees
+its peer advertising a newer replication-protocol or schema version refuses to merge and demotes
+itself (raising the alarm above) rather than attempting a translation that might silently drop or
+misinterpret a field it does not understand. One node sitting out until someone eventually updates
+the other is the acceptable failure mode; quiet data corruption ten years in is not.
+
+### Decision: discovery reuses the existing scan pipeline; mDNS was rejected
+Superseded from an earlier pass of this design, which called for mDNS ("pairing once, then mDNS
+forever"). That was wrong on inspection: Dom does not actually use mDNS for *any* existing device
+discovery — every device (myStrom, MikroTik, Sonnen, Keba) is found via the ARP/ping scan → DHCP
+leases → HTTP fingerprint pipeline (`discovery_task`, `fingerprint.rs`, `devices::detect_type`), so
+mDNS would have been a second, novel, redundant mechanism, not a consistent one. It also doesn't
+traverse the Docker bridge network the test harness uses without extra configuration (`compose.yaml`
+used to carry this exact caveat). A peer Dom instance is just another thing on the LAN the existing
+pipeline can find — `main::cluster_discovery_task` probes every candidate IP `discovery_task`
+already gathers, deliberately *not* folded into `detect_type`'s device chain, because a peer isn't
+a sensor to add to `Devices` and poll, it's a cluster relationship a human needs to confirm before
+anything trusts it (see below). This survives IP changes, reboots, and a full hardware swap the
+same way MAC-based device IP-migration already does — once a peer's identity is pinned, discovery
+keeps recognizing it at a new address on its own; see "identity, not address, is the trust anchor"
+below.
+
+### Decision: a signed, replay-resistant heartbeat — and why the wire format matters
+The heartbeat exchange (`cluster::HeartbeatRequest`/`HeartbeatReply`, `main::heartbeat_once`) is now
+authenticated: each node has a persistent Ed25519 keypair (`db::get_or_create_cluster_keypair`),
+and every reply is signed. Two details here were not obvious and are worth recording so they are
+not accidentally undone:
+- **The signature covers explicit length-prefixed bytes, not `serde_json` output.** JSON's byte
+  encoding (field order, escaping, whitespace) is an implementation detail of the serializer, not a
+  contract — signing over it would silently break the moment a field is added or a serde version
+  changes, in a way nothing catches at compile time. `cluster::signable_bytes` builds the bytes
+  explicitly instead.
+- **The reply is bound to a fresh nonce the requester generates every call.** Without this, a
+  captured valid signed reply (a real peer's honest "I'm active") could be replayed by anything
+  with network position, indefinitely, to make a dead peer look alive and prevent the failover this
+  whole design exists to enable — a signature that doesn't stop replay is *worse* than no
+  authentication, because it looks like a guarantee it doesn't provide. `HeartbeatRequest::nonce` /
+  `HeartbeatReply::request_nonce` close this: a reply that doesn't echo the nonce just sent is
+  rejected outright (`heartbeat_once`).
+
+### Decision: identity, not address, is the trust anchor — and pairing still takes one human action
+`cluster_peer_pubkey` (`Config`), not `cluster_peer_addr`, is what a paired node actually trusts:
+`cluster_discovery_task` auto-updates the address on its own whenever the *pinned* key is found at
+a new IP, no human involved — exactly like existing MAC-based device IP-migration, just keyed on a
+cryptographic identity instead of a MAC address. But nothing is trusted the first time without one
+explicit confirmation per node (`App::cluster_pairing_prompt`, the Network view's "Cluster" panel,
+key `'p'` — modeled directly on the existing TLS-certificate-acceptance flow). This is the one
+deliberate exception to "no user input for ten years": discovery finding a candidate and *silently*
+pairing with it would let anything answering on the LAN — a neighbor's Dom, a VLAN misconfiguration
+— join the cluster just by being reachable. An unpinned discovery probe's signature verification
+(`cluster::verify_reply`) is worth stating plainly: it proves the responder holds *some* private key
+matching its own claim, not that it's the intended peer. Real trust starts only once a human pins a
+specific key; that verification is a sanity check on the wire format, not a trust decision.
+
+A paired node whose peer answers with a key that no longer matches the pin (most plausibly: the
+peer was reinstalled or reset and generated a new keypair) does not silently trust the new key or
+silently get stuck — it raises `AlarmCondition::PeerIdentityMismatch` and populates the same
+re-pair prompt a fresh discovery candidate would, so a human can look and decide.
+
+`DOM_CLUSTER_AUTO_PAIR` (`compose.yaml` only) is the one env-var-only exception to the
+human-confirmation rule, standing in for the TUI keypress a headless container has no TTY to
+receive — it exercises the real discovery → sign → verify → pin path, skipping only the "wait for
+a person" step, and — like `DOM_CLUSTER_PEER_ADDR`/`DOM_CLUSTER_IS_PRIMARY` before it — is never
+written to `Config`, so it can't end up set in a real deployment by accident.
+
+The heartbeat channel still has no encryption and the listener still never authenticates who is
+connecting to it (only the *consuming* side — `heartbeat_once` checking a reply — verifies
+anything, mirroring how MikroTik's TLS pinning only has the Dom client verify the server, never the
+reverse). That remains a reasonable trust level for what the channel actually carries — a node id,
+a public key, and a boolean role claim, never a credential or an actuation command — matching the
+LAN trust level Dom already extends elsewhere (myStrom commands are unauthenticated cleartext HTTP
+today).
+
+### Left open for implementation planning
+Deliberately not decided yet, because they are implementation choices rather than the value
+judgements above: the concrete replication transport and message shape; the exact timers for
+"unreachable long enough to demote" and "unreachable long enough to take over"; whether the
+leadership log and the config/credential replication share one mechanism or two; and how a third
+or later node (if this ever grows past a pair) would change the priority and quorum story. None of
+these should be settled by default while writing code — they belong in their own design pass.
+
+### First slice implemented: the pure role decision, the alarm entry point, the leadership log
+`src/cluster.rs` (`decide_role` and its types), `src/alarm.rs` (`AlarmSink`/`LogAlarm`), the
+`LeadershipEpochs` table and its `db.rs` primitives, and `main::cluster_task` wiring them to real
+data (gateway reachability via the already-tracked Router status, peer status honestly
+`PeerStatus::NotPaired` since no pairing mechanism exists) are implemented and tested. This is the
+foundation the peer-networking layer — deliberately left open above — plugs into once it has its
+own design pass; nothing about pairing, replication, or GPIO exists yet.
+
+### A container harness now exists for testing with more than one instance
+`Dockerfile` and `compose.yaml` bring up two independent `dom` containers (`dom-a`, `dom-b`), each
+with its own volume, as a stand-in for two separate machines when there are not two Raspberry Pis
+on hand. Verified end to end: both instances start headless, each generates and persists its own
+`cluster_node_id`, each records its own `LeadershipEpochs` row, and a restart preserves that node's
+id while correctly closing the old epoch and opening a new one — exactly what `db.rs`'s doc
+comments claim.
+
+This does not yet prove anything about failover, because there is still no peer-pairing code for
+the two containers to use — they simply run solo, side by side. It is the harness that pass should
+run against once it exists, with one caveat worth remembering then rather than rediscovering it:
+Docker's default bridge network does not forward multicast between containers, so mDNS-based
+discovery specifically will need `network_mode: host` or a macvlan network in `compose.yaml`, not
+the default bridge it uses today.
+
+### Second slice implemented: a real heartbeat, a real peer status, and a cold-start bug fixed
+The container harness above made a real peer connection buildable and testable, so this pass
+replaced `cluster_task`'s hardcoded `PeerStatus::NotPaired` with an actual TCP heartbeat between
+two nodes, added the static primary/backup designation `decide_role` needs to break ties, and
+fixed a real defect the design review before this pass caught in the *previous* slice's own code.
+
+**The bug**: `App::default().cluster_role` and `cluster_task`'s local `role` both defaulted to
+`Role::Active` — correct for solo mode, but once a peer is configured, two nodes booting together
+(or recovering from a shared power outage) would both start believing they were active before
+either had heard from the other. The fix isn't only a different default: `PeerStatus` gained a
+fourth variant, `Establishing` — "peer configured, no heartbeat has ever succeeded yet" — kept
+distinct from `Unreachable` ("was reachable, now confirmed gone"), because collapsing the two
+would reintroduce the same bug one layer down. `decide_role` treats them very differently:
+`Establishing` defers to the static primary/backup designation (only the primary ever claims
+`Active` during that window, so the two nodes can never both claim it), while `Unreachable` is the
+real failover trigger and applies unconditionally, not gated by the designation — a backup that
+waited for permission before taking over a genuinely dead primary would defeat the point of having
+one. `cluster_task`'s local `role` also now starts `Standby` (not `Role::default()`) whenever a
+peer is configured, so `currently_active` starts honest rather than optimistic — belt and
+suspenders alongside the `Establishing` fix, since only `PeerStatus::Reachable` branches ever
+consult `currently_active`.
+
+A second review pass, after the first fix landed, caught a related instance of the same class of
+bug: `App::default().cluster_role` (used by `cluster_heartbeat_listener_task`, which answers a
+peer's heartbeat directly from `state.cluster_role`) was still `Active`, and `main()` spawned that
+listener before `cluster_task`'s first tick had a chance to correct it — a paired node that
+received a heartbeat in that window would answer `claims_active: true` while actually `Standby`,
+which could make its peer wrongly detect a split brain and demote itself. Fixed by moving the
+`Standby`-when-paired seeding out of `cluster_task` and into `main()`, applied synchronously to
+`state.cluster_role` *before* either cluster task is spawned — the window is now provably zero
+rather than merely short, and `cluster_peer_addr` is read once in `main()` and passed to
+`cluster_task` rather than each task reading it independently. Verified by restarting the primary
+container five times in a row against an already-`Active` backup and checking for both a
+`SplitBrainDetected` alarm and any unwanted role flap on the backup — zero of either, every time.
+
+**Primary/backup is a static `Config` key, not derived.** Deriving it (e.g. comparing node ids)
+would need the peer's id before it could be known, which is exactly the bootstrap-ordering problem
+`Establishing` exists to avoid — and whoever pairs two nodes already has an opinion on which is
+which. `cluster_peer_addr`/`cluster_is_primary` (`db.rs`) read an env var
+(`DOM_CLUSTER_PEER_ADDR`/`DOM_CLUSTER_IS_PRIMARY`) first, falling back to `Config` — the same
+manually-set, no-UI pattern `SUPPLY_KEYS` already uses. The env var exists only so `compose.yaml`
+can declare pairing for the test harness without a bootstrap-write step; a real install just sets
+`Config` directly.
+
+**The heartbeat itself** is a plain directed TCP exchange, not multicast — deliberately decoupled
+from discovery so this slice could be built and tested on Docker's default bridge network, with
+mDNS-based auto-discovery left for its own later pass (see "discovery is pairing once, then mDNS
+forever" above — unchanged, just not yet implemented). Each side connects to the other's
+configured `host:port`, writes one `cluster::HeartbeatMessage` (`node_id`, `claims_active`) as a
+JSON line, and reads the peer's reply the same way; `cluster_heartbeat_listener_task` answers
+whoever connects with this node's current claim. Every step is individually timeout-bound
+(`CLUSTER_HEARTBEAT_TIMEOUT`, 2s) so one unresponsive attempt cannot stall a tick. Cadence is
+`CLUSTER_HEARTBEAT_INTERVAL_SECS` (5s, faster than the other background tasks' 30s because
+failover latency matters here), and a peer is only declared `Unreachable` after
+`CLUSTER_PEER_LOST_AFTER_FAILURES` (3) consecutive failures — mirroring
+`devices::LOST_AFTER_FAILURES`'s reasoning that one dropped packet must not trigger a failover on
+a healthy cluster; short of that threshold, the last known claim is reported rather than flipping
+straight to `Establishing`/`Unreachable`; matches `devices::ConnStatus::Connecting`'s precedent.
+
+**No authentication on the heartbeat channel — a deliberate choice for this slice, not an
+oversight**, superseded by the next slice below ("a signed, replay-resistant heartbeat"), which
+adds exactly the authentication anticipated here once discovery made "which Dom on the LAN did I
+just find" a real question. Left in place as a record of the reasoning at the time, not corrected
+in place: an unsalted shared secret would have protected nothing a channel already trusted by
+network position, which is why this slice didn't reach for one, even though it turned out
+authentication was worth adding once discovery replaced a manually-set address.
+
+**Verified end to end**, using the container harness with real pairing configured: bringing both
+`dom-a` (primary) and `dom-b` (backup) up together produced `dom-a` → `Active`, `dom-b` →
+`Standby`, with **no** split-brain alarm during startup — the concrete proof the cold-start fix
+holds under real concurrent OS processes, not just the unit tests. `docker compose stop dom-a`
+produced a `PeerUnreachable` alarm on `dom-b` and a role change to `Active` within the expected
+~15–20s window, with a new `LeadershipEpochs` row opened under `dom-b`'s own node id. Restarting
+`dom-a` afterward had it rejoin as `Standby` — sticky failback holding, not just asserted in this
+document — and `dom-b`'s alarm cleared once contact resumed.
+
+This run also caught and fixed a second, smaller bug: the role-transition log (and the
+`epoch_opened` flag guarding it) had been written on the assumption that a node is either freshly
+started or already logged its one and only transition into `Active`; a node that starts and stays
+`Standby` never satisfies either, so it re-logged "role is now Standby" every single tick forever.
+Replaced with a `started` flag that tracks "has this task's first tick been processed" instead of
+"has this node ever gone active" — a distinction that only mattered once `Standby` became a real,
+persistent steady state rather than something only ever seen mid-transition.
+
+One honest limitation of the harness surfaced by this verification, worth recording rather than
+working around: `gateway_reachable` reuses the Network view's router-discovery signal
+(`app::classify_network_devices`), which needs a device labeled "router" or a discovered
+MikroTik — neither of which exists inside an isolated Docker bridge network. Left as designed, the
+harness's `gateway_reachable` never becomes `true`, so both nodes sit at `Paused` indefinitely; the
+`Active`/`Standby`/failover/failback run described above was captured with that one check
+temporarily forced `true` for the duration of the test, then reverted before this was written —
+nothing about gateway-reachability's real logic changed, and the heartbeat protocol itself was
+independently confirmed working (successful JSON exchanges, correct node ids, correct
+`claims_active` values) with the real check left in place. A real two-Raspberry-Pi deployment has
+an actual router to discover and does not have this gap; closing it for the container harness
+specifically (e.g. a fake discoverable "router" device) was judged not worth the scope for this
+pass.
+
+### Third slice implemented: discovery, cryptographic pairing, and a live-repairing bug found
+Implements the discovery/identity design above: `cluster::HeartbeatRequest`/`HeartbeatReply`/
+`signable_bytes`/`sign_reply`/`verify_reply`, `db::get_or_create_cluster_keypair`/
+`cluster_peer_pubkey`/`set_cluster_peer_pubkey`/`set_cluster_peer_addr`, `main::heartbeat_once`
+rewritten to sign and verify, `main::cluster_heartbeat_listener_task` signing its replies,
+`main::cluster_discovery_task` (new), and `App::cluster_pairing_prompt`/the Network view's
+"Cluster" panel/key `'p'` for the one human confirmation this design still requires.
+
+**A second cold-start-shaped bug, caught only by testing the dynamic path.** `cluster_task` read
+`peer_addr`/`cluster_is_primary`/`cluster_peer_pubkey` once at startup and never again — fine when
+pairing was a human hand-editing `Config` and restarting, silently wrong now that pairing happens
+while the process is already running (a TUI confirm, or discovery auto-pairing): a node paired
+after boot kept running in `PeerStatus::NotPaired` forever, never noticing. Caught by the container
+harness specifically *because* it exercises pairing happening live, which no unit test does. Fixed
+by re-reading all three from `Config` every tick; an address change specifically (not a same-address
+pin update) resets the task's local `role`/`consecutive_failures`/`ever_reachable` tracking to the
+same values a fresh process boot would use — otherwise a node transitioning from solo to paired
+would carry over a stale `role: Active` into `decide_role`'s `currently_active` input, reopening
+the exact split-brain window `PeerStatus::Establishing` exists to close, just triggered by a live
+transition instead of a simultaneous boot.
+
+**Verified end to end** with the container harness, `DOM_CLUSTER_AUTO_PAIR=true` and no
+`DOM_CLUSTER_PEER_ADDR` set on either side: `cluster_discovery_task` found the peer over the
+Compose bridge network on its own (no address ever set by hand), pinned its identity, and
+`cluster_task` picked up the new pairing within one tick — logging the transition and moving to
+`Paused` immediately (gateway still undiscoverable in this harness, as in the prior slice). With
+`gateway_reachable` temporarily forced (same one-check, reverted-after technique as before): the
+primary went `Active` and the backup `Standby` with no split-brain alarm, confirming the cold-start
+fix still holds now that pairing is dynamic rather than present at boot. Separately, wiping one
+container's volume (a fresh random keypair, simulating a reinstalled peer) and restarting it at the
+same address produced repeated, correctly-labeled `PeerIdentityMismatch` warnings on the other side
+— "answered by an identity that doesn't match the pin... treating as unreachable until re-paired" —
+rather than either silently trusting the new key or silently getting stuck with no explanation.

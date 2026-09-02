@@ -20,7 +20,9 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+pub mod alarm;
 pub mod app;
+pub mod cluster;
 pub mod db;
 pub mod devices;
 pub mod energy;

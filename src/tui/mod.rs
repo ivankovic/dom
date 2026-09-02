@@ -47,21 +47,29 @@ enum DetailSlot {
     AddTimer,
 }
 
+/// Whether a switch's timer list (and "+ Add timer" row) is shown for the
+/// given mode — Time mode runs them directly; Eco mode reads only their
+/// *length* (see `devices::mystrom_switch`'s "Eco mode" docs) but still shows
+/// and edits them the same way, since that is how its window's duration is
+/// set.
+fn shows_timers(mode: Option<&SwitchAutoMode>) -> bool {
+    matches!(mode, Some(SwitchAutoMode::Time) | Some(SwitchAutoMode::Eco))
+}
+
 fn detail_slot(app: &App, ip: IpAddr) -> DetailSlot {
-    let is_time = matches!(app.switch_auto_modes.get(&ip), Some(SwitchAutoMode::Time));
+    let shows_timers = shows_timers(app.switch_auto_modes.get(&ip));
     let n = app.switch_timers.get(&ip).map(|t| t.len()).unwrap_or(0);
     match app.detail_row {
         0 => DetailSlot::Relay,
         1 => DetailSlot::Auto,
-        r if is_time && r >= 2 && r < 2 + n => DetailSlot::Timer(r - 2),
-        _ if is_time => DetailSlot::AddTimer,
+        r if shows_timers && r >= 2 && r < 2 + n => DetailSlot::Timer(r - 2),
+        _ if shows_timers => DetailSlot::AddTimer,
         _ => DetailSlot::Auto,
     }
 }
 
 fn max_detail_row(app: &App, ip: IpAddr) -> usize {
-    let is_time = matches!(app.switch_auto_modes.get(&ip), Some(SwitchAutoMode::Time));
-    if is_time {
+    if shows_timers(app.switch_auto_modes.get(&ip)) {
         2 + app.switch_timers.get(&ip).map(|t| t.len()).unwrap_or(0)
     } else {
         1
@@ -84,6 +92,16 @@ fn toggled_keba_mode(app: &App, ip: IpAddr) -> devices::keba::ChargingMode {
         Some(ChargingMode::Eco) => ChargingMode::EcoCarFirst,
         Some(ChargingMode::EcoCarFirst) => ChargingMode::Disabled,
         _ => ChargingMode::FullPower,
+    }
+}
+
+/// The mode Enter would switch a myStrom switch's auto-mode to next:
+/// Disabled → Time → Eco → Disabled.
+fn toggled_switch_auto_mode(current: Option<&SwitchAutoMode>) -> SwitchAutoMode {
+    match current {
+        Some(SwitchAutoMode::Time) => SwitchAutoMode::Eco,
+        Some(SwitchAutoMode::Eco) => SwitchAutoMode::Disabled,
+        _ => SwitchAutoMode::Time,
     }
 }
 
@@ -221,6 +239,28 @@ async fn event_loop(
                     }
                 };
 
+                // Confirming a discovered (or re-identified) cluster peer — see
+                // App::cluster_pairing_prompt. Same gating as accept_cert: only from
+                // the Network view, where the prompt is shown, and only while no
+                // text input is open.
+                let confirm_pairing: Option<crate::app::ClusterPairingPrompt> = {
+                    let app = state.read().unwrap();
+                    let is_p = matches!(
+                        &event,
+                        Event::Key(KeyEvent { code: KeyCode::Char('p' | 'P'), .. })
+                    );
+                    if is_p
+                        && app.view == View::Network
+                        && app.address_input.is_none()
+                        && app.rename_input.is_none()
+                        && app.timer_dialog.is_none()
+                    {
+                        app.cluster_pairing_prompt.clone()
+                    } else {
+                        None
+                    }
+                };
+
                 // Address entry is modal: while it is open, Enter looks the address
                 // up and every other key edits the buffer.
                 let address_save: Option<String> = if is_enter {
@@ -300,14 +340,9 @@ async fn event_loop(
 
                                         let auto: Option<(IpAddr, SwitchAutoMode)> =
                                             if is_enter && slot == DetailSlot::Auto {
-                                                let new = if matches!(
+                                                let new = toggled_switch_auto_mode(
                                                     app.switch_auto_modes.get(&dev.ip),
-                                                    Some(SwitchAutoMode::Time)
-                                                ) {
-                                                    SwitchAutoMode::Disabled
-                                                } else {
-                                                    SwitchAutoMode::Time
-                                                };
+                                                );
                                                 Some((dev.ip, new))
                                             } else {
                                                 None
@@ -386,6 +421,31 @@ async fn event_loop(
                             state.write().unwrap().cert_alerts.remove(&ip);
                         }
                         Err(e) => log::warn!("could not accept {ip}'s new certificate: {e:#}"),
+                    }
+                }
+
+                if let Some(prompt) = confirm_pairing {
+                    // Pin the peer's address and identity — the one explicit human action this
+                    // feature deliberately still requires (see SPECS.md). cluster_task/
+                    // cluster_discovery_task re-read both from Config on their own schedule, no
+                    // restart needed.
+                    let addr_result = crate::db::set_cluster_peer_addr(pool, &prompt.addr).await;
+                    let key_result =
+                        crate::db::set_cluster_peer_pubkey(pool, &prompt.public_key).await;
+                    match (addr_result, key_result) {
+                        (Ok(()), Ok(())) => {
+                            log::info!(
+                                "cluster: paired with {} at {}",
+                                prompt.node_id,
+                                prompt.addr
+                            );
+                            state.write().unwrap().cluster_pairing_prompt = None;
+                        }
+                        (addr_result, key_result) => {
+                            for e in [addr_result.err(), key_result.err()].into_iter().flatten() {
+                                log::warn!("cluster: could not save pairing: {e:#}");
+                            }
+                        }
                     }
                 }
 
@@ -846,6 +906,48 @@ mod tests {
         let app = App::default();
         assert_eq!(max_detail_row(&app, IP), 1);
         assert!(detail_slot(&app, IP) == DetailSlot::Relay);
+    }
+
+    #[test]
+    fn eco_mode_exposes_the_timer_list_too() {
+        // Eco reads the timer pair's *length*, not its clock time, but still
+        // shows and edits it exactly like Time mode does.
+        let mut app = app_with_switch(Some(SwitchAutoMode::Eco), 2);
+        assert_eq!(max_detail_row(&app, IP), 4, "relay, auto, two timers, add");
+        for (row, expected) in [
+            (0, DetailSlot::Relay),
+            (1, DetailSlot::Auto),
+            (2, DetailSlot::Timer(0)),
+            (3, DetailSlot::Timer(1)),
+            (4, DetailSlot::AddTimer),
+        ] {
+            app.detail_row = row;
+            assert!(detail_slot(&app, IP) == expected, "row {row}");
+        }
+    }
+
+    // ── Switch auto-mode cycling ──────────────────────────────────────────────
+
+    #[test]
+    fn enter_cycles_a_switch_through_every_auto_mode_and_back() {
+        let mut app = App::default();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let next = toggled_switch_auto_mode(app.switch_auto_modes.get(&IP));
+            seen.push(next.clone());
+            app.switch_auto_modes.insert(IP, next);
+        }
+        assert!(
+            matches!(seen[0], SwitchAutoMode::Time)
+                && matches!(seen[1], SwitchAutoMode::Eco)
+                && matches!(seen[2], SwitchAutoMode::Disabled),
+            "all three modes must be reachable, and the cycle must close"
+        );
+        // A fourth press returns to the start.
+        assert!(matches!(
+            toggled_switch_auto_mode(app.switch_auto_modes.get(&IP)),
+            SwitchAutoMode::Time
+        ));
     }
 
     // ── KEBA mode cycling ─────────────────────────────────────────────────────

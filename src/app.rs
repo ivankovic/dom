@@ -57,6 +57,33 @@ pub enum Focus {
 pub enum SwitchAutoMode {
     Disabled,
     Time,
+    /// Each day, run the on/off window predicted to draw the least from the
+    /// grid — see `devices::mystrom_switch::choose_window`.
+    Eco,
+}
+
+/// A day's computed Eco-mode plan for one switch: when to turn on, when to
+/// turn off, and what it was predicted to cost — recomputed once per local
+/// day by `main::eco_job`, never persisted (like `SolarOutlook`, it is a
+/// derived value rather than a fact worth storing).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EcoPlan {
+    /// The local day this plan is for — a plan is recomputed once `Utc::now()`
+    /// crosses into a new local day.
+    pub date: chrono::NaiveDate,
+    pub on_at: DateTime<Utc>,
+    pub off_at: DateTime<Utc>,
+    /// Predicted grid import for the window, Wh — shown so the plan reads as
+    /// more than a guess.
+    ///
+    /// `None` marks the *timer fallback*: a day Eco could not score, placed at
+    /// the device's own configured timer clock times instead. A fallback plan
+    /// predicts nothing, so there is no figure to show — see
+    /// `main::compute_eco_plan` for what makes a day unscoreable.
+    pub predicted_grid_wh: Option<f64>,
+    /// True once `on_at`/`off_at` have actually been sent to the switch.
+    pub on_fired: bool,
+    pub off_fired: bool,
 }
 
 #[derive(Clone)]
@@ -160,6 +187,20 @@ pub struct CertAlert {
     pub expected: String,
     /// The one it presented instead.
     pub observed: String,
+}
+
+/// A Dom peer found on the LAN (or an already-paired peer's identity no longer matching its pin),
+/// awaiting one explicit keypress before its key is trusted — see `App::cluster_pairing_prompt`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClusterPairingPrompt {
+    /// `host:port` to write as `cluster_peer_addr` if this is confirmed.
+    pub addr: String,
+    pub node_id: String,
+    /// Hex-encoded Ed25519 public key to pin as `cluster_peer_pubkey` if this is confirmed.
+    pub public_key: String,
+    /// `true` when confirming this would overwrite an existing pin (a re-pair, not a first
+    /// pairing) — purely for the prompt's wording, the confirm action is identical either way.
+    pub replaces_pin: bool,
 }
 
 /// How long a device may take to answer a poll before it is called slow, in
@@ -341,6 +382,24 @@ pub struct App {
     pub switch_auto_modes: HashMap<IpAddr, SwitchAutoMode>,
     /// Scheduled timers per switch device.
     pub switch_timers: HashMap<IpAddr, Vec<SwitchTimer>>,
+    /// Today's Eco-mode plan per switch device, once one has been computed —
+    /// see `EcoPlan`.
+    pub switch_eco_plans: HashMap<IpAddr, EcoPlan>,
+    /// This node's current cluster role — see `crate::cluster`. Defaults to `Active` (via
+    /// `Role::default()`), matching `cluster::decide_role`'s own answer for a node with no peer
+    /// configured — but that default is only trustworthy for the single-node case. `main()`
+    /// seeds this field synchronously with the *correct* starting value (`Standby` when a peer
+    /// is configured) before spawning `cluster_heartbeat_listener_task`, which answers a peer's
+    /// heartbeat from this field the moment it starts accepting connections — if it were left at
+    /// the raw default, a paired node could briefly claim `Active` to a peer that asks before
+    /// `main::cluster_task`'s own first tick corrects it.
+    pub cluster_role: crate::cluster::Role,
+    /// A discovered peer awaiting one explicit human confirmation before its identity is pinned
+    /// — see `main::cluster_discovery_task` (which populates this from an unrecognized reply) and
+    /// `main::cluster_task` (which populates it when a *paired* peer's identity no longer matches
+    /// the pin). Deliberately `Option`, not a map of many: this is a two-node design, there is
+    /// realistically at most one relevant prompt at a time.
+    pub cluster_pairing_prompt: Option<ClusterPairingPrompt>,
     /// When Some, the "Add Timer" popup is open.
     pub timer_dialog: Option<TimerDialog>,
     /// Currently focused row in the Detail panel (for switch sub-navigation).
@@ -438,6 +497,7 @@ impl App {
         self.device_energy_today.remove(ip);
         self.switch_auto_modes.remove(ip);
         self.switch_timers.remove(ip);
+        self.switch_eco_plans.remove(ip);
         self.last_network_status.remove(ip);
     }
 
