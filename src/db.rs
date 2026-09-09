@@ -26,6 +26,17 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
+    let pool = connect(uri).await?;
+    create_devices(&pool).await?;
+    create_schema(&pool).await?;
+    Ok(pool)
+}
+
+/// Opens the pool, puts the database into WAL mode and tightens its permissions.
+///
+/// Separated from the schema below only for length — nothing here is optional,
+/// and `init` is the one caller.
+async fn connect(uri: &str) -> anyhow::Result<SqlitePool> {
     let opts = SqliteConnectOptions::from_str(uri)
         .map_err(|e| anyhow::anyhow!(e))?
         .create_if_missing(true)
@@ -69,6 +80,15 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     // After WAL is enabled, so the sidecars it creates exist and are covered too.
     restrict_to_owner(uri);
 
+    Ok(pool)
+}
+
+/// Creates `Devices`, and brings an existing one up to date.
+///
+/// Kept apart from the rest of the schema because the order within it matters:
+/// the unique index at the end is over `fingerprint`, which the migrations above
+/// it are what add to a database made before that column existed.
+async fn create_devices(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS Devices (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,30 +103,30 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             auto_mode           TEXT    NOT NULL DEFAULT 'disabled'
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Idempotent migrations: silently ignored if columns already exist.
     let _ = sqlx::query("ALTER TABLE Devices ADD COLUMN label TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ =
         sqlx::query("ALTER TABLE Devices ADD COLUMN auto_mode TEXT NOT NULL DEFAULT 'disabled'")
-            .execute(&pool)
+            .execute(pool)
             .await;
     // Stable per-device identity (currently the LAN MAC address, from the ARP
     // cache) independent of IP, so a device that gets a new DHCP lease can be
     // recognized as the same physical device rather than showing up as a
     // second, permanently-unreachable entry — see `upsert_device`.
     let _ = sqlx::query("ALTER TABLE Devices ADD COLUMN fingerprint TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     // SHA-256 of the TLS certificate this device presented the first time Dom
     // connected to it over HTTPS. NULL until then; see `devices::tls`. Distinct
     // from `fingerprint` above, which is the LAN MAC and identifies the hardware
     // — this identifies the key it holds.
     let _ = sqlx::query("ALTER TABLE Devices ADD COLUMN tls_fingerprint TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
 
     // NULLs are distinct in a SQLite unique index, so devices without a known
@@ -116,9 +136,17 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_type_fingerprint
          ON Devices (type, fingerprint)",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Creates every other table, each followed by the indexes over it.
+///
+/// All of it is `IF NOT EXISTS`, so this runs on every startup and does nothing
+/// to a database that already has them.
+async fn create_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS SwitchTimers (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +155,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             relay_on   INTEGER NOT NULL
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query(
@@ -139,14 +167,14 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             value       REAL    NOT NULL
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_raw_metric_time
          ON RawDeviceMeasurements (device_id, metric, timestamp DESC)",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query(
@@ -159,14 +187,14 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             energy_ws   REAL    NOT NULL
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_energy_metric_res_time
          ON Energy (device_id, metric, resolution, timestamp DESC)",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // The index above leads with `device_id`, so a query that asks "what happened
@@ -179,7 +207,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     // an index can be to keep. It costs ~30 MB against a table that retention
     // holds to four days.
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_energy_time ON Energy (timestamp)")
-        .execute(&pool)
+        .execute(pool)
         .await?;
 
     sqlx::query(
@@ -191,14 +219,14 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             rsoc_avg    REAL    NOT NULL
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_energystorage_res_time
          ON EnergyStorage (device_id, resolution, timestamp DESC)",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query(
@@ -211,14 +239,14 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             previous_status   TEXT    NOT NULL
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_networkstatusevents_time
          ON NetworkStatusEvents (timestamp DESC)",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Application settings that outlive a run, e.g. the chosen colour theme.
@@ -230,7 +258,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             value  TEXT NOT NULL
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Per-local-day energy totals, rolled up from the 2s rows in `Energy`.
@@ -257,11 +285,11 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             PRIMARY KEY (device_id, day, metric)
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_energydaily_day ON EnergyDaily (day, metric)")
-        .execute(&pool)
+        .execute(pool)
         .await?;
 
     // Per-minute energy, rolled up from the 2s rows in `Energy`.
@@ -297,13 +325,13 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             PRIMARY KEY (device_id, minute, metric)
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_energyminute_time ON EnergyMinute (minute, metric)",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Which local days each rollup tier has already processed.
@@ -323,7 +351,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             PRIMARY KEY (tier, day)
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Which cluster node held the `Active` role during which wall-clock interval — see
@@ -339,7 +367,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             ended_at    TEXT
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
     // "Find the currently-open epoch" is the hot query (every role transition runs it); a
     // partial index keeps it to the one row that matters rather than scanning the whole table.
@@ -347,7 +375,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
         "CREATE INDEX IF NOT EXISTS idx_leadershipepochs_open
          ON LeadershipEpochs (ended_at) WHERE ended_at IS NULL",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Outdoor temperature readings from the nearest MeteoSwiss station.
@@ -369,7 +397,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             distance_km   REAL
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Per-local-day device temperature.
@@ -395,7 +423,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             PRIMARY KEY (device_id, day)
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Per-local-day battery state of charge.
@@ -416,7 +444,7 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             PRIMARY KEY (device_id, day)
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
     // Weather forecast for the array's plane, one row per 15-minute step.
@@ -440,10 +468,10 @@ pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
             issued_at         TEXT NOT NULL
         )",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
 
-    Ok(pool)
+    Ok(())
 }
 
 /// Makes the database readable and writable only by the user running Dom.
