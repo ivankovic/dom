@@ -588,14 +588,7 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
         // Some devices (e.g. behind AP client isolation) never answer ICMP, but the
         // router already knows about them via DHCP — fingerprint those too so they
         // still show up as discovered devices.
-        let lease_ips: Vec<IpAddr> = {
-            let app = state.read().unwrap();
-            app.mikrotik_readings
-                .values()
-                .flat_map(|r| r.leases.iter())
-                .filter_map(|lease| lease.address.parse().ok())
-                .collect()
-        };
+        let lease_ips = lease_addresses(&state.read().unwrap());
         let fingerprint_targets = merge_scan_targets(&devs, lease_ips);
 
         let mut set = tokio::task::JoinSet::new();
@@ -665,6 +658,10 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
 
         // Automatically configure and add our own IP addresses as "Dom", and
         // drop any this machine no longer has — see `forget_stale_addresses`.
+        //
+        // Read once and reused by `merge_device_list` below, which used to call
+        // `detect_local_ips` again for itself. One reading of the interfaces per
+        // cycle, so what is saved here and what is displayed cannot disagree.
         let local_ips = devices::dom_local::detect_local_ips();
         for local_ip in &local_ips {
             let _ = devices::dom_local::save_device(&pool, *local_ip).await;
@@ -680,23 +677,7 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
             let app = state.read().unwrap();
             app.devices.clone()
         };
-        // Build a map from IP to DHCP lease comment/host-name for label fallback
-        let dhcp_info: std::collections::HashMap<std::net::IpAddr, String> = {
-            let app = state.read().unwrap();
-            app.mikrotik_readings
-                .values()
-                .flat_map(|r| r.leases.iter())
-                .filter_map(|lease| {
-                    // Use comment if available, otherwise fall back to host-name
-                    let label = lease
-                        .comment
-                        .clone()
-                        .or_else(|| lease.host_name.clone())
-                        .filter(|s| !s.is_empty());
-                    lease.address.parse().ok().zip(label)
-                })
-                .collect()
-        };
+        let dhcp_info = dhcp_labels(&state.read().unwrap());
 
         // Load all labels from DB as a fallback
         let db_labels: std::collections::HashMap<std::net::IpAddr, Option<String>> =
@@ -704,56 +685,16 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
 
         {
             let mut app = state.write().unwrap();
-            let mut new_devices: Vec<app::ScannedDevice> = fps
-                .iter()
-                .map(|fp| {
-                    let latency_ms = latency_for(fp.ip, &devs);
-                    let label = resolve_label(fp.ip, &all_existing_devices, &db_labels, &dhcp_info);
-                    app::ScannedDevice {
-                        ip: fp.ip,
-                        latency_ms,
-                        open_ports: fp.open_ports.clone(),
-                        // Same classification used when persisting above, so the
-                        // displayed model can't disagree with the stored type.
-                        name: devices::detect_type(fp)
-                            .map(|t| t.display_name())
-                            .or_else(|| {
-                                devices::dom_local::is_local_ip(fp.ip)
-                                    .then_some(devices::dom_local::NAME)
-                            }),
-                        label,
-                    }
-                })
-                .collect();
+            let new_devices = merge_device_list(
+                &fps,
+                &devs,
+                &all_existing_devices,
+                &app.polled_ips,
+                &local_ips,
+                &db_labels,
+                &dhcp_info,
+            );
 
-            // Add our local IP addresses as "Dom" devices
-            let local_ips = devices::dom_local::detect_local_ips();
-            for local_ip in local_ips {
-                if !new_devices.iter().any(|d| d.ip == local_ip) {
-                    let latency_ms = latency_for(local_ip, &devs);
-                    let label =
-                        resolve_label(local_ip, &all_existing_devices, &db_labels, &dhcp_info);
-                    new_devices.push(app::ScannedDevice {
-                        ip: local_ip,
-                        latency_ms,
-                        open_ports: vec![],
-                        name: Some(devices::dom_local::NAME),
-                        label,
-                    });
-                }
-            }
-
-            // Add previously-polled devices not found in this scan.
-            // Also add non-polled devices with labels that weren't found in this scan.
-            for existing in &all_existing_devices {
-                if !new_devices.iter().any(|d| d.ip == existing.ip)
-                    && (app.polled_ips.contains(&existing.ip) || existing.label.is_some())
-                {
-                    new_devices.push(existing.clone());
-                }
-            }
-
-            new_devices.sort_by_key(|d| ip_sort_key(d.ip));
             let max = new_devices.len().saturating_sub(1);
             app.selected = app.selected.min(max);
             app.devices = new_devices;
@@ -777,6 +718,96 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
 
         record_network_status_transitions(&state, &pool).await;
     }
+}
+
+/// Every address the router has handed out a DHCP lease for.
+///
+/// Some devices — behind AP client isolation, say — never answer ICMP, but the
+/// router knows about them anyway, so these are worth reaching for by other
+/// means.
+fn lease_addresses(app: &app::App) -> Vec<IpAddr> {
+    app.mikrotik_readings
+        .values()
+        .flat_map(|r| r.leases.iter())
+        .filter_map(|lease| lease.address.parse().ok())
+        .collect()
+}
+
+/// Names the router knows for the addresses it has leased: the lease comment
+/// where one is set, otherwise the host-name the device gave for itself. Empty
+/// strings are dropped rather than shown as a blank label.
+fn dhcp_labels(app: &app::App) -> HashMap<IpAddr, String> {
+    app.mikrotik_readings
+        .values()
+        .flat_map(|r| r.leases.iter())
+        .filter_map(|lease| {
+            let label = lease
+                .comment
+                .clone()
+                .or_else(|| lease.host_name.clone())
+                .filter(|s| !s.is_empty());
+            lease.address.parse().ok().zip(label)
+        })
+        .collect()
+}
+
+/// The device list a finished scan should leave behind, in address order.
+///
+/// A scan is not the whole truth about what is on the network, so its results
+/// are a union rather than a replacement: everything fingerprinted this round,
+/// plus this machine's own addresses, plus anything already known that the scan
+/// missed but which is either being polled or carries a label. Without those
+/// last two a device would vanish from the list for a cycle because one probe
+/// went unanswered.
+#[allow(clippy::too_many_arguments)]
+fn merge_device_list(
+    fps: &[fingerprint::Fingerprint],
+    devs: &[devices::Device],
+    existing: &[app::ScannedDevice],
+    polled_ips: &HashSet<IpAddr>,
+    local_ips: &[IpAddr],
+    db_labels: &HashMap<IpAddr, Option<String>>,
+    dhcp_info: &HashMap<IpAddr, String>,
+) -> Vec<app::ScannedDevice> {
+    let mut new_devices: Vec<app::ScannedDevice> = fps
+        .iter()
+        .map(|fp| app::ScannedDevice {
+            ip: fp.ip,
+            latency_ms: latency_for(fp.ip, devs),
+            open_ports: fp.open_ports.clone(),
+            // The same classification used when persisting the device, so the
+            // displayed model cannot disagree with the stored type.
+            name: devices::detect_type(fp)
+                .map(|t| t.display_name())
+                .or_else(|| {
+                    devices::dom_local::is_local_ip(fp.ip).then_some(devices::dom_local::NAME)
+                }),
+            label: resolve_label(fp.ip, existing, db_labels, dhcp_info),
+        })
+        .collect();
+
+    for local_ip in local_ips {
+        if !new_devices.iter().any(|d| d.ip == *local_ip) {
+            new_devices.push(app::ScannedDevice {
+                ip: *local_ip,
+                latency_ms: latency_for(*local_ip, devs),
+                open_ports: vec![],
+                name: Some(devices::dom_local::NAME),
+                label: resolve_label(*local_ip, existing, db_labels, dhcp_info),
+            });
+        }
+    }
+
+    for device in existing {
+        if !new_devices.iter().any(|d| d.ip == device.ip)
+            && (polled_ips.contains(&device.ip) || device.label.is_some())
+        {
+            new_devices.push(device.clone());
+        }
+    }
+
+    new_devices.sort_by_key(|d| ip_sort_key(d.ip));
+    new_devices
 }
 
 /// Best-known display label for `ip`, in precedence order: a label already
@@ -1924,14 +1955,7 @@ async fn cluster_discovery_task(
             let app = state.read().unwrap();
             app.last_ping_devices.clone()
         };
-        let lease_ips: Vec<IpAddr> = {
-            let app = state.read().unwrap();
-            app.mikrotik_readings
-                .values()
-                .flat_map(|r| r.leases.iter())
-                .filter_map(|lease| lease.address.parse().ok())
-                .collect()
-        };
+        let lease_ips = lease_addresses(&state.read().unwrap());
         let candidates = merge_scan_targets(&devs, lease_ips);
 
         let mut set = tokio::task::JoinSet::new();
@@ -2263,6 +2287,224 @@ mod tests {
 
     fn local_hhmm(t: chrono::DateTime<Utc>) -> String {
         t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+    }
+
+    // ── Reading the router's lease table ──────────────────────────────────────
+
+    fn app_with_leases(leases: &[(&str, Option<&str>, Option<&str>)]) -> app::App {
+        let mut app = app::App::default();
+        app.mikrotik_readings.insert(
+            IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1)),
+            app::MikrotikReading {
+                leases: leases
+                    .iter()
+                    .map(|(addr, comment, host)| devices::mikrotik::DhcpLease {
+                        address: (*addr).to_string(),
+                        mac_address: "AA:BB:CC:DD:EE:FF".to_string(),
+                        host_name: host.map(|h| h.to_string()),
+                        comment: comment.map(|c| c.to_string()),
+                        status: "bound".to_string(),
+                    })
+                    .collect(),
+                firewall_rules: vec![],
+                updated_at: Utc::now(),
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn every_leased_address_is_worth_reaching_for() {
+        let app = app_with_leases(&[("172.16.0.20", None, None), ("172.16.0.21", None, None)]);
+        let mut got = lease_addresses(&app);
+        got.sort_by_key(|ip| ip_sort_key(*ip));
+        assert_eq!(
+            got,
+            vec![
+                "172.16.0.20".parse::<IpAddr>().unwrap(),
+                "172.16.0.21".parse::<IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lease_with_an_unparseable_address_is_skipped_not_fatal() {
+        let app = app_with_leases(&[("not-an-address", None, None), ("172.16.0.20", None, None)]);
+        assert_eq!(lease_addresses(&app).len(), 1);
+    }
+
+    #[test]
+    fn a_lease_comment_is_preferred_over_the_host_name() {
+        // The comment is what a person typed on the router; the host-name is
+        // whatever the device called itself.
+        let app = app_with_leases(&[("172.16.0.20", Some("Kitchen"), Some("esp-1a2b"))]);
+        let got = dhcp_labels(&app);
+        assert_eq!(
+            got.get(&"172.16.0.20".parse().unwrap()).map(String::as_str),
+            Some("Kitchen")
+        );
+    }
+
+    #[test]
+    fn the_host_name_is_used_when_no_comment_was_set() {
+        let app = app_with_leases(&[("172.16.0.20", None, Some("esp-1a2b"))]);
+        let got = dhcp_labels(&app);
+        assert_eq!(
+            got.get(&"172.16.0.20".parse().unwrap()).map(String::as_str),
+            Some("esp-1a2b")
+        );
+    }
+
+    #[test]
+    fn a_blank_name_is_no_name_at_all() {
+        // An empty comment would otherwise show as a device with a blank label,
+        // which reads as a bug rather than as "unnamed".
+        let app = app_with_leases(&[
+            ("172.16.0.20", Some(""), None),
+            ("172.16.0.21", None, Some("")),
+            ("172.16.0.22", None, None),
+        ]);
+        assert!(dhcp_labels(&app).is_empty());
+    }
+
+    #[test]
+    fn an_empty_comment_masks_the_host_name_rather_than_falling_through() {
+        // `comment.or_else(host_name)` picks the comment because `Some("")` is
+        // `Some`, and only then is the blank dropped — so a device whose lease
+        // has an empty comment shows unnamed even though it gave a host-name.
+        // Recorded as the behaviour it is; moving the emptiness check ahead of
+        // the fallback would change what such devices are called.
+        let app = app_with_leases(&[("172.16.0.20", Some(""), Some("esp-1a2b"))]);
+        assert_eq!(dhcp_labels(&app).get(&"172.16.0.20".parse().unwrap()), None);
+    }
+
+    // ── Merging a scan into the device list ───────────────────────────────────
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, last))
+    }
+
+    fn fp_at(last: u8) -> fingerprint::Fingerprint {
+        fingerprint::Fingerprint {
+            ip: ip(last),
+            open_ports: vec![80],
+            http: vec![],
+        }
+    }
+
+    fn seen(last: u8, label: Option<&str>) -> app::ScannedDevice {
+        app::ScannedDevice {
+            ip: ip(last),
+            latency_ms: 5.0,
+            open_ports: vec![],
+            name: None,
+            label: label.map(|l| l.to_string()),
+        }
+    }
+
+    fn merged(
+        fps: &[fingerprint::Fingerprint],
+        existing: &[app::ScannedDevice],
+        polled: &[u8],
+    ) -> Vec<IpAddr> {
+        let polled_ips: HashSet<IpAddr> = polled.iter().map(|l| ip(*l)).collect();
+        merge_device_list(
+            fps,
+            &[],
+            existing,
+            &polled_ips,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .into_iter()
+        .map(|d| d.ip)
+        .collect()
+    }
+
+    #[test]
+    fn a_scan_that_missed_a_polled_device_does_not_drop_it() {
+        // One unanswered probe must not make a device Dom is actively polling
+        // disappear from the list for a cycle.
+        assert_eq!(
+            merged(&[fp_at(20)], &[seen(20, None), seen(30, None)], &[30]),
+            vec![ip(20), ip(30)]
+        );
+    }
+
+    #[test]
+    fn a_scan_that_missed_a_labelled_device_does_not_drop_it_either() {
+        // A label is a person's own assignment; losing it to a missed probe
+        // would lose their work.
+        assert_eq!(
+            merged(
+                &[fp_at(20)],
+                &[seen(20, None), seen(30, Some("Kitchen"))],
+                &[]
+            ),
+            vec![ip(20), ip(30)]
+        );
+    }
+
+    #[test]
+    fn an_unlabelled_device_that_is_not_polled_does_drop_out() {
+        // Nothing is holding on to it, so a scan that no longer sees it is the
+        // truth about the network.
+        assert_eq!(
+            merged(&[fp_at(20)], &[seen(20, None), seen(30, None)], &[]),
+            vec![ip(20)]
+        );
+    }
+
+    #[test]
+    fn a_device_found_by_the_scan_is_not_added_twice() {
+        assert_eq!(
+            merged(&[fp_at(20)], &[seen(20, Some("Kitchen"))], &[20]),
+            vec![ip(20)],
+            "polled and labelled and scanned, but still one device"
+        );
+    }
+
+    #[test]
+    fn the_merged_list_comes_back_in_address_order() {
+        let got = merged(&[fp_at(30), fp_at(9), fp_at(200)], &[], &[]);
+        assert_eq!(
+            got,
+            vec![ip(9), ip(30), ip(200)],
+            "numeric, not lexicographic"
+        );
+    }
+
+    #[test]
+    fn this_machines_own_addresses_are_added_once_and_named() {
+        let local = [ip(50)];
+        let devices_out = merge_device_list(
+            &[fp_at(20)],
+            &[],
+            &[],
+            &HashSet::new(),
+            &local,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let dom: Vec<&app::ScannedDevice> = devices_out.iter().filter(|d| d.ip == ip(50)).collect();
+        assert_eq!(dom.len(), 1);
+        assert_eq!(dom[0].name, Some(devices::dom_local::NAME));
+    }
+
+    #[test]
+    fn a_label_from_the_routers_lease_reaches_a_freshly_scanned_device() {
+        let dhcp: HashMap<IpAddr, String> = [(ip(20), "Kitchen".to_string())].into_iter().collect();
+        let devices_out = merge_device_list(
+            &[fp_at(20)],
+            &[],
+            &[],
+            &HashSet::new(),
+            &[],
+            &HashMap::new(),
+            &dhcp,
+        );
+        assert_eq!(devices_out[0].label.as_deref(), Some("Kitchen"));
     }
 
     // ── Timer selection and retry bookkeeping ─────────────────────────────────
