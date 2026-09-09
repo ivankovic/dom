@@ -20,7 +20,7 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -863,18 +863,31 @@ async fn record_network_status_transitions(state: &SharedState, pool: &SqlitePoo
 
 /// Loads DB-known devices at startup, adds them to the TUI list, and starts poll loops
 /// so the app shows live data immediately without waiting for the first network scan.
+/// A device loaded from the database, presented as if a scan had just found it.
+///
+/// Zero latency and no open ports because nothing has been probed yet: the poll
+/// loops spawned alongside are what fill those in, and until they do the device
+/// still has to appear in the list.
+fn known_device(ip: IpAddr, name: &'static str, label: Option<String>) -> app::ScannedDevice {
+    app::ScannedDevice {
+        ip,
+        latency_ms: 0.0,
+        open_ports: vec![],
+        name: Some(name),
+        label,
+    }
+}
+
 async fn bootstrap_known_devices(state: &SharedState, pool: &SqlitePool) {
     let mut initial: Vec<app::ScannedDevice> = Vec::new();
 
     if let Ok(rows) = devices::sonnen_batterie::load_all(pool).await {
         for d in &rows {
-            initial.push(app::ScannedDevice {
-                ip: d.ip,
-                latency_ms: 0.0,
-                open_ports: vec![],
-                name: Some(devices::sonnen_batterie::NAME),
-                label: d.label.clone(),
-            });
+            initial.push(known_device(
+                d.ip,
+                devices::sonnen_batterie::NAME,
+                d.label.clone(),
+            ));
         }
         for d in rows {
             maybe_spawn_poll_loop(d.ip, pool, state).await;
@@ -882,13 +895,11 @@ async fn bootstrap_known_devices(state: &SharedState, pool: &SqlitePool) {
     }
     if let Ok(rows) = devices::mystrom_switch::load_all(pool).await {
         for d in &rows {
-            initial.push(app::ScannedDevice {
-                ip: d.ip,
-                latency_ms: 0.0,
-                open_ports: vec![],
-                name: Some(devices::mystrom_switch::NAME),
-                label: d.label.clone(),
-            });
+            initial.push(known_device(
+                d.ip,
+                devices::mystrom_switch::NAME,
+                d.label.clone(),
+            ));
         }
         for d in rows {
             maybe_spawn_switch_poll_loop(d.ip, pool, state).await;
@@ -896,13 +907,7 @@ async fn bootstrap_known_devices(state: &SharedState, pool: &SqlitePool) {
     }
     if let Ok(rows) = devices::mikrotik::load_all(pool).await {
         for d in &rows {
-            initial.push(app::ScannedDevice {
-                ip: d.ip,
-                latency_ms: 0.0,
-                open_ports: vec![],
-                name: Some(devices::mikrotik::NAME),
-                label: d.label.clone(),
-            });
+            initial.push(known_device(d.ip, devices::mikrotik::NAME, d.label.clone()));
         }
         for d in rows {
             maybe_spawn_mikrotik_poll_loop(d.ip, pool, state).await;
@@ -910,13 +915,7 @@ async fn bootstrap_known_devices(state: &SharedState, pool: &SqlitePool) {
     }
     if let Ok(rows) = devices::keba::load_all(pool).await {
         for d in &rows {
-            initial.push(app::ScannedDevice {
-                ip: d.ip,
-                latency_ms: 0.0,
-                open_ports: vec![],
-                name: Some(devices::keba::NAME),
-                label: d.label.clone(),
-            });
+            initial.push(known_device(d.ip, devices::keba::NAME, d.label.clone()));
         }
         for d in rows {
             maybe_spawn_keba_poll_loop(d.ip, pool, state).await;
@@ -926,13 +925,7 @@ async fn bootstrap_known_devices(state: &SharedState, pool: &SqlitePool) {
     // Add local machine as "Dom" devices
     if let Ok(rows) = devices::dom_local::load_all(pool).await {
         for d in &rows {
-            initial.push(app::ScannedDevice {
-                ip: d.ip,
-                latency_ms: 0.0,
-                open_ports: vec![],
-                name: Some(devices::dom_local::NAME),
-                label: None,
-            });
+            initial.push(known_device(d.ip, devices::dom_local::NAME, None));
         }
     }
 
@@ -941,13 +934,7 @@ async fn bootstrap_known_devices(state: &SharedState, pool: &SqlitePool) {
     for local_ip in local_ips {
         // Check if this IP is already in the initial list
         if !initial.iter().any(|d| d.ip == local_ip) {
-            initial.push(app::ScannedDevice {
-                ip: local_ip,
-                latency_ms: 0.0,
-                open_ports: vec![],
-                name: Some(devices::dom_local::NAME),
-                label: None,
-            });
+            initial.push(known_device(local_ip, devices::dom_local::NAME, None));
             // Save it to the database
             let _ = devices::dom_local::save_device(pool, local_ip).await;
         }
@@ -976,6 +963,65 @@ async fn bootstrap_known_devices(state: &SharedState, pool: &SqlitePool) {
     }
 }
 
+/// A timer, identified by its id and the local day it is due on. Both halves
+/// matter: the bookkeeping below is cleared when the date rolls over, so the
+/// same timer is due again tomorrow.
+type TimerKey = (i64, String);
+
+/// The timers that should be commanded this tick.
+///
+/// A timer qualifies when its switch is in Time mode, it has not already fired
+/// today, and it is either newly due — its time falls in the minutes swept since
+/// the last tick — or was due earlier and has not been accepted yet.
+fn timers_to_fire(
+    app: &app::App,
+    window: &[String],
+    fired: &HashSet<TimerKey>,
+    pending: &HashMap<TimerKey, u32>,
+    today: &str,
+) -> Vec<(IpAddr, i64, bool)> {
+    let mut actions = Vec::new();
+    for (ip, mode) in &app.switch_auto_modes {
+        if *mode != SwitchAutoMode::Time {
+            continue;
+        }
+        for t in app.switch_timers.get(ip).into_iter().flatten() {
+            let key = (t.id, today.to_string());
+            if fired.contains(&key) {
+                continue;
+            }
+            if pending.contains_key(&key) || window.contains(&t.time_hhmm) {
+                actions.push((*ip, t.id, t.relay_on));
+            }
+        }
+    }
+    actions
+}
+
+/// Records one failed attempt at a timer, returning how many it has now had and
+/// whether it has been given up on for the day.
+///
+/// Giving up records it as fired, which is not a claim that it ran — the log
+/// says otherwise. What it prevents is retrying a device that is simply off,
+/// every tick, until midnight.
+fn record_failed_attempt(
+    fired: &mut HashSet<TimerKey>,
+    pending: &mut HashMap<TimerKey, u32>,
+    key: TimerKey,
+) -> (u32, bool) {
+    let attempts = pending.entry(key.clone()).or_insert(0);
+    *attempts += 1;
+    let attempts = *attempts;
+
+    if attempts >= TIMER_MAX_ATTEMPTS {
+        pending.remove(&key);
+        fired.insert(key);
+        (attempts, true)
+    } else {
+        (attempts, false)
+    }
+}
+
 /// Background task: every 30 s, checks wall-clock time against scheduled switch timers and fires
 /// any that match the current HH:MM and haven't already fired today.
 async fn timer_job(state: SharedState) {
@@ -985,11 +1031,10 @@ async fn timer_job(state: SharedState) {
     // (timer_id, "YYYY-MM-DD") pairs that have fired, and ones that came due but
     // whose switch would not take the command. Both are cleared when the date
     // rolls over.
-    let mut fired: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+    let mut fired: HashSet<TimerKey> = HashSet::new();
     // ...and how many attempts each pending one has already had, so a switch
     // that is simply off does not get talked to for the rest of the day.
-    let mut pending: std::collections::HashMap<(i64, String), u32> =
-        std::collections::HashMap::new();
+    let mut pending: HashMap<TimerKey, u32> = HashMap::new();
 
     // Where the last sweep reached. Starts at "now" so timers earlier today do
     // not all fire at once on startup — Dom coming up at six in the evening must
@@ -1009,26 +1054,7 @@ async fn timer_job(state: SharedState) {
         // firing was simply lost for the day.
         let window = elapsed_window(swept_to, now);
 
-        let to_fire: Vec<(IpAddr, i64, bool)> = {
-            let app = state.read().unwrap();
-            let mut actions = Vec::new();
-            for (ip, mode) in &app.switch_auto_modes {
-                if *mode != SwitchAutoMode::Time {
-                    continue;
-                }
-                for t in app.switch_timers.get(ip).into_iter().flatten() {
-                    let key = (t.id, today.clone());
-                    if fired.contains(&key) {
-                        continue;
-                    }
-                    // Either newly due, or due earlier and not yet accepted.
-                    if pending.contains_key(&key) || window.contains(&t.time_hhmm) {
-                        actions.push((*ip, t.id, t.relay_on));
-                    }
-                }
-            }
-            actions
-        };
+        let to_fire = timers_to_fire(&state.read().unwrap(), &window, &fired, &pending, &today);
 
         for (ip, timer_id, relay_on) in to_fire {
             let key = (timer_id, today.clone());
@@ -1049,27 +1075,16 @@ async fn timer_job(state: SharedState) {
                     fired.insert(key.clone());
                     pending.remove(&key);
                 }
-                Err(e) => {
-                    let attempts = pending.entry(key.clone()).or_insert(0);
-                    *attempts += 1;
-                    if *attempts >= TIMER_MAX_ATTEMPTS {
-                        log::warn!(
-                            "timer {timer_id} could not switch {ip} after {attempts} attempts \
-                             ({e:#}); giving up until tomorrow"
-                        );
-                        pending.remove(&key);
-                        // Recorded as fired so it is not attempted again today.
-                        // The switch never took the command, and the log says so;
-                        // what this prevents is retrying a device that is simply
-                        // off, every tick, for the rest of the day.
-                        fired.insert(key);
-                    } else {
-                        log::warn!(
-                            "timer {timer_id} could not switch {ip}: {e:#}; \
-                             attempt {attempts}, will retry"
-                        );
-                    }
-                }
+                Err(e) => match record_failed_attempt(&mut fired, &mut pending, key) {
+                    (attempts, true) => log::warn!(
+                        "timer {timer_id} could not switch {ip} after {attempts} attempts \
+                         ({e:#}); giving up until tomorrow"
+                    ),
+                    (attempts, false) => log::warn!(
+                        "timer {timer_id} could not switch {ip}: {e:#}; \
+                         attempt {attempts}, will retry"
+                    ),
+                },
             }
         }
 
@@ -2248,6 +2263,182 @@ mod tests {
 
     fn local_hhmm(t: chrono::DateTime<Utc>) -> String {
         t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+    }
+
+    // ── Timer selection and retry bookkeeping ─────────────────────────────────
+
+    /// An app with one Time-mode switch holding the given timers.
+    fn timer_app(mode: SwitchAutoMode, timers: &[(i64, &str, bool)]) -> app::App {
+        let mut app = app::App::default();
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1));
+        app.switch_auto_modes.insert(ip, mode);
+        app.switch_timers.insert(
+            ip,
+            timers
+                .iter()
+                .map(|(id, hhmm, relay_on)| app::SwitchTimer {
+                    id: *id,
+                    time_hhmm: (*hhmm).to_string(),
+                    relay_on: *relay_on,
+                })
+                .collect(),
+        );
+        app
+    }
+
+    fn win(minutes: &[&str]) -> Vec<String> {
+        minutes.iter().map(|m| (*m).to_string()).collect()
+    }
+
+    const DAY: &str = "2026-08-03";
+
+    #[test]
+    fn a_timer_fires_when_its_minute_falls_in_the_swept_window() {
+        let app = timer_app(SwitchAutoMode::Time, &[(1, "07:00", true)]);
+        let got = timers_to_fire(
+            &app,
+            &win(&["07:01", "07:00"]),
+            &HashSet::new(),
+            &HashMap::new(),
+            DAY,
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].1, got[0].2), (1, true));
+    }
+
+    #[test]
+    fn a_timer_outside_the_window_is_left_alone() {
+        let app = timer_app(SwitchAutoMode::Time, &[(1, "07:00", true)]);
+        assert!(
+            timers_to_fire(
+                &app,
+                &win(&["09:00", "08:59"]),
+                &HashSet::new(),
+                &HashMap::new(),
+                DAY
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_time_mode_switches_run_their_timers() {
+        // Eco reads the same timers for its window's *length* only; it must not
+        // fire them itself, or the day would be switched twice.
+        for mode in [SwitchAutoMode::Eco, SwitchAutoMode::Disabled] {
+            let app = timer_app(mode.clone(), &[(1, "07:00", true)]);
+            assert!(
+                timers_to_fire(
+                    &app,
+                    &win(&["07:00"]),
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    DAY
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn a_timer_that_already_fired_today_does_not_fire_again() {
+        let app = timer_app(SwitchAutoMode::Time, &[(1, "07:00", true)]);
+        let fired: HashSet<TimerKey> = [(1, DAY.to_string())].into_iter().collect();
+        assert!(timers_to_fire(&app, &win(&["07:00"]), &fired, &HashMap::new(), DAY).is_empty());
+    }
+
+    #[test]
+    fn the_same_timer_is_due_again_the_next_day() {
+        // The key carries the date, so yesterday's firing does not suppress it.
+        let app = timer_app(SwitchAutoMode::Time, &[(1, "07:00", true)]);
+        let fired: HashSet<TimerKey> = [(1, "2026-08-02".to_string())].into_iter().collect();
+        assert_eq!(
+            timers_to_fire(&app, &win(&["07:00"]), &fired, &HashMap::new(), DAY).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_timer_awaiting_a_retry_stays_due_after_its_window_has_passed() {
+        // This is what makes a briefly unreachable switch recoverable: the
+        // minute is long gone, but the command was never accepted.
+        let app = timer_app(SwitchAutoMode::Time, &[(1, "07:00", true)]);
+        let pending: HashMap<TimerKey, u32> = [((1, DAY.to_string()), 2)].into_iter().collect();
+        assert_eq!(
+            timers_to_fire(&app, &win(&["09:00"]), &HashSet::new(), &pending, DAY).len(),
+            1,
+            "still pending, so still due"
+        );
+    }
+
+    #[test]
+    fn every_due_timer_on_a_switch_is_returned() {
+        let app = timer_app(
+            SwitchAutoMode::Time,
+            &[(1, "07:00", true), (2, "07:00", false), (3, "22:00", false)],
+        );
+        let got = timers_to_fire(
+            &app,
+            &win(&["07:00"]),
+            &HashSet::new(),
+            &HashMap::new(),
+            DAY,
+        );
+        let mut ids: Vec<i64> = got.iter().map(|(_, id, _)| *id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_failed_attempt_is_counted_and_retried() {
+        let mut fired = HashSet::new();
+        let mut pending = HashMap::new();
+        let key = (1i64, DAY.to_string());
+
+        for expected in 1..TIMER_MAX_ATTEMPTS {
+            assert_eq!(
+                record_failed_attempt(&mut fired, &mut pending, key.clone()),
+                (expected, false)
+            );
+            assert!(fired.is_empty(), "not given up on yet");
+        }
+        assert_eq!(pending.get(&key), Some(&(TIMER_MAX_ATTEMPTS - 1)));
+    }
+
+    #[test]
+    fn a_switch_that_never_answers_is_given_up_on_for_the_day() {
+        // Recorded as fired, which is not a claim that it ran — it stops Dom
+        // talking to a device that is simply off, every tick, until midnight.
+        let mut fired = HashSet::new();
+        let mut pending = HashMap::new();
+        let key = (1i64, DAY.to_string());
+
+        let mut last = (0, false);
+        for _ in 0..TIMER_MAX_ATTEMPTS {
+            last = record_failed_attempt(&mut fired, &mut pending, key.clone());
+        }
+        assert_eq!(last, (TIMER_MAX_ATTEMPTS, true));
+        assert!(
+            fired.contains(&key),
+            "recorded as fired so it is not retried"
+        );
+        assert!(!pending.contains_key(&key), "and no longer pending");
+    }
+
+    #[test]
+    fn giving_up_on_one_timer_leaves_the_others_alone() {
+        let mut fired = HashSet::new();
+        let mut pending = HashMap::new();
+        let dead = (1i64, DAY.to_string());
+        let live = (2i64, DAY.to_string());
+
+        for _ in 0..TIMER_MAX_ATTEMPTS {
+            record_failed_attempt(&mut fired, &mut pending, dead.clone());
+        }
+        record_failed_attempt(&mut fired, &mut pending, live.clone());
+
+        assert!(fired.contains(&dead) && !fired.contains(&live));
+        assert_eq!(pending.get(&live), Some(&1));
     }
 
     // ── Eco planning: the pure pieces ─────────────────────────────────────────
