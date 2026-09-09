@@ -176,60 +176,11 @@ async fn main() -> anyhow::Result<()> {
         rescan_notify.clone(),
     ));
 
-    // Background: prune RawDeviceMeasurements and old network status events, hourly.
-    {
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(3600));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                let _ = db::prune_raw_measurements(&pool).await;
-                let _ = db::prune_network_status_events(&pool).await;
-                // Hand back what pruning freed. Without this the file only ever
-                // grows to its high-water mark — see `db::reclaim_free_pages`.
-                match db::reclaim_free_pages(&pool).await {
-                    Ok(0) => {}
-                    Ok(left) => log::info!("reclaimed free pages; {left} still on the free list"),
-                    Err(e) => log::warn!("reclaiming free pages failed: {e:#}"),
-                }
-            }
-        });
-    }
+    // Background: prunes the 2s series and old network status events, hourly.
+    tokio::spawn(prune_task(pool.clone()));
 
-    // Background: refresh energy chart and Internet-traffic chart data —
-    // fires immediately, then every 60s.
-    {
-        let pool = pool.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok(data) = db::query_today_energy(&pool).await {
-                    state.write().unwrap().energy_chart = data;
-                }
-                if let Ok(map) = db::query_device_energy_today(&pool).await {
-                    state.write().unwrap().device_energy_today = map;
-                }
-                if let Ok(data) = db::query_internet_traffic_today(&pool).await {
-                    state.write().unwrap().internet_traffic_chart = data;
-                }
-                // Daily temperature history for the Environment view. Read here
-                // rather than during render so the view stays a pure function of
-                // state, like every other one.
-                let today = chrono::Local::now().date_naive();
-                if let Ok(rows) = db::query_daily_temperature(
-                    &pool,
-                    today - chrono::Duration::days(ENVIRONMENT_HISTORY_DAYS),
-                    today,
-                )
-                .await
-                {
-                    state.write().unwrap().temperature_history = rows;
-                }
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
-    }
+    // Background: keeps the chart data the views read current.
+    tokio::spawn(chart_refresh_task(state.clone(), pool.clone()));
 
     // Background: outdoor temperature, if a location has been configured.
     tokio::spawn(weather_task(state.clone(), pool.clone()));
@@ -259,11 +210,7 @@ async fn main() -> anyhow::Result<()> {
     // correct it — a peer that heartbeats in that window would see a false
     // `claims_active: true` and could wrongly demote itself. See
     // `App::cluster_role`'s doc.
-    state.write().unwrap().cluster_role = if cluster_peer_addr.is_some() {
-        cluster::Role::Standby
-    } else {
-        cluster::Role::Active
-    };
+    state.write().unwrap().cluster_role = initial_cluster_role(cluster_peer_addr.is_some());
 
     // Background: this node's cluster role — solo/Active until pairing exists.
     tokio::spawn(cluster_task(
@@ -303,6 +250,55 @@ async fn main() -> anyhow::Result<()> {
             );
             run_headless().await
         }
+    }
+}
+
+/// Background task: prunes the 2s measurement series and old network status
+/// events once an hour, then hands back what that freed.
+async fn prune_task(pool: SqlitePool) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let _ = db::prune_raw_measurements(&pool).await;
+        let _ = db::prune_network_status_events(&pool).await;
+        // Without this the file only ever grows to its high-water mark — see
+        // `db::reclaim_free_pages`.
+        match db::reclaim_free_pages(&pool).await {
+            Ok(0) => {}
+            Ok(left) => log::info!("reclaimed free pages; {left} still on the free list"),
+            Err(e) => log::warn!("reclaiming free pages failed: {e:#}"),
+        }
+    }
+}
+
+/// Background task: re-reads the chart data the views draw from, immediately and
+/// then every 60s.
+///
+/// Read here rather than during render, so every view stays a pure function of
+/// the state it is handed.
+async fn chart_refresh_task(state: SharedState, pool: SqlitePool) {
+    loop {
+        if let Ok(data) = db::query_today_energy(&pool).await {
+            state.write().unwrap().energy_chart = data;
+        }
+        if let Ok(map) = db::query_device_energy_today(&pool).await {
+            state.write().unwrap().device_energy_today = map;
+        }
+        if let Ok(data) = db::query_internet_traffic_today(&pool).await {
+            state.write().unwrap().internet_traffic_chart = data;
+        }
+        let today = chrono::Local::now().date_naive();
+        if let Ok(rows) = db::query_daily_temperature(
+            &pool,
+            today - chrono::Duration::days(ENVIRONMENT_HISTORY_DAYS),
+            today,
+        )
+        .await
+        {
+            state.write().unwrap().temperature_history = rows;
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 
@@ -1621,6 +1617,84 @@ fn degrade(
 /// Gateway reachability reuses `App::network_status` (already computed for
 /// the Network view) against whichever device `classify_network_devices`
 /// names as the router, rather than adding a second ping mechanism.
+/// The role a node takes before it has heard anything from a peer.
+///
+/// A configured peer starts it at `Standby` rather than `Role::default()`
+/// (`Active`): this is the other half of the cold-start fix alongside
+/// `PeerStatus::Establishing`. `currently_active` must start honest, not
+/// optimistic, or two nodes booting together could both feed `true` into
+/// `decide_role` before either has heard from the other. See SPECS.md.
+///
+/// `main` seeds `App::cluster_role` with this synchronously, before either
+/// cluster task spawns, so the heartbeat listener can never answer from
+/// `Active` for a paired node — a peer heartbeating in that window would read a
+/// false `claims_active: true` and could wrongly demote itself.
+fn initial_cluster_role(paired: bool) -> cluster::Role {
+    if paired {
+        cluster::Role::Standby
+    } else {
+        cluster::Role::Active
+    }
+}
+
+/// Everything this node has learned about its current pairing.
+///
+/// Grouped because they are reset together: when the configured peer changes,
+/// none of it describes the new machine, and unpicking the fields one at a time
+/// is how one gets forgotten.
+struct PeerLink {
+    role: cluster::Role,
+    /// Forces the very first tick to log and act even when `decide_role`'s
+    /// answer matches `role`'s initial value — a solo node starting and staying
+    /// `Active`, say. Distinct from "has this node ever opened a leadership
+    /// epoch", which for a node that starts and stays `Standby` would never
+    /// become true and would re-log every tick forever.
+    started: bool,
+    consecutive_failures: u32,
+    ever_reachable: bool,
+    last_claims_active: bool,
+}
+
+impl PeerLink {
+    /// A link that has learned nothing yet — see `initial_cluster_role` for why
+    /// a paired node starts at `Standby`.
+    fn new(paired: bool) -> Self {
+        Self {
+            role: initial_cluster_role(paired),
+            started: false,
+            consecutive_failures: 0,
+            ever_reachable: false,
+            last_claims_active: false,
+        }
+    }
+
+    /// How an unanswered — or wrongly answered — heartbeat leaves the peer.
+    fn degraded_status(&self) -> cluster::PeerStatus {
+        degrade(
+            self.consecutive_failures,
+            self.ever_reachable,
+            self.last_claims_active,
+        )
+    }
+}
+
+/// Whether this node can still reach the gateway, which is what tells an
+/// `Active` node it is on the useful side of a network split.
+///
+/// The first router in the classified topology is the one asked; `Slow` counts
+/// as reachable, since a slow answer is still an answer.
+fn gateway_is_reachable(app: &app::App) -> bool {
+    app::classify_network_devices(&app.devices)
+        .routers
+        .first()
+        .is_some_and(|ip| {
+            matches!(
+                app.network_status(*ip),
+                app::NetworkDeviceStatus::Ok | app::NetworkDeviceStatus::Slow
+            )
+        })
+}
+
 async fn cluster_task(
     node_id: String,
     mut peer_addr: Option<String>,
@@ -1646,20 +1720,7 @@ async fn cluster_task(
     // `PeerStatus::Establishing`: `currently_active` must start honest, not
     // optimistic, or two nodes booting together could both feed `true` into
     // `decide_role` before either has heard from the other. See SPECS.md.
-    let mut role = if peer_addr.is_some() {
-        cluster::Role::Standby
-    } else {
-        cluster::Role::Active
-    };
-    // Forces the very first tick to log/act even when `decide_role`'s answer
-    // matches `role`'s initial value (e.g. a solo node starting and staying
-    // `Active`) — distinct from "has this node ever opened a leadership
-    // epoch", which for a node that starts and stays `Standby` would never
-    // become true and would otherwise re-log every single tick forever.
-    let mut started = false;
-    let mut consecutive_failures: u32 = 0;
-    let mut ever_reachable = false;
-    let mut last_claims_active = false;
+    let mut link = PeerLink::new(peer_addr.is_some());
 
     let tick_secs = |paired: bool| {
         Duration::from_secs(if paired {
@@ -1680,16 +1741,11 @@ async fn cluster_task(
                 "cluster: peer configuration changed ({peer_addr:?} -> {fresh_peer_addr:?})"
             );
             peer_addr = fresh_peer_addr;
-            role = if peer_addr.is_some() {
-                cluster::Role::Standby
-            } else {
-                cluster::Role::Active
-            };
-            state.write().unwrap().cluster_role = role;
-            started = false;
-            consecutive_failures = 0;
-            ever_reachable = false;
-            last_claims_active = false;
+            // Everything learned about the old peer is about a different
+            // machine now, so the whole link starts again rather than being
+            // unpicked field by field.
+            link = PeerLink::new(peer_addr.is_some());
+            state.write().unwrap().cluster_role = link.role;
             ticker = tokio::time::interval(tick_secs(peer_addr.is_some()));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
@@ -1711,17 +1767,8 @@ async fn cluster_task(
             warned_no_pin = false;
         }
 
-        let (currently_active, gateway_reachable) = {
-            let app = state.read().unwrap();
-            let topology = app::classify_network_devices(&app.devices);
-            let reachable = topology.routers.first().is_some_and(|ip| {
-                matches!(
-                    app.network_status(*ip),
-                    app::NetworkDeviceStatus::Ok | app::NetworkDeviceStatus::Slow
-                )
-            });
-            (matches!(role, cluster::Role::Active), reachable)
-        };
+        let currently_active = matches!(link.role, cluster::Role::Active);
+        let gateway_reachable = gateway_is_reachable(&state.read().unwrap());
 
         let peer = match &peer_addr {
             None => cluster::PeerStatus::NotPaired,
@@ -1732,11 +1779,11 @@ async fn cluster_task(
                         reply.node_id,
                         reply.claims_active
                     );
-                    consecutive_failures = 0;
-                    ever_reachable = true;
-                    last_claims_active = reply.claims_active;
+                    link.consecutive_failures = 0;
+                    link.ever_reachable = true;
+                    link.last_claims_active = reply.claims_active;
                     cluster::PeerStatus::Reachable {
-                        claims_active: last_claims_active,
+                        claims_active: link.last_claims_active,
                     }
                 }
                 Ok(reply) => {
@@ -1745,7 +1792,7 @@ async fn cluster_task(
                     // ordinary network failure (most plausibly: the peer was reinstalled and
                     // generated a new keypair), so it gets its own alarm and a re-pair prompt
                     // rather than silently degrading like a dropped connection would.
-                    consecutive_failures += 1;
+                    link.consecutive_failures += 1;
                     log::warn!(
                         "cluster: heartbeat to {addr} answered by an identity that doesn't match \
                          the pin (got {}) — treating as unreachable until re-paired",
@@ -1759,14 +1806,15 @@ async fn cluster_task(
                             public_key: reply.public_key,
                             replaces_pin: true,
                         });
-                    degrade(consecutive_failures, ever_reachable, last_claims_active)
+                    link.degraded_status()
                 }
                 Err(e) => {
-                    consecutive_failures += 1;
+                    link.consecutive_failures += 1;
                     log::debug!(
-                        "cluster: heartbeat to {addr} failed ({consecutive_failures} in a row): {e:#}"
+                        "cluster: heartbeat to {addr} failed ({} in a row): {e:#}",
+                        link.consecutive_failures
                     );
-                    degrade(consecutive_failures, ever_reachable, last_claims_active)
+                    link.degraded_status()
                 }
             },
         };
@@ -1786,12 +1834,12 @@ async fn cluster_task(
             alarmed = false;
         }
 
-        if decision.role != role || !started {
-            started = true;
+        if decision.role != link.role || !link.started {
+            link.started = true;
             log::info!("cluster: role is now {:?}", decision.role);
-            role = decision.role;
-            state.write().unwrap().cluster_role = role;
-            if role == cluster::Role::Active
+            link.role = decision.role;
+            state.write().unwrap().cluster_role = link.role;
+            if link.role == cluster::Role::Active
                 && let Err(e) = db::open_leadership_epoch(&pool, &node_id, Utc::now()).await
             {
                 log::warn!("cluster: could not record a leadership epoch: {e:#}");
@@ -2287,6 +2335,114 @@ mod tests {
 
     fn local_hhmm(t: chrono::DateTime<Utc>) -> String {
         t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+    }
+
+    // ── Cluster: starting state and gateway reachability ──────────────────────
+
+    #[test]
+    fn a_paired_node_starts_on_standby_and_a_solo_one_active() {
+        // A paired node must not start optimistic: two booting together would
+        // both feed `claims_active: true` into the other's `decide_role`.
+        assert_eq!(initial_cluster_role(true), cluster::Role::Standby);
+        assert_eq!(initial_cluster_role(false), cluster::Role::Active);
+    }
+
+    #[test]
+    fn a_fresh_link_has_learned_nothing() {
+        let link = PeerLink::new(true);
+        assert_eq!(link.role, cluster::Role::Standby);
+        assert!(!link.started, "the first tick must still log and act");
+        assert_eq!(link.consecutive_failures, 0);
+        assert!(!link.ever_reachable);
+        assert!(!link.last_claims_active);
+    }
+
+    #[test]
+    fn a_peer_never_yet_heard_from_is_establishing_not_unreachable() {
+        // The distinction is what stops a node promoting itself during the
+        // seconds before the peer's listener is up.
+        let mut link = PeerLink::new(true);
+        link.consecutive_failures = 1;
+        assert_eq!(link.degraded_status(), cluster::PeerStatus::Establishing);
+    }
+
+    #[test]
+    fn a_peer_that_was_reachable_keeps_its_last_claim_while_it_is_missed() {
+        let mut link = PeerLink::new(true);
+        link.ever_reachable = true;
+        link.last_claims_active = true;
+        link.consecutive_failures = 1;
+        assert_eq!(
+            link.degraded_status(),
+            cluster::PeerStatus::Reachable {
+                claims_active: true
+            },
+            "one missed beat is not a lost peer"
+        );
+    }
+
+    #[test]
+    fn enough_missed_beats_make_a_peer_unreachable_however_well_it_was_known() {
+        let mut link = PeerLink::new(true);
+        link.ever_reachable = true;
+        link.last_claims_active = true;
+        link.consecutive_failures = CLUSTER_PEER_LOST_AFTER_FAILURES;
+        assert_eq!(link.degraded_status(), cluster::PeerStatus::Unreachable);
+    }
+
+    /// An app holding one device labelled `label`, with the given poll state.
+    fn app_with_router(label: &str, status: Option<(app::ConnStatus, f64)>) -> app::App {
+        let mut app = app::App::default();
+        let router = ip(1);
+        app.devices.push(app::ScannedDevice {
+            ip: router,
+            latency_ms: 1.0,
+            open_ports: vec![],
+            name: None,
+            label: Some(label.to_string()),
+        });
+        if let Some((conn, latency)) = status {
+            app.conn_status.insert(router, conn);
+            app.poll_latency_ms.insert(router, latency);
+        }
+        app
+    }
+
+    #[test]
+    fn a_router_answering_normally_counts_as_a_reachable_gateway() {
+        let app = app_with_router("router", Some((app::ConnStatus::Online, 10.0)));
+        assert!(gateway_is_reachable(&app));
+    }
+
+    #[test]
+    fn a_slow_router_is_still_a_reachable_gateway() {
+        // A slow answer is still an answer; treating it as a split would demote
+        // a node over nothing more than a loaded router.
+        let app = app_with_router("router", Some((app::ConnStatus::Online, app::SLOW_POLL_MS)));
+        assert!(gateway_is_reachable(&app));
+    }
+
+    #[test]
+    fn a_lost_or_connecting_router_is_not_a_reachable_gateway() {
+        for conn in [app::ConnStatus::Lost, app::ConnStatus::Connecting] {
+            let app = app_with_router("router", Some((conn, 10.0)));
+            assert!(!gateway_is_reachable(&app));
+        }
+    }
+
+    #[test]
+    fn a_router_nothing_has_polled_yet_is_not_a_reachable_gateway() {
+        // `Unknown` is not evidence of reachability, and treating it as such
+        // would make every startup look like a healthy gateway.
+        let app = app_with_router("router", None);
+        assert!(!gateway_is_reachable(&app));
+    }
+
+    #[test]
+    fn a_node_that_knows_of_no_router_has_no_reachable_gateway() {
+        assert!(!gateway_is_reachable(&app::App::default()));
+        let app = app_with_router("kitchen lamp", Some((app::ConnStatus::Online, 10.0)));
+        assert!(!gateway_is_reachable(&app), "not classified as a router");
     }
 
     // ── Reading the router's lease table ──────────────────────────────────────
