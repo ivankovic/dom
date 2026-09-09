@@ -1,0 +1,27 @@
+# nextest configuration.
+#
+# The suite is otherwise isolation-clean — every database test opens either
+# `sqlite://:memory:` or its own `tempfile::tempdir()`, mock servers bind port 0,
+# and nothing sets environment variables — so process-per-test needs no other
+# help here.
+
+[test-groups]
+# The four tests below are the only ones that put a *real* SQLite database on
+# the disk, WAL sidecars and all. Everything else is in memory. Run under
+# coverage instrumentation they once all timed out together inside
+# `db::init`, within 0.15s of each other, on sqlx's 30-second connection
+# acquire timeout — the signature of the disk, not of a shared path.
+#
+# It has not reproduced since, so this is a declaration of a shared resource
+# rather than a fix for a known bug: these four contend for one disk, so let
+# one run at a time. It costs about a second, and only for them.
+on-disk-database = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = '''
+    test(=the_database_is_readable_only_by_its_owner)
+  + test(=an_existing_world_readable_database_is_corrected_on_startup)
+  + test(=every_pooled_connection_gets_the_relaxed_sync_setting)
+  + test(=freed_pages_are_handed_back_rather_than_hoarded)
+'''
+test-group = "on-disk-database"
