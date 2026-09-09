@@ -1142,6 +1142,88 @@ fn datetime_from_step(day: chrono::NaiveDate, step: usize) -> Option<chrono::Dat
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+/// Today's predicted production, in watts, for each of the day's 96 quarter-hour
+/// steps — or `None` if too little of the forecast covers today to plan against.
+///
+/// A day the forecast barely covers scores as if the sun never rose, since every
+/// unfilled step stays at zero production. That is indistinguishable from a
+/// genuinely overcast day — which is a *legitimate* all-tied result that
+/// `choose_window` is meant to break at random (see `TIE_EPSILON_WH`) — so the
+/// two cannot be told apart after the fact, only here, by asking how many steps
+/// actually arrived. Too few and there is no solar signal to place a window
+/// against at all; the caller defers to the configured timer instead of rolling
+/// dice.
+fn production_curve(
+    forecast: &[solar::ForecastPoint],
+    calibration_k: f64,
+    today: chrono::NaiveDate,
+) -> Option<[f64; devices::mystrom_switch::STEPS_PER_DAY]> {
+    let mut production_w = [0.0; devices::mystrom_switch::STEPS_PER_DAY];
+    let mut forecast_steps = 0usize;
+    for point in forecast {
+        let local = point.valid_at.with_timezone(&chrono::Local);
+        if local.date_naive() != today {
+            continue;
+        }
+        let step = local.hour() as usize * 4 + local.minute() as usize / 15;
+        if let Some(slot) = production_w.get_mut(step) {
+            *slot = solar::predict_wh(point.gti_w_m2, point.temperature_c, calibration_k)
+                * solar::STEPS_PER_HOUR;
+            forecast_steps += 1;
+        }
+    }
+    (forecast_steps >= ECO_MIN_FORECAST_STEPS).then_some(production_w)
+}
+
+/// What the switch typically draws while running, from its own recorded history.
+///
+/// Averaged over its historical on-window where there is data for it, falling
+/// back to its overall average — a switch just moved into Eco from a differently
+/// timed Time-mode schedule still has *some* history to start from. `None` when
+/// that does not come out above zero, which is not a load worth planning around.
+///
+/// Written as `> 0.0` rather than the inlined version's `<= 0.0`, so an empty
+/// curve — whose fallback average is `0.0 / 0.0` — is rejected instead of
+/// carrying a NaN into `choose_window`. `baseline_from_curves` already rules
+/// that input out in `compute_eco_plan`; this makes it safe here regardless.
+fn typical_running_power(
+    switch_curve: &HashMap<usize, f64>,
+    on_step: usize,
+    duration_steps: usize,
+) -> Option<f64> {
+    use devices::mystrom_switch::STEPS_PER_DAY;
+
+    let in_window: Vec<f64> = (0..duration_steps)
+        .filter_map(|i| switch_curve.get(&((on_step + i) % STEPS_PER_DAY)).copied())
+        .collect();
+    let typical_power_w = if in_window.is_empty() {
+        switch_curve.values().sum::<f64>() / switch_curve.len() as f64
+    } else {
+        in_window.iter().sum::<f64>() / in_window.len() as f64
+    };
+    (typical_power_w > 0.0).then_some(typical_power_w)
+}
+
+/// The instants a window starting at `start` and running `duration_steps` opens
+/// and closes, rolling into tomorrow when it runs past midnight.
+fn window_instants(
+    today: chrono::NaiveDate,
+    start: usize,
+    duration_steps: usize,
+) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
+    use devices::mystrom_switch::STEPS_PER_DAY;
+
+    let on_at = datetime_from_step(today, start)?;
+    let off_step_abs = start + duration_steps;
+    let off_day = if off_step_abs >= STEPS_PER_DAY {
+        today.succ_opt()?
+    } else {
+        today
+    };
+    let off_at = datetime_from_step(off_day, off_step_abs % STEPS_PER_DAY)?;
+    Some((on_at, off_at))
+}
+
 /// Computes today's Eco-mode plan for one myStrom switch, or `None` if there
 /// is not yet enough to plan from: no solar calibration, too little of today's
 /// forecast, or too little recorded history for the switch's own draw and the
@@ -1159,7 +1241,7 @@ async fn compute_eco_plan(
     off_hhmm: &str,
     today: chrono::NaiveDate,
 ) -> Option<app::EcoPlan> {
-    use devices::mystrom_switch::{STEPS_PER_DAY, duration_steps_from_timers, step_of_hhmm};
+    use devices::mystrom_switch::{duration_steps_from_timers, step_of_hhmm};
 
     let duration_steps = duration_steps_from_timers(on_hhmm, off_hhmm)?;
     let on_step = step_of_hhmm(on_hhmm)?;
@@ -1167,31 +1249,7 @@ async fn compute_eco_plan(
     let calibration = db::get_calibration(pool).await.ok().flatten()?;
 
     let forecast = db::query_forecast(pool, today, today).await.ok()?;
-    let mut production_w = [0.0; STEPS_PER_DAY];
-    let mut forecast_steps = 0usize;
-    for point in &forecast {
-        let local = point.valid_at.with_timezone(&chrono::Local);
-        if local.date_naive() != today {
-            continue;
-        }
-        let step = local.hour() as usize * 4 + local.minute() as usize / 15;
-        if let Some(slot) = production_w.get_mut(step) {
-            *slot = solar::predict_wh(point.gti_w_m2, point.temperature_c, calibration.k)
-                * solar::STEPS_PER_HOUR;
-            forecast_steps += 1;
-        }
-    }
-    // A day the forecast barely covers scores as if the sun never rose, since
-    // every unfilled step stays at zero production. That is indistinguishable
-    // from a genuinely overcast day — which is a *legitimate* all-tied result
-    // that `choose_window` is meant to break at random (see `TIE_EPSILON_WH`)
-    // — so the two cannot be told apart after the fact, only here, by asking
-    // how many steps actually arrived. Too few and there is no solar signal to
-    // place a window against at all; defer to the configured timer instead of
-    // rolling dice.
-    if forecast_steps < ECO_MIN_FORECAST_STEPS {
-        return None;
-    }
+    let production_w = production_curve(&forecast, calibration.k, today)?;
 
     let house_id: Option<i64> =
         sqlx::query_scalar("SELECT id FROM Devices WHERE type = 'sonnen_eco8' LIMIT 1")
@@ -1225,21 +1283,7 @@ async fn compute_eco_plan(
     // both curves to count one as known.
     let baseline_w = devices::mystrom_switch::baseline_from_curves(&house_curve, &switch_curve)?;
 
-    // Typical power while running: averaged over the switch's own historical
-    // on-window where there is data for it, falling back to its overall
-    // average — a switch that was just moved into Eco from a differently
-    // timed Time-mode schedule still has *some* history to start from.
-    let in_window: Vec<f64> = (0..duration_steps)
-        .filter_map(|i| switch_curve.get(&((on_step + i) % STEPS_PER_DAY)).copied())
-        .collect();
-    let typical_power_w = if in_window.is_empty() {
-        switch_curve.values().sum::<f64>() / switch_curve.len() as f64
-    } else {
-        in_window.iter().sum::<f64>() / in_window.len() as f64
-    };
-    if typical_power_w <= 0.0 {
-        return None;
-    }
+    let typical_power_w = typical_running_power(&switch_curve, on_step, duration_steps)?;
 
     let (start, predicted_grid_wh) = devices::mystrom_switch::choose_window(
         duration_steps,
@@ -1248,14 +1292,7 @@ async fn compute_eco_plan(
         &baseline_w,
     )?;
 
-    let on_at = datetime_from_step(today, start)?;
-    let off_step_abs = start + duration_steps;
-    let off_day = if off_step_abs >= STEPS_PER_DAY {
-        today.succ_opt()?
-    } else {
-        today
-    };
-    let off_at = datetime_from_step(off_day, off_step_abs % STEPS_PER_DAY)?;
+    let (on_at, off_at) = window_instants(today, start, duration_steps)?;
 
     Some(app::EcoPlan {
         date: today,
@@ -1371,6 +1408,41 @@ async fn fire_eco_leg(
 /// `MAX_TIMER_CATCHUP_MINUTES` (shared with `timer_job`) only bounds how late
 /// a catch-up is still worth attempting, so a multi-hour outage does not fire
 /// an hours-old "on" with almost none of its window left.
+/// The Eco-mode switches with a usable timer pair, and the pair that gives each
+/// one's window its length — see `compute_eco_plan`.
+///
+/// If a switch has more than one timer of either direction, the first found
+/// (earliest, since `switch_timers` is loaded in time order) is the one read:
+/// Eco plans exactly one window a day, so a device with several pairs configured
+/// only lends its first pair's length. A switch missing either direction is not
+/// a candidate at all — there is no duration to plan against.
+fn eco_candidates(app: &app::App) -> Vec<(IpAddr, String, String)> {
+    app.switch_auto_modes
+        .iter()
+        .filter(|(_, mode)| matches!(mode, SwitchAutoMode::Eco))
+        .filter_map(|(ip, _)| {
+            let timers = app.switch_timers.get(ip)?;
+            let on = timers.iter().find(|t| t.relay_on)?;
+            let off = timers.iter().find(|t| !t.relay_on)?;
+            Some((*ip, on.time_hhmm.clone(), off.time_hhmm.clone()))
+        })
+        .collect()
+}
+
+/// Whether one leg of a plan should fire now: it has not fired yet, its time has
+/// come, and it came recently enough to still be worth acting on.
+///
+/// The upper bound is what stops a laptop resumed in the evening from switching
+/// a tank on for a window that ended hours ago.
+fn leg_is_due(
+    fired: bool,
+    at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    catchup: chrono::Duration,
+) -> bool {
+    !fired && now >= at && now - at <= catchup
+}
+
 async fn eco_job(state: SharedState, pool: SqlitePool) {
     let mut ticker = tokio::time::interval(Duration::from_secs(TIMER_TICK_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1383,25 +1455,7 @@ async fn eco_job(state: SharedState, pool: SqlitePool) {
         let now = Utc::now();
         let today = now.with_timezone(&chrono::Local).date_naive();
 
-        // Eco-mode switches and the on/off timer pair that gives their
-        // window its length — see `compute_eco_plan`. If more than one of
-        // either exists, the first found (earliest, since `switch_timers` is
-        // loaded in time order) is the one read; Eco plans exactly one window
-        // a day, so a device with several timer pairs configured only lends
-        // its first pair's length.
-        let candidates: Vec<(IpAddr, String, String)> = {
-            let app = state.read().unwrap();
-            app.switch_auto_modes
-                .iter()
-                .filter(|(_, mode)| matches!(mode, SwitchAutoMode::Eco))
-                .filter_map(|(ip, _)| {
-                    let timers = app.switch_timers.get(ip)?;
-                    let on = timers.iter().find(|t| t.relay_on)?;
-                    let off = timers.iter().find(|t| !t.relay_on)?;
-                    Some((*ip, on.time_hhmm.clone(), off.time_hhmm.clone()))
-                })
-                .collect()
-        };
+        let candidates = eco_candidates(&state.read().unwrap());
         if candidates.is_empty() {
             continue;
         }
@@ -1451,10 +1505,10 @@ async fn eco_job(state: SharedState, pool: SqlitePool) {
             };
             let catchup = chrono::Duration::minutes(MAX_TIMER_CATCHUP_MINUTES);
 
-            if !plan.on_fired && now >= plan.on_at && now - plan.on_at <= catchup {
+            if leg_is_due(plan.on_fired, plan.on_at, now, catchup) {
                 fire_eco_leg(&state, ip, true, &mut on_attempts).await;
             }
-            if !plan.off_fired && now >= plan.off_at && now - plan.off_at <= catchup {
+            if leg_is_due(plan.off_fired, plan.off_at, now, catchup) {
                 fire_eco_leg(&state, ip, false, &mut off_attempts).await;
             }
         }
@@ -2194,6 +2248,289 @@ mod tests {
 
     fn local_hhmm(t: chrono::DateTime<Utc>) -> String {
         t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+    }
+
+    // ── Eco planning: the pure pieces ─────────────────────────────────────────
+
+    fn forecast_point(at: chrono::DateTime<chrono::Local>, gti: f64) -> solar::ForecastPoint {
+        solar::ForecastPoint {
+            valid_at: at.with_timezone(&Utc),
+            gti_w_m2: gti,
+            temperature_c: 20.0,
+            cloud_cover_pct: 0.0,
+            precipitation_mm: 0.0,
+        }
+    }
+
+    /// A forecast covering `steps` quarter-hours from midnight local, all with
+    /// the same irradiance.
+    fn forecast_covering(
+        day: chrono::NaiveDate,
+        steps: usize,
+        gti: f64,
+    ) -> Vec<solar::ForecastPoint> {
+        use chrono::TimeZone;
+        (0..steps)
+            .map(|i| {
+                let naive = day
+                    .and_hms_opt((i as u32 / 4) % 24, (i as u32 % 4) * 15, 0)
+                    .unwrap();
+                let local = chrono::Local
+                    .from_local_datetime(&naive)
+                    .earliest()
+                    .unwrap();
+                forecast_point(local, gti)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_forecast_covering_too_little_of_the_day_is_not_planned_against() {
+        // Below the gate there is no solar signal to place a window against;
+        // every unfilled step reads as zero production, which is indistinguishable
+        // from an overcast day.
+        let day = a_day();
+        let thin = forecast_covering(day, ECO_MIN_FORECAST_STEPS - 1, 500.0);
+        assert!(production_curve(&thin, 1.0, day).is_none());
+
+        let enough = forecast_covering(day, ECO_MIN_FORECAST_STEPS, 500.0);
+        assert!(production_curve(&enough, 1.0, day).is_some());
+    }
+
+    #[test]
+    fn only_todays_forecast_points_count_towards_the_coverage_gate() {
+        // `query_forecast` is asked for one day, but a point on either side of
+        // the local midnight boundary can still come back; it must not be
+        // counted as coverage of today.
+        let day = a_day();
+        let mut points = forecast_covering(day, ECO_MIN_FORECAST_STEPS - 1, 500.0);
+        points.extend(forecast_covering(day.succ_opt().unwrap(), 8, 500.0));
+        assert!(
+            production_curve(&points, 1.0, day).is_none(),
+            "tomorrow's points must not make today look covered"
+        );
+    }
+
+    #[test]
+    fn the_production_curve_lands_each_point_on_its_own_quarter_hour() {
+        let day = a_day();
+        let curve = production_curve(&forecast_covering(day, 96, 800.0), 1.0, day).unwrap();
+        assert_eq!(curve.len(), devices::mystrom_switch::STEPS_PER_DAY);
+        // Uniform irradiance in, so every step should hold the same figure, and
+        // it should be a real one.
+        assert!(curve[0] > 0.0);
+        assert!(curve.iter().all(|w| (w - curve[0]).abs() < 1e-9));
+    }
+
+    #[test]
+    fn a_dark_forecast_still_produces_a_curve_to_plan_against() {
+        // All-zero production is a legitimate result — an overcast day — and is
+        // deliberately distinct from "not enough forecast".
+        let day = a_day();
+        let curve = production_curve(&forecast_covering(day, 96, 0.0), 1.0, day).unwrap();
+        assert!(curve.iter().all(|w| *w == 0.0));
+    }
+
+    #[test]
+    fn typical_power_averages_the_switchs_own_on_window() {
+        // Steps 8..12 draw 2000 W, the rest 100 W. A window over 8..12 should
+        // read the former, not the blend.
+        let mut curve: HashMap<usize, f64> = (0..96).map(|i| (i, 100.0)).collect();
+        for i in 8..12 {
+            curve.insert(i, 2000.0);
+        }
+        assert_eq!(typical_running_power(&curve, 8, 4), Some(2000.0));
+    }
+
+    #[test]
+    fn typical_power_falls_back_to_the_overall_average_off_window() {
+        // A switch just moved into Eco from a differently timed schedule has no
+        // history in the new window, but still has history.
+        let curve: HashMap<usize, f64> = [(40, 300.0), (41, 500.0)].into_iter().collect();
+        assert_eq!(
+            typical_running_power(&curve, 8, 4),
+            Some(400.0),
+            "no data in 8..12, so the whole curve's average"
+        );
+    }
+
+    #[test]
+    fn typical_power_wraps_a_window_that_runs_past_midnight() {
+        let mut curve: HashMap<usize, f64> = (0..96).map(|i| (i, 100.0)).collect();
+        curve.insert(95, 1000.0);
+        curve.insert(0, 1000.0);
+        assert_eq!(
+            typical_running_power(&curve, 95, 2),
+            Some(1000.0),
+            "steps 95 and 0, not 95 and 96"
+        );
+    }
+
+    #[test]
+    fn a_switch_that_never_draws_anything_is_not_worth_planning_for() {
+        let curve: HashMap<usize, f64> = (0..96).map(|i| (i, 0.0)).collect();
+        assert_eq!(typical_running_power(&curve, 0, 4), None);
+        // An empty curve averages to NaN; rejecting it here is what keeps that
+        // out of `choose_window`. Unreachable via `compute_eco_plan`, which
+        // gates on `baseline_from_curves` first.
+        assert_eq!(typical_running_power(&HashMap::new(), 0, 4), None);
+    }
+
+    #[test]
+    fn a_window_reads_back_as_the_wall_clock_times_it_covers() {
+        let day = a_day();
+        // Step 32 is 08:00; four steps is an hour.
+        let (on, off) = window_instants(day, 32, 4).unwrap();
+        assert_eq!(local_hhmm(on), "08:00");
+        assert_eq!(local_hhmm(off), "09:00");
+    }
+
+    #[test]
+    fn a_window_that_runs_past_midnight_closes_on_the_next_day() {
+        let day = a_day();
+        // Step 92 is 23:00; eight steps carries it two hours into tomorrow.
+        let (on, off) = window_instants(day, 92, 8).unwrap();
+        assert_eq!(local_hhmm(on), "23:00");
+        assert_eq!(local_hhmm(off), "01:00");
+        assert!(off > on, "the close must not land before the open");
+        assert_eq!(
+            (off - on),
+            chrono::Duration::hours(2),
+            "eight quarter-hours, across the boundary"
+        );
+    }
+
+    // ── Eco candidates ────────────────────────────────────────────────────────
+
+    /// One switch to seed the app with: its last IP octet, its auto mode (or
+    /// none configured), and its timers as (time, turns-on).
+    type EcoEntry<'a> = (u8, Option<SwitchAutoMode>, &'a [(&'a str, bool)]);
+
+    fn eco_app(entries: &[EcoEntry]) -> app::App {
+        let mut app = app::App::default();
+        for (last_octet, mode, timers) in entries {
+            let ip: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, *last_octet));
+            if let Some(mode) = mode {
+                app.switch_auto_modes.insert(ip, mode.clone());
+            }
+            app.switch_timers.insert(
+                ip,
+                timers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (hhmm, relay_on))| app::SwitchTimer {
+                        id: i as i64,
+                        time_hhmm: (*hhmm).to_string(),
+                        relay_on: *relay_on,
+                    })
+                    .collect(),
+            );
+        }
+        app
+    }
+
+    #[test]
+    fn only_eco_switches_with_a_complete_timer_pair_are_candidates() {
+        let app = eco_app(&[
+            (
+                1,
+                Some(SwitchAutoMode::Eco),
+                &[("06:00", true), ("08:00", false)],
+            ),
+            (
+                2,
+                Some(SwitchAutoMode::Time),
+                &[("06:00", true), ("08:00", false)],
+            ),
+            (3, Some(SwitchAutoMode::Eco), &[("06:00", true)]),
+            (4, Some(SwitchAutoMode::Eco), &[("08:00", false)]),
+            (5, None, &[("06:00", true), ("08:00", false)]),
+        ]);
+        let got = eco_candidates(&app);
+        assert_eq!(got.len(), 1, "only .1 qualifies: {got:?}");
+        assert_eq!(got[0].0, IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1)));
+        assert_eq!((got[0].1.as_str(), got[0].2.as_str()), ("06:00", "08:00"));
+    }
+
+    #[test]
+    fn a_switch_with_several_pairs_lends_only_its_first() {
+        // Eco plans exactly one window a day, so the extra pairs are ignored
+        // rather than producing extra candidates.
+        let app = eco_app(&[(
+            1,
+            Some(SwitchAutoMode::Eco),
+            &[
+                ("06:00", true),
+                ("08:00", false),
+                ("18:00", true),
+                ("20:00", false),
+            ],
+        )]);
+        let got = eco_candidates(&app);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].1.as_str(), got[0].2.as_str()), ("06:00", "08:00"));
+    }
+
+    #[test]
+    fn no_eco_switches_means_no_candidates() {
+        assert!(eco_candidates(&app::App::default()).is_empty());
+    }
+
+    // ── Firing a leg ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_leg_fires_once_its_time_has_come_and_not_before() {
+        let catchup = chrono::Duration::minutes(MAX_TIMER_CATCHUP_MINUTES);
+        let at = at("07:00").with_timezone(&Utc);
+
+        assert!(!leg_is_due(
+            false,
+            at,
+            at - chrono::Duration::minutes(1),
+            catchup
+        ));
+        assert!(leg_is_due(false, at, at, catchup));
+        assert!(leg_is_due(
+            false,
+            at,
+            at + chrono::Duration::minutes(5),
+            catchup
+        ));
+    }
+
+    #[test]
+    fn a_leg_that_already_fired_does_not_fire_again() {
+        let catchup = chrono::Duration::minutes(MAX_TIMER_CATCHUP_MINUTES);
+        let at = at("07:00").with_timezone(&Utc);
+        assert!(!leg_is_due(
+            true,
+            at,
+            at + chrono::Duration::minutes(5),
+            catchup
+        ));
+    }
+
+    #[test]
+    fn a_leg_missed_by_more_than_the_catchup_is_left_alone() {
+        // Resuming a suspended machine in the evening must not switch a tank on
+        // for a window that closed hours ago.
+        let catchup = chrono::Duration::minutes(MAX_TIMER_CATCHUP_MINUTES);
+        let at = at("07:00").with_timezone(&Utc);
+
+        let just_inside = at + chrono::Duration::minutes(MAX_TIMER_CATCHUP_MINUTES);
+        assert!(
+            leg_is_due(false, at, just_inside, catchup),
+            "the bound is inclusive"
+        );
+
+        let just_outside = just_inside + chrono::Duration::seconds(1);
+        assert!(!leg_is_due(false, at, just_outside, catchup));
+        assert!(!leg_is_due(
+            false,
+            at,
+            at + chrono::Duration::hours(12),
+            catchup
+        ));
     }
 
     #[test]
