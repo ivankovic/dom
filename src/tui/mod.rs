@@ -552,267 +552,22 @@ async fn event_loop(
                         }
                     }
                 } else {
-                    // Set when the user toggles the theme, so the new choice can
-                    // be written to the DB after the write guard is dropped —
-                    // never hold the lock across an await.
-                    let mut theme_chosen: Option<theme::ThemeMode> = None;
-                    // Set when the selected statistics window or period changes,
-                    // so the new range is queried after the guard is released.
-                    let mut stats_reload = false;
+                    // Key handling is synchronous and runs holding the write lock,
+                    // so it records what it wants done and the code below acts on
+                    // it once the guard has been dropped — never an await, a
+                    // notify or a query while the lock is held.
+                    let KeyOutcome {
+                        quit,
+                        rescan: rescan_now,
+                        stats_reload,
+                        theme_chosen,
+                    } = apply_key(&mut state.write().unwrap(), &event, open_dialog_ip);
 
-                    // Synchronous write-lock branch. Scoped so the guard is
-                    // provably released before the await below.
-                    {
-                    let mut app = state.write().unwrap();
-
-                    if app.timer_dialog.is_some() {
-                        match event {
-                            Event::Key(KeyEvent {
-                                code: KeyCode::Char('c'),
-                                modifiers: KeyModifiers::CONTROL,
-                                ..
-                            }) => break,
-                            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
-                                app.timer_dialog = None;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Tab, .. }) => {
-                                let dlg = app.timer_dialog.as_mut().unwrap();
-                                dlg.field = match dlg.field {
-                                    TimerDialogField::Time => TimerDialogField::Action,
-                                    TimerDialogField::Action => TimerDialogField::Time,
-                                };
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
-                                let dlg = app.timer_dialog.as_mut().unwrap();
-                                if dlg.field == TimerDialogField::Time {
-                                    dlg.time_buf.pop();
-                                }
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char(c), .. }) => {
-                                let dlg = app.timer_dialog.as_mut().unwrap();
-                                if dlg.field == TimerDialogField::Time {
-                                    if dlg.time_buf.len() < 5 && (c.is_ascii_digit() || c == ':') {
-                                        dlg.time_buf.push(c);
-                                        // Auto-insert colon after 2 digits.
-                                        if dlg.time_buf.len() == 2 && !dlg.time_buf.contains(':') {
-                                            dlg.time_buf.push(':');
-                                        }
-                                    }
-                                } else {
-                                    dlg.relay_on = !dlg.relay_on;
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else if app.address_input.is_some() {
-                        match event {
-                            Event::Key(KeyEvent {
-                                code: KeyCode::Char('c'),
-                                modifiers: KeyModifiers::CONTROL,
-                                ..
-                            }) => break,
-                            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
-                                app.address_input = None;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
-                                if let Some(buf) = app.address_input.as_mut() {
-                                    buf.pop();
-                                }
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char(c), .. }) => {
-                                if let Some(buf) = app.address_input.as_mut() {
-                                    push_bounded(buf, c);
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else if app.rename_input.is_some() {
-                        match event {
-                            Event::Key(KeyEvent {
-                                code: KeyCode::Char('c'),
-                                modifiers: KeyModifiers::CONTROL,
-                                ..
-                            }) => break,
-                            Event::Key(KeyEvent { code: KeyCode::Char(c), .. }) => {
-                                if let Some(buf) = app.rename_input.as_mut() {
-                                    push_bounded(buf, c);
-                                }
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
-                                if let Some(buf) = app.rename_input.as_mut() {
-                                    buf.pop();
-                                }
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
-                                app.rename_input = None;
-                            }
-                            _ => {}
-                        }
-                    } else if let Some(ip) = open_dialog_ip {
-                        app.timer_dialog = Some(crate::app::TimerDialog {
-                            ip,
-                            time_buf: String::new(),
-                            relay_on: true,
-                            field: TimerDialogField::Time,
-                        });
-                    } else {
-                        match event {
-                            Event::Key(KeyEvent { code: KeyCode::Char('q' | 'Q'), .. })
-                            | Event::Key(KeyEvent {
-                                code: KeyCode::Char('c'),
-                                modifiers: KeyModifiers::CONTROL,
-                                ..
-                            }) => break,
-                            Event::Key(KeyEvent { code: KeyCode::Char('c' | 'C'), .. }) => {
-                                app.view = View::Current;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char('e' | 'E'), .. }) => {
-                                app.view = View::Energy;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char('n' | 'N'), .. }) => {
-                                app.view = View::Network;
-                            }
-                            // Reachable only when timer_delete (computed above from the same
-                            // 'd'/'D' press) was None — i.e. not currently deleting a timer.
-                            Event::Key(KeyEvent { code: KeyCode::Char('d' | 'D'), .. }) => {
-                                app.view = View::Devices;
-                                let max = app.visible_devices().len().saturating_sub(1);
-                                app.selected = app.selected.min(max);
-                            }
-                            // Wakes the ping-scan and discovery tasks immediately, out of
-                            // their normal schedule. A no-op for whichever of the two (if
-                            // any) is already mid-run, since Notify only wakes waiters that
-                            // are actually parked — it doesn't queue.
-                            Event::Key(KeyEvent { code: KeyCode::Char('s' | 'S'), .. }) => {
-                                rescan.notify_waiters();
-                            }
-                            // Switches between the dark and light palettes. Recorded
-                            // as an explicit choice, which from now on overrides
-                            // terminal auto-detection on every startup.
-                            // Each of m/y opens the statistics view directly on
-                            // that window; pressing the same one again returns to
-                            // the current period after browsing.
-                            Event::Key(KeyEvent { code: KeyCode::Char('m' | 'M'), .. }) => {
-                                app.view = View::Statistics;
-                                app.stats.set_window(crate::stats::StatsWindow::Month);
-                                stats_reload = true;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char('y' | 'Y'), .. }) => {
-                                app.view = View::Statistics;
-                                app.stats.set_window(crate::stats::StatsWindow::Year);
-                                stats_reload = true;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Left, .. })
-                                if app.view == View::Statistics =>
-                            {
-                                app.stats.back(chrono::Local::now().date_naive());
-                                stats_reload = true;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Right, .. })
-                                if app.view == View::Statistics =>
-                            {
-                                app.stats.forward();
-                                stats_reload = true;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char('a' | 'A'), .. })
-                                if app.view == View::Environment =>
-                            {
-                                app.address_input =
-                                    Some(app.location.as_ref().map(|l| l.label.clone()).unwrap_or_default());
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char('v' | 'V'), .. }) => {
-                                app.view = View::Environment;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Up, .. })
-                                if app.view == View::Environment =>
-                            {
-                                app.env_selected = app.env_selected.saturating_sub(1);
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Down, .. })
-                                if app.view == View::Environment =>
-                            {
-                                let max = render::temperature_sensors(&app).len().saturating_sub(1);
-                                app.env_selected = (app.env_selected + 1).min(max);
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char('t' | 'T'), .. }) => {
-                                app.theme_mode = app.theme_mode.toggled();
-                                theme_chosen = Some(app.theme_mode);
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Up, .. })
-                                if app.view == View::Energy =>
-                            {
-                                app.energy_selected = app.energy_selected.saturating_sub(1);
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Down, .. })
-                                if app.view == View::Energy =>
-                            {
-                                let max = energy_active_devices(&app).len().saturating_sub(1);
-                                app.energy_selected = (app.energy_selected + 1).min(max);
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Tab, .. })
-                                if is_device_list_view(&app.view) =>
-                            {
-                                app.focus = match app.focus {
-                                    Focus::DeviceList => Focus::Detail,
-                                    Focus::Detail => {
-                                        app.detail_row = 0;
-                                        Focus::DeviceList
-                                    }
-                                };
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Up, .. })
-                                if is_device_list_view(&app.view)
-                                    && app.focus == Focus::DeviceList =>
-                            {
-                                app.selected = app.selected.saturating_sub(1);
-                                app.detail_row = 0;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Down, .. })
-                                if is_device_list_view(&app.view)
-                                    && app.focus == Focus::DeviceList =>
-                            {
-                                let max = app.visible_devices().len().saturating_sub(1);
-                                app.selected = (app.selected + 1).min(max);
-                                app.detail_row = 0;
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Up, .. })
-                                if is_device_list_view(&app.view)
-                                    && app.focus == Focus::Detail =>
-                            {
-                                app.detail_row = app.detail_row.saturating_sub(1);
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Down, .. })
-                                if is_device_list_view(&app.view)
-                                    && app.focus == Focus::Detail =>
-                            {
-                                if let Some(ip) = app.selected_device().map(|d| d.ip)
-                                    && app
-                                        .selected_device()
-                                        .map(|d| d.name == Some(crate::devices::mystrom_switch::NAME))
-                                        .unwrap_or(false)
-                                {
-                                    let max = max_detail_row(&app, ip);
-                                    app.detail_row = (app.detail_row + 1).min(max);
-                                }
-                            }
-                            Event::Key(KeyEvent { code: KeyCode::Char('r' | 'R'), .. })
-                                if is_device_list_view(&app.view) =>
-                            {
-                                // Cloned out of the immutable borrow before the
-                                // mutable writes below; also looks the selected
-                                // device up once rather than twice.
-                                if let Some(current) = app
-                                    .selected_device()
-                                    .map(|d| d.label.clone().unwrap_or_default())
-                                {
-                                    app.rename_input = Some(current);
-                                    app.focus = Focus::Detail;
-                                    app.detail_row = 0;
-                                }
-                            }
-                            _ => {}
-                        }
+                    if quit {
+                        break;
                     }
+                    if rescan_now {
+                        rescan.notify_waiters();
                     }
 
                     if stats_reload {
@@ -830,6 +585,353 @@ async fn event_loop(
     }
 
     Ok(())
+}
+
+/// What a key press asks the event loop to do beyond mutating `App`.
+///
+/// Key handling is synchronous and runs holding the state write lock, so it
+/// cannot await, notify, or touch the database. It records what it wants here
+/// instead and `event_loop` acts on it once the guard is dropped — the same
+/// discipline the `theme_chosen` and `stats_reload` locals already followed,
+/// widened to cover quitting and rescanning as well.
+#[derive(Default, PartialEq, Debug)]
+struct KeyOutcome {
+    /// The user asked to quit: 'q', or Ctrl-C from any input.
+    quit: bool,
+    /// The user asked for an immediate ping-scan and discovery pass ('s').
+    rescan: bool,
+    /// The selected statistics window or period changed, so its range has to be
+    /// queried again.
+    stats_reload: bool,
+    /// The user toggled the palette; the choice has to be persisted.
+    theme_chosen: Option<theme::ThemeMode>,
+}
+
+/// Applies one key press to the application state.
+///
+/// Pure but for `app`: the same state, event and `open_dialog_ip` produce the
+/// same mutations and the same outcome, which is what makes the key map
+/// testable without a terminal, a database, or a running event loop.
+///
+/// `open_dialog_ip` is the switch whose timer dialog this press opens, decided
+/// earlier under the read lock along with the other Enter-driven actions.
+fn apply_key(app: &mut App, event: &Event, open_dialog_ip: Option<IpAddr>) -> KeyOutcome {
+    let mut outcome = KeyOutcome::default();
+
+    if app.timer_dialog.is_some() {
+        match event {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => outcome.quit = true,
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            }) => {
+                app.timer_dialog = None;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab, ..
+            }) => {
+                let dlg = app.timer_dialog.as_mut().unwrap();
+                dlg.field = match dlg.field {
+                    TimerDialogField::Time => TimerDialogField::Action,
+                    TimerDialogField::Action => TimerDialogField::Time,
+                };
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                let dlg = app.timer_dialog.as_mut().unwrap();
+                if dlg.field == TimerDialogField::Time {
+                    dlg.time_buf.pop();
+                }
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            }) => {
+                let dlg = app.timer_dialog.as_mut().unwrap();
+                if dlg.field == TimerDialogField::Time {
+                    if dlg.time_buf.len() < 5 && (c.is_ascii_digit() || *c == ':') {
+                        dlg.time_buf.push(*c);
+                        // Auto-insert colon after 2 digits.
+                        if dlg.time_buf.len() == 2 && !dlg.time_buf.contains(':') {
+                            dlg.time_buf.push(':');
+                        }
+                    }
+                } else {
+                    dlg.relay_on = !dlg.relay_on;
+                }
+            }
+            _ => {}
+        }
+    } else if app.address_input.is_some() {
+        match event {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => outcome.quit = true,
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            }) => {
+                app.address_input = None;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                if let Some(buf) = app.address_input.as_mut() {
+                    buf.pop();
+                }
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            }) => {
+                if let Some(buf) = app.address_input.as_mut() {
+                    push_bounded(buf, *c);
+                }
+            }
+            _ => {}
+        }
+    } else if app.rename_input.is_some() {
+        match event {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => outcome.quit = true,
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            }) => {
+                if let Some(buf) = app.rename_input.as_mut() {
+                    push_bounded(buf, *c);
+                }
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                if let Some(buf) = app.rename_input.as_mut() {
+                    buf.pop();
+                }
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            }) => {
+                app.rename_input = None;
+            }
+            _ => {}
+        }
+    } else if let Some(ip) = open_dialog_ip {
+        app.timer_dialog = Some(crate::app::TimerDialog {
+            ip,
+            time_buf: String::new(),
+            relay_on: true,
+            field: TimerDialogField::Time,
+        });
+    } else {
+        match event {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('q' | 'Q'),
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => outcome.quit = true,
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c' | 'C'),
+                ..
+            }) => {
+                app.view = View::Current;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('e' | 'E'),
+                ..
+            }) => {
+                app.view = View::Energy;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('n' | 'N'),
+                ..
+            }) => {
+                app.view = View::Network;
+            }
+            // Reachable only when timer_delete (computed above from the same
+            // 'd'/'D' press) was None — i.e. not currently deleting a timer.
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('d' | 'D'),
+                ..
+            }) => {
+                app.view = View::Devices;
+                let max = app.visible_devices().len().saturating_sub(1);
+                app.selected = app.selected.min(max);
+            }
+            // Wakes the ping-scan and discovery tasks immediately, out of
+            // their normal schedule. A no-op for whichever of the two (if
+            // any) is already mid-run, since Notify only wakes waiters that
+            // are actually parked — it doesn't queue.
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('s' | 'S'),
+                ..
+            }) => {
+                outcome.rescan = true;
+            }
+            // Switches between the dark and light palettes. Recorded
+            // as an explicit choice, which from now on overrides
+            // terminal auto-detection on every startup.
+            // Each of m/y opens the statistics view directly on
+            // that window; pressing the same one again returns to
+            // the current period after browsing.
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('m' | 'M'),
+                ..
+            }) => {
+                app.view = View::Statistics;
+                app.stats.set_window(crate::stats::StatsWindow::Month);
+                outcome.stats_reload = true;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('y' | 'Y'),
+                ..
+            }) => {
+                app.view = View::Statistics;
+                app.stats.set_window(crate::stats::StatsWindow::Year);
+                outcome.stats_reload = true;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }) if app.view == View::Statistics => {
+                app.stats.back(chrono::Local::now().date_naive());
+                outcome.stats_reload = true;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }) if app.view == View::Statistics => {
+                app.stats.forward();
+                outcome.stats_reload = true;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('a' | 'A'),
+                ..
+            }) if app.view == View::Environment => {
+                app.address_input = Some(
+                    app.location
+                        .as_ref()
+                        .map(|l| l.label.clone())
+                        .unwrap_or_default(),
+                );
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('v' | 'V'),
+                ..
+            }) => {
+                app.view = View::Environment;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            }) if app.view == View::Environment => {
+                app.env_selected = app.env_selected.saturating_sub(1);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }) if app.view == View::Environment => {
+                let max = render::temperature_sensors(app).len().saturating_sub(1);
+                app.env_selected = (app.env_selected + 1).min(max);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('t' | 'T'),
+                ..
+            }) => {
+                app.theme_mode = app.theme_mode.toggled();
+                outcome.theme_chosen = Some(app.theme_mode);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            }) if app.view == View::Energy => {
+                app.energy_selected = app.energy_selected.saturating_sub(1);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }) if app.view == View::Energy => {
+                let max = energy_active_devices(app).len().saturating_sub(1);
+                app.energy_selected = (app.energy_selected + 1).min(max);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab, ..
+            }) if is_device_list_view(&app.view) => {
+                app.focus = match app.focus {
+                    Focus::DeviceList => Focus::Detail,
+                    Focus::Detail => {
+                        app.detail_row = 0;
+                        Focus::DeviceList
+                    }
+                };
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            }) if is_device_list_view(&app.view) && app.focus == Focus::DeviceList => {
+                app.selected = app.selected.saturating_sub(1);
+                app.detail_row = 0;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }) if is_device_list_view(&app.view) && app.focus == Focus::DeviceList => {
+                let max = app.visible_devices().len().saturating_sub(1);
+                app.selected = (app.selected + 1).min(max);
+                app.detail_row = 0;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            }) if is_device_list_view(&app.view) && app.focus == Focus::Detail => {
+                app.detail_row = app.detail_row.saturating_sub(1);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }) if is_device_list_view(&app.view) && app.focus == Focus::Detail => {
+                if let Some(ip) = app.selected_device().map(|d| d.ip)
+                    && app
+                        .selected_device()
+                        .map(|d| d.name == Some(crate::devices::mystrom_switch::NAME))
+                        .unwrap_or(false)
+                {
+                    let max = max_detail_row(app, ip);
+                    app.detail_row = (app.detail_row + 1).min(max);
+                }
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('r' | 'R'),
+                ..
+            }) if is_device_list_view(&app.view) => {
+                // Cloned out of the immutable borrow before the
+                // mutable writes below; also looks the selected
+                // device up once rather than twice.
+                if let Some(current) = app
+                    .selected_device()
+                    .map(|d| d.label.clone().unwrap_or_default())
+                {
+                    app.rename_input = Some(current);
+                    app.focus = Focus::Detail;
+                    app.detail_row = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    outcome
 }
 
 #[cfg(test)]
@@ -1082,6 +1184,552 @@ mod tests {
         let listed: Vec<IpAddr> = energy_active_devices(&app).iter().map(|d| d.ip).collect();
         // ips[1] has no reading of any kind, and the order follows app.devices.
         assert_eq!(listed, vec![ips[0], ips[2], ips[3]]);
+    }
+
+    // ── The key map ───────────────────────────────────────────────────────────
+    //
+    // `apply_key` is the whole of the interface's key handling, lifted out of
+    // the event loop so it can be driven directly. Everything below presses a
+    // key at an `App` and checks what changed — no terminal, no database, no
+    // running loop.
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ch(c: char) -> Event {
+        key(KeyCode::Char(c))
+    }
+
+    fn ctrl(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    /// Presses a key with no timer dialog waiting to be opened, which is the
+    /// ordinary case.
+    fn press(app: &mut App, event: Event) -> KeyOutcome {
+        apply_key(app, &event, None)
+    }
+
+    fn app_in(view: View) -> App {
+        App {
+            view,
+            ..Default::default()
+        }
+    }
+
+    fn app_renaming() -> App {
+        App {
+            rename_input: Some(String::new()),
+            ..Default::default()
+        }
+    }
+
+    fn app_entering_address() -> App {
+        App {
+            address_input: Some(String::new()),
+            ..Default::default()
+        }
+    }
+
+    /// An app holding `n` devices, the first of them a myStrom switch — the one
+    /// device type with a navigable detail panel.
+    fn app_with_devices(n: u8) -> App {
+        let mut app = App::default();
+        for i in 1..=n {
+            app.devices.push(ScannedDevice {
+                ip: IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, i)),
+                latency_ms: 1.0,
+                open_ports: vec![],
+                name: if i == 1 {
+                    Some(crate::devices::mystrom_switch::NAME)
+                } else {
+                    None
+                },
+                label: None,
+            });
+        }
+        app.view = View::Devices;
+        app
+    }
+
+    // ── Quitting ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn q_and_ctrl_c_ask_the_loop_to_quit() {
+        for event in [ch('q'), ch('Q'), ctrl('c')] {
+            let mut app = App::default();
+            assert!(press(&mut app, event).quit);
+        }
+    }
+
+    #[test]
+    fn ctrl_c_quits_out_of_every_modal_input() {
+        // Whatever is open, Ctrl-C has to get the user out of the program —
+        // it is the one key that must not be swallowed as text.
+        let mut with_rename = app_renaming();
+        let mut with_address = app_entering_address();
+        let mut with_dialog = app_with_dialog(TimerDialogField::Time);
+
+        for app in [&mut with_rename, &mut with_address, &mut with_dialog] {
+            assert!(press(app, ctrl('c')).quit);
+        }
+    }
+
+    #[test]
+    fn q_is_a_letter_while_a_text_input_is_open() {
+        // The rename and address buffers take every printable key, so quitting
+        // on 'q' there would make the letter untypeable.
+        let mut app = app_renaming();
+        assert!(!press(&mut app, ch('q')).quit);
+        assert_eq!(app.rename_input.as_deref(), Some("q"));
+
+        let mut app = app_entering_address();
+        assert!(!press(&mut app, ch('q')).quit);
+        assert_eq!(app.address_input.as_deref(), Some("q"));
+    }
+
+    // ── Modal precedence ──────────────────────────────────────────────────────
+
+    #[test]
+    fn an_open_dialog_swallows_the_keys_that_would_switch_view() {
+        // 'e' is the Energy view unless something modal is open, in which case
+        // it is a keystroke belonging to that thing.
+        let mut app = App {
+            view: View::Current,
+            rename_input: Some(String::new()),
+            ..Default::default()
+        };
+        press(&mut app, ch('e'));
+        assert!(app.view == View::Current, "view must not have changed");
+        assert_eq!(app.rename_input.as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn opening_a_timer_dialog_consumes_the_press_that_opened_it() {
+        // `open_dialog_ip` is decided from this same key under the read lock;
+        // the press must not also be handled as a normal key.
+        //
+        // This branch is ahead of the main key map, so while it is taken no
+        // other binding fires — Ctrl-C included. That is safe only because the
+        // caller sets `open_dialog_ip` on Enter and nothing else (it needs
+        // `is_enter` and the "+ Add timer" slot), which is what keeps quitting
+        // reachable from everywhere.
+        let mut app = app_in(View::Devices);
+        let event = key(KeyCode::Enter);
+        let outcome = apply_key(&mut app, &event, Some(IP));
+
+        let dlg = app.timer_dialog.as_ref().expect("dialog opened");
+        assert_eq!(dlg.ip, IP);
+        assert_eq!(dlg.time_buf, "");
+        assert!(dlg.relay_on, "a new timer defaults to switching on");
+        assert!(dlg.field == TimerDialogField::Time);
+        assert_eq!(outcome, KeyOutcome::default(), "nothing else was asked for");
+    }
+
+    // ── The timer dialog ──────────────────────────────────────────────────────
+
+    fn app_with_dialog(field: TimerDialogField) -> App {
+        App {
+            timer_dialog: Some(crate::app::TimerDialog {
+                ip: IP,
+                time_buf: String::new(),
+                relay_on: true,
+                field,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn typing_a_time_inserts_the_colon_by_itself() {
+        let mut app = app_with_dialog(TimerDialogField::Time);
+        for c in "0730".chars() {
+            press(&mut app, ch(c));
+        }
+        assert_eq!(app.timer_dialog.unwrap().time_buf, "07:30");
+    }
+
+    #[test]
+    fn a_typed_colon_is_not_doubled_by_the_automatic_one() {
+        // Someone typing "7:30" supplies their own separator; the auto-insert
+        // only fires when two digits arrived without one.
+        let mut app = app_with_dialog(TimerDialogField::Time);
+        for c in "7:30".chars() {
+            press(&mut app, ch(c));
+        }
+        assert_eq!(app.timer_dialog.unwrap().time_buf, "7:30");
+    }
+
+    #[test]
+    fn the_time_field_takes_neither_letters_nor_a_sixth_character() {
+        let mut app = app_with_dialog(TimerDialogField::Time);
+        // A letter is refused part-way through, leaving what came before it.
+        for c in "07x3".chars() {
+            press(&mut app, ch(c));
+        }
+        assert_eq!(app.timer_dialog.as_ref().unwrap().time_buf, "07:3");
+
+        // "07:30" is full at five characters; a sixth is refused.
+        press(&mut app, ch('0'));
+        press(&mut app, ch('9'));
+        assert_eq!(app.timer_dialog.unwrap().time_buf, "07:30");
+    }
+
+    #[test]
+    fn backspace_erases_the_time_a_character_at_a_time() {
+        let mut app = app_with_dialog(TimerDialogField::Time);
+        for c in "0730".chars() {
+            press(&mut app, ch(c));
+        }
+        press(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.timer_dialog.as_ref().unwrap().time_buf, "07:3");
+        press(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.timer_dialog.unwrap().time_buf, "07:");
+    }
+
+    #[test]
+    fn tab_moves_between_the_time_and_the_action() {
+        let mut app = app_with_dialog(TimerDialogField::Time);
+        press(&mut app, key(KeyCode::Tab));
+        assert!(app.timer_dialog.as_ref().unwrap().field == TimerDialogField::Action);
+        press(&mut app, key(KeyCode::Tab));
+        assert!(app.timer_dialog.unwrap().field == TimerDialogField::Time);
+    }
+
+    #[test]
+    fn on_the_action_field_any_character_flips_the_relay() {
+        let mut app = app_with_dialog(TimerDialogField::Action);
+        press(&mut app, ch('x'));
+        assert!(!app.timer_dialog.as_ref().unwrap().relay_on);
+        press(&mut app, ch('x'));
+        assert!(app.timer_dialog.as_ref().unwrap().relay_on);
+        // ...and the time is left alone.
+        assert_eq!(app.timer_dialog.unwrap().time_buf, "");
+    }
+
+    #[test]
+    fn esc_abandons_the_dialog() {
+        let mut app = app_with_dialog(TimerDialogField::Time);
+        press(&mut app, key(KeyCode::Esc));
+        assert!(app.timer_dialog.is_none());
+    }
+
+    // ── Text inputs ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_rename_buffer_takes_typing_backspace_and_esc() {
+        let mut app = app_renaming();
+        for c in "lamp".chars() {
+            press(&mut app, ch(c));
+        }
+        assert_eq!(app.rename_input.as_deref(), Some("lamp"));
+        press(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.rename_input.as_deref(), Some("lam"));
+        press(&mut app, key(KeyCode::Esc));
+        assert!(app.rename_input.is_none());
+    }
+
+    #[test]
+    fn the_address_buffer_takes_typing_backspace_and_esc() {
+        let mut app = app_entering_address();
+        for c in "Bern".chars() {
+            press(&mut app, ch(c));
+        }
+        assert_eq!(app.address_input.as_deref(), Some("Bern"));
+        press(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.address_input.as_deref(), Some("Ber"));
+        press(&mut app, key(KeyCode::Esc));
+        assert!(app.address_input.is_none());
+    }
+
+    #[test]
+    fn a_held_key_cannot_grow_an_input_without_bound() {
+        // `push_bounded` is what enforces this; the point here is that the key
+        // map actually routes through it rather than pushing directly.
+        let mut app = app_renaming();
+        for _ in 0..MAX_INPUT_CHARS * 2 {
+            press(&mut app, ch('x'));
+        }
+        assert_eq!(app.rename_input.unwrap().chars().count(), MAX_INPUT_CHARS);
+    }
+
+    // ── Views ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn each_view_has_a_key_in_either_case() {
+        for (lower, upper, expected) in [
+            ('c', 'C', View::Current),
+            ('e', 'E', View::Energy),
+            ('n', 'N', View::Network),
+            ('d', 'D', View::Devices),
+            ('v', 'V', View::Environment),
+        ] {
+            for c in [lower, upper] {
+                let mut app = app_in(View::Statistics);
+                press(&mut app, ch(c));
+                assert!(app.view == expected, "'{c}' should open its view");
+            }
+        }
+    }
+
+    #[test]
+    fn opening_the_devices_view_pulls_the_selection_back_into_range() {
+        // The selection is shared with the other list views, which can be
+        // longer than this one.
+        let mut app = app_with_devices(2);
+        app.view = View::Network;
+        app.selected = 9;
+        press(&mut app, ch('d'));
+        assert!(app.view == View::Devices);
+        assert_eq!(app.selected, 1, "two devices, so the last index is 1");
+    }
+
+    #[test]
+    fn the_devices_view_survives_having_no_devices_at_all() {
+        // `visible_devices().len() - 1` on an empty list is the underflow this
+        // guards; `selected` has to land on 0, not `usize::MAX`.
+        let mut app = app_in(View::Network);
+        app.selected = 3;
+        press(&mut app, ch('d'));
+        assert_eq!(app.selected, 0);
+    }
+
+    // ── Statistics ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn m_and_y_open_statistics_on_their_window_and_ask_for_a_reload() {
+        for (c, window) in [
+            ('m', crate::stats::StatsWindow::Month),
+            ('y', crate::stats::StatsWindow::Year),
+        ] {
+            let mut app = app_in(View::Current);
+            let outcome = press(&mut app, ch(c));
+            assert!(app.view == View::Statistics);
+            assert!(app.stats.window == window, "'{c}' selects its window");
+            assert!(outcome.stats_reload, "the new range has to be queried");
+        }
+    }
+
+    #[test]
+    fn the_arrow_keys_only_page_through_time_in_the_statistics_view() {
+        // Left and Right mean something else in every other view, so the guard
+        // on these arms is what keeps them from firing there.
+        let mut app = app_in(View::Statistics);
+        assert!(press(&mut app, key(KeyCode::Left)).stats_reload);
+        assert!(press(&mut app, key(KeyCode::Right)).stats_reload);
+
+        let mut app = app_in(View::Current);
+        assert!(!press(&mut app, key(KeyCode::Left)).stats_reload);
+        assert!(!press(&mut app, key(KeyCode::Right)).stats_reload);
+    }
+
+    // ── Environment ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_opens_the_address_prompt_only_from_the_environment_view() {
+        let mut app = app_in(View::Environment);
+        press(&mut app, ch('a'));
+        assert_eq!(app.address_input.as_deref(), Some(""));
+
+        // Elsewhere 'a' is not bound at all.
+        let mut app = app_in(View::Devices);
+        press(&mut app, ch('a'));
+        assert!(app.address_input.is_none());
+    }
+
+    #[test]
+    fn the_address_prompt_opens_on_the_address_already_set() {
+        // Correcting a typo in a long address should not mean retyping it.
+        let mut app = app_in(View::Environment);
+        app.location = Some(crate::db::Location {
+            label: "Bundesplatz 3, 3005 Bern".into(),
+            east: 0.0,
+            north: 0.0,
+            latitude: 0.0,
+            longitude: 0.0,
+        });
+        press(&mut app, ch('a'));
+        assert_eq!(
+            app.address_input.as_deref(),
+            Some("Bundesplatz 3, 3005 Bern")
+        );
+    }
+
+    #[test]
+    fn the_sensor_selection_stops_at_both_ends_of_the_list() {
+        let mut app = app_in(View::Environment);
+        // No sensors are reporting, so the list is empty and nothing moves.
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(app.env_selected, 0);
+        press(&mut app, key(KeyCode::Up));
+        assert_eq!(app.env_selected, 0, "must not wrap to usize::MAX");
+    }
+
+    #[test]
+    fn the_energy_selection_stops_at_both_ends_of_the_list() {
+        let mut app = app_in(View::Energy);
+        // Nothing is reporting, so the list is empty and neither arrow moves.
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(app.energy_selected, 0);
+        press(&mut app, key(KeyCode::Up));
+        assert_eq!(app.energy_selected, 0, "must not wrap to usize::MAX");
+    }
+
+    #[test]
+    fn a_key_that_is_not_bound_is_simply_ignored() {
+        // Each modal branch ends in a catch-all; the point is that an unbound
+        // key leaves the state exactly as it was rather than falling through
+        // to the branch below.
+        let mut renaming = app_renaming();
+        let mut addressing = app_entering_address();
+        let mut dialog = app_with_dialog(TimerDialogField::Time);
+
+        for app in [&mut renaming, &mut addressing, &mut dialog] {
+            let outcome = press(app, key(KeyCode::F(5)));
+            assert_eq!(outcome, KeyOutcome::default());
+            assert!(app.view == View::Current, "the view is left where it was");
+        }
+        assert_eq!(renaming.rename_input.as_deref(), Some(""));
+        assert_eq!(addressing.address_input.as_deref(), Some(""));
+        assert!(dialog.timer_dialog.is_some());
+    }
+
+    // ── Theme ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn t_toggles_the_palette_and_reports_the_choice_for_saving() {
+        let mut app = App::default();
+        let was = app.theme_mode;
+        let outcome = press(&mut app, ch('t'));
+        assert!(app.theme_mode != was, "the palette flipped");
+        assert_eq!(
+            outcome.theme_chosen,
+            Some(app.theme_mode),
+            "the loop persists exactly what is now in effect"
+        );
+
+        // Back again, and that is what gets stored.
+        let outcome = press(&mut app, ch('T'));
+        assert_eq!(app.theme_mode, was);
+        assert_eq!(outcome.theme_chosen, Some(was));
+    }
+
+    // ── Rescan ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn s_asks_for_a_rescan_and_changes_nothing_else() {
+        let mut app = app_in(View::Devices);
+        let outcome = press(&mut app, ch('s'));
+        assert_eq!(
+            outcome,
+            KeyOutcome {
+                rescan: true,
+                ..Default::default()
+            }
+        );
+        assert!(app.view == View::Devices, "the view is left where it was");
+    }
+
+    // ── Device list navigation ────────────────────────────────────────────────
+
+    #[test]
+    fn tab_moves_focus_into_the_detail_panel_and_back() {
+        let mut app = app_with_devices(2);
+        app.detail_row = 3;
+
+        press(&mut app, key(KeyCode::Tab));
+        assert!(app.focus == Focus::Detail);
+        assert_eq!(app.detail_row, 3, "the row is kept on the way in");
+
+        press(&mut app, key(KeyCode::Tab));
+        assert!(app.focus == Focus::DeviceList);
+        assert_eq!(app.detail_row, 0, "and reset on the way back out");
+    }
+
+    #[test]
+    fn tab_does_nothing_in_a_view_without_a_detail_panel() {
+        let mut app = app_in(View::Statistics);
+        press(&mut app, key(KeyCode::Tab));
+        assert!(app.focus == Focus::DeviceList);
+    }
+
+    #[test]
+    fn the_device_selection_stops_at_both_ends_of_the_list() {
+        let mut app = app_with_devices(2);
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(app.selected, 1);
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(app.selected, 1, "clamped at the last device");
+        press(&mut app, key(KeyCode::Up));
+        assert_eq!(app.selected, 0);
+        press(&mut app, key(KeyCode::Up));
+        assert_eq!(app.selected, 0, "must not wrap to usize::MAX");
+    }
+
+    #[test]
+    fn moving_between_devices_resets_the_detail_row() {
+        // The row means something different for each device, so carrying it
+        // across would land on an unrelated slot.
+        let mut app = app_with_devices(2);
+        app.detail_row = 3;
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(app.detail_row, 0);
+    }
+
+    #[test]
+    fn the_detail_row_only_moves_down_for_a_switch() {
+        // A switch is the one device with rows to walk through; for anything
+        // else Down in the detail panel has nowhere to go.
+        let mut app = app_with_devices(2);
+        app.switch_auto_modes
+            .insert(app.devices[0].ip, SwitchAutoMode::Disabled);
+        app.focus = Focus::Detail;
+
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(app.detail_row, 1, "relay, then auto");
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(app.detail_row, 1, "and no further with auto mode off");
+
+        // The second device is not a switch, so its panel does not scroll.
+        app.selected = 1;
+        app.detail_row = 0;
+        press(&mut app, key(KeyCode::Down));
+        assert_eq!(app.detail_row, 0);
+    }
+
+    #[test]
+    fn the_detail_row_stops_at_the_top() {
+        let mut app = app_with_devices(1);
+        app.focus = Focus::Detail;
+        press(&mut app, key(KeyCode::Up));
+        assert_eq!(app.detail_row, 0, "must not wrap to usize::MAX");
+    }
+
+    // ── Renaming ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn r_opens_the_rename_prompt_on_the_label_already_set() {
+        let mut app = app_with_devices(1);
+        app.devices[0].label = Some("Kitchen".into());
+        press(&mut app, ch('r'));
+        assert_eq!(app.rename_input.as_deref(), Some("Kitchen"));
+        assert!(app.focus == Focus::Detail);
+        assert_eq!(app.detail_row, 0);
+    }
+
+    #[test]
+    fn r_opens_an_empty_prompt_for_a_device_that_has_no_label() {
+        let mut app = app_with_devices(1);
+        press(&mut app, ch('r'));
+        assert_eq!(app.rename_input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn r_does_nothing_with_no_device_selected() {
+        let mut app = app_in(View::Devices);
+        press(&mut app, ch('r'));
+        assert!(app.rename_input.is_none());
     }
 
     // ── Input bounds ──────────────────────────────────────────────────────────
