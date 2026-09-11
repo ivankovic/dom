@@ -36,3 +36,7 @@ target
 # Diagnostics, written beside the database. See src/logging.rs.
 dom.log
 dom.log.1
+
+# Local UI state for the codediff viewer (theme, layout, recently diffed
+# file pairs pointing at throwaway /tmp blobs). Per-machine, not project config.
+.codediff.toml
