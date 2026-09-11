@@ -20,6 +20,33 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! Dom, as a library: every module the binary is assembled from.
+//!
+//! `main.rs` is the application — the tokio runtime, the background tasks, the
+//! terminal — and everything it does is built out of the modules declared here.
+//! The split exists so the parts can be tested without one: an integration test,
+//! or `cargo test`, links this crate and never starts a runtime or a TUI.
+//!
+//! Read [`db`] first if you are looking for where data lives, [`app`] for what
+//! the interface currently believes, and SPECS.md for why any of it is shaped
+//! the way it is. The modules divide up roughly as:
+//!
+//! - [`app`] — the whole of the displayed state, behind one lock, plus the pure
+//!   functions that derive from it. No I/O.
+//! - [`db`] — the SQLite schema, every query, and the tiered retention that
+//!   keeps a two-second sample rate affordable on an SD card.
+//! - [`devices`] — one module per kind of hardware on the LAN, each with its own
+//!   detection, polling and (where it applies) actuation.
+//! - [`fingerprint`] — what a host on the network looks like from the outside,
+//!   which is what `devices` classifies.
+//! - [`tui`] — drawing and key handling, and nothing else.
+//! - [`energy`], [`solar`], [`stats`] — the arithmetic: provenance, the array's
+//!   own geometry, and the aggregates the statistics view draws.
+//! - [`online`] — the three public-internet services, over hand-written HTTP
+//!   on TLS. The only places Dom reaches anything off the LAN.
+//! - [`cluster`], [`alarm`], [`logging`] — running as one of two nodes, saying
+//!   so when something is wrong, and writing diagnostics somewhere other than
+//!   the terminal the TUI owns.
 pub mod alarm;
 pub mod app;
 pub mod cluster;

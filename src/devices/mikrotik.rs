@@ -20,6 +20,48 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! A MikroTik router: who else is on the network, and what the uplink is doing.
+//!
+//! This device is not measured for its own sake. It is the only thing that knows
+//! facts about the *network* — which addresses hold a DHCP lease and what names
+//! they gave, and how many bytes have crossed the internet interface — and both
+//! of those show up elsewhere: leases give discovered devices their names in the
+//! Network view, and the interface counters are what the internet-traffic chart
+//! draws.
+//!
+//! It is polled far more slowly than anything else (half an hour by default).
+//! None of what it reports changes every two seconds, and a router is the one
+//! device where an expensive poll has a cost for everything else on the network.
+//!
+//! Three things here are unlike the other device modules:
+//!
+//! - **It is the only device Dom authenticates to**, with a username and
+//!   password over RouterOS's REST API. That is also why it is the only one that
+//!   speaks TLS: the credential used to be sent over plain HTTP on every poll.
+//!   A router's certificate is self-signed, so it is pinned on first use rather
+//!   than verified — [`crate::devices::tls`] explains the trade, and why a
+//!   mismatch must never fall back to cleartext. [`Transport`] is the choice
+//!   between the two, and a cleartext session is surfaced in the interface as a
+//!   warning rather than done quietly.
+//! - **The JSON is not well-typed.** RouterOS returns numbers as strings, some
+//!   fields appear only sometimes, and a missing field is not an error — hence
+//!   `str_or_u64` and the tolerant shapes of [`DhcpLease`], [`FirewallRule`] and
+//!   [`InterfaceStats`].
+//! - **Only one of the two fetches is allowed to fail the poll.** A poll reads
+//!   leases and firewall rules; `decide_poll_outcome` is the pure function that
+//!   decides what that pair means, and only a failed *lease* fetch makes the
+//!   device Disconnected. Losing the firewall rules keeps the previous ones and
+//!   raises a warning, because they change rarely and a router that is answering
+//!   is not offline.
+//! - **A traffic counter can go backwards.** The interface byte counters are
+//!   cumulative, so a delta over any interval is exactly the bytes that passed —
+//!   until the router reboots and they restart from zero. The poll loop records a
+//!   delta only when both counters have not decreased; a reboot loses that one
+//!   interval rather than recording a nonsensical figure.
+//!
+//! `INTERNET_INTERFACE` is a fact about this installation, and only the modem
+//! reports it — the same fetch against the router or an access point comes back
+//! empty and is skipped.
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;

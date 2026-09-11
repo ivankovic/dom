@@ -20,6 +20,33 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! The Sonnen Eco 8 battery: the house's whole energy picture, from one device.
+//!
+//! This is the most important device on the network, because it is the only one
+//! that measures the *house* rather than itself. Its status endpoint reports
+//! four powers — production, consumption, battery and grid — and those four are
+//! where nearly every number in the statistics and energy views comes from.
+//! See [`Reading`] for the sign conventions, which are not obvious: the battery
+//! is positive when discharging and the grid is positive when *exporting*.
+//!
+//! Its poll loop writes six metrics per interval, in one transaction. Four are
+//! the powers themselves, integrated over the interval (`consumption`,
+//! `production`, `pac`, `grid`). The other two — `grid_to_house` and
+//! `grid_to_battery` — are not measured at all: they are what
+//! [`crate::energy`] derives, and they exist because "how much of what the house
+//! used came from the grid" is unanswerable from the four powers alone once the
+//! battery can charge from the grid. That module's documentation has the
+//! reasoning and the worked example; nothing here should be changed without
+//! reading it.
+//!
+//! State of charge goes to `EnergyStorage` rather than `Energy`, since it is a
+//! level and not a flow — averaging it is meaningful, summing it is not.
+//!
+//! Two operational notes. The API needs an `Auth-Token`, which is why
+//! `DeviceRecord` carries an `api_key` and why a battery with none configured
+//! cannot be polled. And the request is plain HTTP on port 8080, because that is
+//! what the device offers — unlike [`crate::devices::mikrotik`], there is no TLS
+//! to pin.
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 

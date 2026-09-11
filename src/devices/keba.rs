@@ -20,6 +20,46 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! A KEBA wallbox: charging a car from the sun, over UDP.
+//!
+//! Two things make this the most involved device module. It is the only one that
+//! does not speak HTTP — the wallbox's protocol is line-oriented UDP on port
+//! 7090, where a request is a word (`report 2`) and the reply is JSON — and it
+//! is the only one whose actuation is *continuous*. A switch is on or off; a
+//! wallbox is told a current, in milliamps, and changing it changes how fast a
+//! car charges right now.
+//!
+//! The polling half reads two reports: [`Report2`] for state, plug and hardware
+//! current limit, [`Report3`] for power and energy counters. Note the units —
+//! milliwatts and deci-watt-hours — which is where the conversions in the
+//! storage helpers come from, and [`state_label`]/[`plug_label`] for what the
+//! numeric codes mean.
+//!
+//! # Eco mode
+//!
+//! [`eco_loop`] is the rest of the file: every ten seconds it looks at the
+//! surplus the battery module is reporting and commands the current that
+//! consumes it, so the car charges on solar rather than on the grid. The pure
+//! decision is `eco_decision`, and the constants above it are the module's
+//! real content — each one is there because of something observed in the field:
+//!
+//! - **The averaging window equals the tick.** A longer one (60 s was tried)
+//!   mixes samples from before and after Eco's own last command, so the estimate
+//!   describes a blend of two regimes and Eco oscillates between off and maximum
+//!   instead of converging.
+//! - **Hysteresis on the enable decision.** The protocol floor is 6 A; without a
+//!   lower floor for *stopping*, a surplus hovering near it flapped the charger
+//!   on and off every tick — seen in the field as repeated "5 kW available but
+//!   charging is off".
+//! - **Only 90% of the measured surplus is claimed**, because the estimate is a
+//!   ten-second average and a cloud or a kettle should cost some unclaimed
+//!   export rather than tip the car into drawing from the grid.
+//! - **Volts and phases are [`Supply`], read from the database**, because they
+//!   describe a building rather than a protocol. Getting them wrong does not
+//!   fail; it scales every target by the ratio it is wrong by.
+//!
+//! `eco_decision` is a pure function for the same reason `cluster::decide_role`
+//! is: it is the part that must not be wrong, and it can be exercised directly.
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 

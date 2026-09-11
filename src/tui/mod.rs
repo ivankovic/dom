@@ -20,6 +20,46 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! The terminal interface: the event loop, and what a key press means.
+//!
+//! [`run`] is the entry point, and its signature is the first decision worth
+//! knowing about: it returns [`Interface::Unavailable`] rather than an error
+//! when there is no terminal. Dom's actual work happens in background tasks that
+//! neither need nor notice one, and treating a missing TTY as fatal meant a
+//! headless Raspberry Pi — the normal way to run this — collected nothing at all.
+//!
+//! `event_loop` then selects over three things: a 100 ms redraw tick, the
+//! crossterm event stream, and whatever the key press asked for. Drawing is
+//! `render`'s job and nothing in this module does any of it.
+//!
+//! # Deciding is separated from doing
+//!
+//! This is the organising idea of the file, and it exists because the whole
+//! second half used to be untestable.
+//!
+//! `apply_key` is a **pure** function of the state, the event and which dialog
+//! is open. It mutates [`crate::app::App`] for anything that is only a
+//! change of view — moving the selection, opening a dialog, typing into one —
+//! and for anything that needs the world, it returns a `KeyOutcome` saying *what
+//! should happen* without doing it. So the entire key map is exercisable with no
+//! terminal, and the tests at the foot of the file do exactly that.
+//!
+//! The "Acting on a key press" section is the other half: one function per
+//! outcome, each running after the read lock that decided it has been dropped.
+//! They were a two-hundred-line `if`/`else if` chain inlined in `event_loop`,
+//! which nothing could reach; split out, the database-backed ones run against an
+//! in-memory schema. That matters because they are where "change what is
+//! displayed only once the write succeeded" is decided — a relay that reports
+//! itself on before the command lands is worse than a slow one.
+//!
+//! Two consequences to respect when adding to this:
+//!
+//! - **Capture the address, not the row.** Anything held across the `await` in
+//!   an action must be an `IpAddr` or an id, because the device list can be
+//!   rebuilt by a scan while the write is in flight. `timer_delete` carries
+//!   `(IpAddr, i64)` for this reason.
+//! - **No lock is held across an `await`.** The pure half reads under the lock
+//!   and the acting half runs without it, which is what keeps that true.
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;

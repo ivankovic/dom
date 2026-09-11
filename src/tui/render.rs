@@ -20,6 +20,41 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! Drawing, and only drawing.
+//!
+//! One entry point — `render` — which lays out a one-line status bar above
+//! whichever of the six views [`View`] currently names, then draws the timer
+//! dialog over the top if one is open. Everything below that is the six views
+//! and the widgets they are made of, in the sections the `── ──` headers mark.
+//!
+//! # What this module is not allowed to do
+//!
+//! It takes `&App` and a `Frame`. It performs no I/O, awaits nothing, queries
+//! nothing, and mutates nothing — every number it draws was put in
+//! [`App`](crate::app::App) by a background task or by `apply_key`. A view that
+//! wants data that is not there yet does not fetch it; something else fetches it
+//! on a schedule and the view draws what has arrived.
+//!
+//! That is what keeps a 100 ms redraw affordable on a Raspberry Pi, and it is
+//! also why this file is large: the work of turning state into a chart happens
+//! here rather than being spread through the tasks that produced the state.
+//!
+//! # Drawing a value that is not there
+//!
+//! Most of the formatting helpers take an `Option` and return a string either
+//! way, because "not measured yet", "the device is unreachable" and "the value
+//! is zero" are three different things and the interface has to keep them apart.
+//! A missing reading is a dash, never a zero — a zero is a measurement.
+//! `altitude` is the smallest example of the pattern.
+//!
+//! The status bar carries the same idea for Dom's own health: normally it shows
+//! the key hints, but when `App::write_error` is set it replaces them with
+//! `not recording measurements — …`. A poll loop that fetches happily while
+//! every write fails otherwise looks identical, on screen, to one that is fine.
+//!
+//! Colours come from [`Theme`](crate::tui::theme::Theme) rather than being named
+//! here, since the palette depends on what the terminal turned out to be — see
+//! `tui::theme`.
 use std::net::IpAddr;
 
 use ratatui::Frame;

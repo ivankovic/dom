@@ -20,6 +20,40 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! Everything the interface currently believes, in one place.
+//!
+//! [`App`] is the whole of the displayed state — some fifty fields covering the
+//! device list, the last reading and connection status per address, the charts,
+//! the dialogs, the scan in progress, the cluster's view of its peer. It lives
+//! behind one `RwLock` as [`SharedState`]: the background tasks in `main` write
+//! to it, and the render pass reads it. That is the only channel between them.
+//!
+//! One lock rather than many, because the alternative is a screen drawn from
+//! several inconsistent snapshots, and because nothing here is held long enough
+//! to matter — no lock in this project is held across an `await`.
+//!
+//! **This module performs no I/O and awaits nothing.** Whatever is derived from
+//! the state is derived by a plain function of it, which is what makes those
+//! functions testable without a database, a network or a terminal:
+//! [`classify_network_devices`] sorts a scan into a topology,
+//! [`status_transition`] decides whether a change is worth recording as an
+//! event. Where a task needs to *do* something, it does it in `main` or `tui`
+//! and writes the result here.
+//!
+//! Two consequences of holding state keyed by address are worth knowing about:
+//!
+//! - [`App::forget_device`] has to clear *every* address-keyed field, and there
+//!   are fourteen of them. Forgetting a device while leaving its certificate alert or its
+//!   cleartext warning behind left a row that could not be dismissed; a test now
+//!   fills all of them and asserts nothing survives.
+//! - A device's address is not stable. Anything that captures one before an
+//!   `await` and uses it after must capture the address, not an index — see
+//!   `tui::mod`'s action functions.
+//!
+//! [`App::write_error`] is the one field that is about Dom rather than about the
+//! house: it says that recording a measurement failed, so that a working poll
+//! loop writing into a full disk does not look identical to one that is fine.
+//! What it cannot yet say is how much has failed — see REVIEW.md.
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};

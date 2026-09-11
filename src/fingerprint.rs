@@ -20,6 +20,38 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! What a host on the network looks like from the outside.
+//!
+//! Discovery answers "is there something at this address"; this module answers
+//! "what does it say about itself". It does not decide what the thing *is* —
+//! that is [`crate::devices::detect_type`], which dispatches to each device
+//! module's own `detect`. Keeping the two apart means the evidence is gathered
+//! once per address and every classifier reads the same [`Fingerprint`].
+//!
+//! The evidence is deliberately shallow: a TCP connect against a fixed list of
+//! ports, and on the HTTP ones a `GET /` and a `GET /report` (the second is how
+//! a myStrom switch identifies itself, and a harmless 404 everywhere else). The
+//! full raw response is kept, headers and all, because what distinguishes these
+//! devices is usually a `Server` header or a title rather than anything
+//! structured.
+//!
+//! Two things here are less obvious than they look, and both were bugs:
+//!
+//! - **Redirects have to be followed, and the address is part of the loop
+//!   guard.** A router's `/` is usually a 301 to HTTPS or to a login path, so
+//!   refusing to follow leaves nothing to classify on. The guard compares
+//!   address, port *and* path, because `resolve_redirect` can change the
+//!   address — comparing only port and path read a redirect to the same resource
+//!   on a different host as a loop.
+//! - **None of this is a string of ASCII.** The response comes from whatever
+//!   answered, so every place that reads it works on bytes rather than slicing a
+//!   `&str` at a fixed offset. See `extract_location` and `split_authority`; the
+//!   latter also exists because an IPv6 literal's own colons are not a port
+//!   separator. SPECS.md, "a string from the network is not a string of ASCII",
+//!   has the reasoning.
+//!
+//! Every read is capped (`HTTP_MAX_BYTES`) and every wait is bounded, since the
+//! thing on the other end is unidentified by definition.
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 

@@ -20,6 +20,60 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! The application: what starts, in what order, and what runs forever.
+//!
+//! Everything Dom can *do* lives in the library ([`dom`]); this file is the
+//! assembly. `main` opens the database, establishes a few facts that everything
+//! else depends on, spawns the long-running tasks, and hands the terminal to
+//! [`dom::tui::run`] — which may decline it, on a headless machine, without that
+//! being an error.
+//!
+//! # The order at startup is load-bearing
+//!
+//! Three steps happen before anything is allowed to record a measurement, and
+//! each is there because of a specific failure:
+//!
+//! - **`await_plausible_clock`.** A Raspberry Pi has no battery-backed clock: it
+//!   boots at whatever was last written to disk and jumps when NTP catches up.
+//!   A sample stamped days in the past is rolled up into the wrong day — or into
+//!   a day already marked done, and so never rolled up at all, after which
+//!   pruning removes it. The database is the only available evidence that time
+//!   has passed, so the check is "is the clock at least as late as the newest
+//!   row", and it is bounded: waiting forever would mean a machine with no
+//!   network never starts.
+//! - **The cluster identity and role.** The node id, keypair and peer address are
+//!   read once here rather than by each of the three cluster tasks
+//!   independently, and `App::cluster_role` is seeded *synchronously* before any
+//!   of them spawn. The heartbeat listener answers from that field as soon as it
+//!   accepts connections, so a paired node must never be observed at
+//!   `Role::default()` — a peer heartbeating in that window would read a false
+//!   `claims_active` and could wrongly demote itself.
+//! - **`bootstrap_known_devices`**, so a restart resumes polling what it already
+//!   knew about instead of waiting for a discovery pass.
+//!
+//! # The tasks
+//!
+//! Twelve are spawned here — nine for the house, three for the cluster — plus
+//! one poll loop per configured device. They share nothing but the pool and the
+//! one `RwLock` around [`App`](dom::app::App): there are no channels between
+//! them, and a task that dies takes only its own job with it.
+//!
+//! Discovery is two tasks rather than one, on independent schedules: an ICMP
+//! sweep of every local subnet, and a pass that reads the router's DHCP leases.
+//! Both can be woken early by the interface's "rescan now" key through a shared
+//! `Notify`. The rest keep something current on a timer — the charts, the
+//! outdoor temperature, the production forecast, the daily rollups, the
+//! retention tiers — and three more run the cluster.
+//!
+//! All but one are on a tokio `interval`, so a task's period is its period and
+//! not its period plus however long the work took. `statistics_task` keeps a
+//! trailing `sleep` deliberately: there the throttle exists to leave the disk
+//! alone *between* passes, and an `interval` would hand it straight into the
+//! next one.
+//!
+//! Release builds are compiled with `panic = "abort"`, which makes any reachable
+//! panic in any of these the end of the whole process. That is the reason the
+//! robustness work recorded in SPECS.md went where it did.
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;

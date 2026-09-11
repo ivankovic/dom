@@ -20,6 +20,67 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! The database: the schema, every query, and how a 2-second sample rate is
+//! made affordable.
+//!
+//! One SQLite file, one pool, and no ORM — every query in this project is
+//! written out here as SQL. Nothing else in the tree talks to the database
+//! directly, which is why the file is as long as it is: it is the whole data
+//! layer, not a module of it.
+//!
+//! [`init`] is the only entry point that matters to a caller. It connects,
+//! creates or migrates the schema, and is safe to run on every startup. The
+//! connection settings it applies are each a deliberate trade recorded at the
+//! constant — WAL with `synchronous = NORMAL` (a power cut may cost the last few
+//! seconds of a series that is re-derivable, and the alternative is a disk flush
+//! per commit, forever, on an SD card), `MAX_WRITE_WAIT` for the write lock,
+//! and `MAX_POOL_WAIT`, deliberately longer, for a connection.
+//!
+//! # Tiered retention is the central idea
+//!
+//! Six metrics every two seconds is about 260,000 rows a day, and keeping them
+//! forever is what a Raspberry Pi cannot do. So resolution is traded for age, in
+//! three tiers, each a table of its own:
+//!
+//! | tier | table | kept |
+//! |---|---|---|
+//! | 2 seconds | `Energy` | [`RAW_ENERGY_RETENTION_DAYS`] days |
+//! | 1 minute | `EnergyMinute` | [`MINUTE_RETENTION_DAYS`] days |
+//! | 1 day | `EnergyDaily` | forever |
+//!
+//! Separate tables rather than a `resolution` column on one, for the reasons
+//! recorded above `EnergyMinute` — and the vestigial column that decision left
+//! behind is discussed there and in REVIEW.md.
+//!
+//! Three consequences run through everything below:
+//!
+//! - **A rollup must be idempotent and must know what it has done.**
+//!   `RollupProgress` records which days are complete per tier, because a day is
+//!   pruned only once it has been summarised. A day marked done that was never
+//!   summarised is data lost silently, which is why the clock check in `main`
+//!   runs before anything records.
+//! - **Nothing is summed across a tier boundary.** A query for today reads the
+//!   minute tier below `minute_tier_boundary` — the start of the first minute
+//!   `EnergyMinute` does not cover — and the 2-second rows at or above it, so no
+//!   interval is counted twice or missed. Totals that need a sign read
+//!   `energy_ws_pos`/`energy_ws_neg` from the tier rather than re-splitting an
+//!   aggregate, since ±0 sums to 0.
+//! - **A gap is not a zero.** `EnergyMinute.span_secs` says how much of a minute
+//!   was actually observed, so a stall is visible as a hole rather than averaged
+//!   away.
+//!
+//! # Space is managed, not assumed
+//!
+//! `auto_vacuum = INCREMENTAL` puts freed pages on a list and never shrinks the
+//! file on its own; [`reclaim_free_pages`] hands them back a bounded number at a
+//! time. What it does *not* do is repack partially-full pages, which is why an
+//! index maintained by inserts arriving out of key order stays about half empty
+//! however diligently space is reclaimed — see [`repack_series_indexes`], which
+//! is the deliberate, opt-in answer to that, and SPECS.md for the measurements.
+//!
+//! Deletes are batched for the same reason everything else here is bounded: one
+//! statement that holds the write lock for a long time is nine poll loops
+//! queueing behind it.
 use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use std::collections::HashMap;
 use std::net::IpAddr;

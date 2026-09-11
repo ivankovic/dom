@@ -20,6 +20,39 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! A myStrom WiFi switch: the one device here that is told what to do.
+//!
+//! Everything else on the network is measured. A switch is also *actuated* —
+//! [`set_relay`] turns it on and off — which makes it the module where being
+//! wrong has a physical consequence, and the reason the cluster design goes to
+//! the trouble it does about two nodes never disagreeing.
+//!
+//! The measurement half is ordinary: [`fetch_report`] reads power and relay
+//! state over plain HTTP on port 80, and the poll loop integrates power into
+//! `Energy` rows the same way every other loop does.
+//!
+//! The rest of this file is **Eco mode**, which is the interesting part. A switch
+//! typically drives something that has to run for a fixed number of hours a day
+//! but does not care *when* — a water heater, a dehumidifier. Eco mode picks the
+//! window that minimises grid import, once a day, from predicted production and
+//! the house's own consumption curve. SPECS.md, "Eco mode for myStrom switches",
+//! records the design; the functions here are its pure pieces, each testable on
+//! its own:
+//!
+//! - The day is [`STEPS_PER_DAY`] quarter-hours. [`step_of_hhmm`] and
+//!   [`duration_steps_from_timers`] convert the user's own timers into that grid,
+//!   so how long the device runs is taken from what they already configured
+//!   rather than asked for again.
+//! - [`baseline_from_curves`] builds what a candidate window is scored against,
+//!   and returns `None` when too little of the day is known — an unknown step is
+//!   not a zero-cost one.
+//! - [`best_window_starts`] returns *every* start within a tolerance of the best,
+//!   not one. Ties are the expected outcome rather than an edge case: on a sunny
+//!   day with surplus all afternoon, many windows genuinely cost the same.
+//! - [`choose_window`] resolves that to a single answer.
+//!
+//! A day Eco cannot score falls back to the device's own timer, which is the
+//! safe direction: the thing still runs when the user said it should.
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 

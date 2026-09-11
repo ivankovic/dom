@@ -56,19 +56,18 @@ from reading.
 
 ## The older half of `src/` has no module documentation
 
-`solar.rs`, `stats.rs`, `theme.rs` and all of `online/` open with a `//!` block explaining
-what the module is for and which decisions are load-bearing — they are the most readable
-files in the project, and that is why.
+**Fixed on 2026-09-12.** Every file in `src/` now opens with a `//!` block; see SPECS.md,
+"every module says what it is for".
 
-`db.rs`, `app.rs`, `main.rs`, `fingerprint.rs`, `tui/mod.rs`, `tui/render.rs` and all five
-device modules have none: not a reduced one, zero `//!` lines. `db.rs` is 4,522 lines and
-`render.rs` 3,508, and both open directly on `use` statements. The per-item documentation
-inside them is genuinely good, which makes the missing orientation more noticeable rather
-than less — there is nothing that says what the file as a whole is responsible for.
-
-Still true as of 2026-09-11, and now the oldest thing on this list. `alarm.rs` and
-`cluster.rs`, added since, both open with one — so the convention is not in doubt, only
-unapplied to the files that predate it.
+One caveat on how, because it bears on how much to trust them. The four largest files
+(`db.rs`, `tui/render.rs`, and the KEBA and MikroTik device modules) were still not read end
+to end — the 2026-09-11 caveat below stands. Their module docs were written from the
+item-level documentation already in them, their section structure, SPECS.md, and targeted
+reads of what each claim names, and then every symbol, constant and behaviour each doc asserts
+was grepped and checked against the code. That caught one outright error: the MikroTik doc
+first described `decide_poll_outcome` as handling counter resets, which it does not — it
+decides which of the two fetches is allowed to fail the poll. What the docs state has been
+verified; what they *omit* about those four files is not evidence of absence.
 
 ## `Energy.resolution` is still vestigial, and the column is now the whole of it
 

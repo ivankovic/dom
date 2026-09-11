@@ -804,7 +804,11 @@ Three consequences worth stating:
 - **The repack is opt-in, behind `DOM_MIGRATE_ENERGY`**, because it holds the write lock over
   a whole-table index rebuild and that is not something to do to someone waiting for the TUI.
   A failure there is reported and startup continues: every index is either old or new, and
-  both are correct.
+  both are correct. Stop the running instance before setting the variable — `DOM_MIGRATE_ENERGY=1
+  dom` is a *second* process against the same file, and the live one's poll loops would queue
+  behind the rebuild on their 30-second `busy_timeout`. Note also that the file does not shrink
+  when the repack reports success: it puts ~11,700 pages on the free list, and
+  `reclaim_free_pages` hands those back on its own schedule.
 - **It is not permanent.** The rebuilt index fragments again as rows arrive. This buys back
   what has accumulated; it does not change the mechanism.
 
@@ -814,6 +818,42 @@ pruning frees pages at the back, so live fragmentation is plausibly worse than m
 than better. And the live database is far larger than four days of data because it grew before
 retention existed; these figures are what a repack recovers from *this* table shape, not a
 prediction for that file.
+
+### Decision: every module says what it is for
+
+Thirteen of the twenty-six files in `src/` opened directly on `use` statements — including the
+two largest, `db.rs` at ~4,900 lines and `tui/render.rs` at ~3,600. The oldest finding in
+REVIEW.md, and the most quietly expensive: the per-item documentation in those files is good,
+which makes the absence of any orientation more noticeable rather than less. There was nothing
+that said what a file as a whole was responsible for.
+
+All thirteen now have one, so every module in the project does. They follow the convention the
+already-documented half established — a one-line statement of what the module is, then why it
+exists, what is load-bearing in it, and what it deliberately does *not* do, with measured
+figures where they exist and a pointer here for anything designed rather than discovered.
+
+What went in them is a judgement worth recording: they describe responsibilities and the
+decisions behind them, not inventories. A list of the functions in a file is already in the
+file and goes stale; "this module performs no I/O and awaits nothing, and here is what that
+buys" does not. Four of them state a constraint that way — `app.rs`, `tui/render.rs`,
+`cluster.rs` and `energy.rs` — and those constraints are the reason those modules are testable.
+
+The risk here was writing confident, specific documentation that is subtly wrong, which in a
+codebase whose documentation has earned trust is worse than none. Two things were done about
+it. The four largest files were *not* read end to end for this — their docs were assembled
+from the item documentation already in them, their section structure, this file, and targeted
+reads — and then every symbol, constant and behaviour each doc names was checked against the
+code. That caught one outright error and three imprecisions: the MikroTik doc described
+`decide_poll_outcome` as handling counter resets, where it actually decides which of the two
+fetches per poll is allowed to fail; `lib.rs` called `online` two services where it is three;
+`app.rs` said "a dozen" address-keyed fields where there are fourteen; `main.rs` said ten
+spawned tasks where there are twelve. All four were the same kind of mistake — a plausible
+figure asserted without counting — which is the failure mode to expect from this exercise.
+
+`cargo doc` is clean of new warnings, which is also a check: an intra-doc link to a private
+item warns, so every `[`bracketed`]` name in these blocks is one that genuinely exists and is
+genuinely public.
+
 
 ### Smaller decisions
 

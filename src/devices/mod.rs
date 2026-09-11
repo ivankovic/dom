@@ -20,6 +20,47 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! The hardware on the network, and what every kind of it has in common.
+//!
+//! Each submodule owns one kind of device — [`mystrom_switch`],
+//! [`sonnen_batterie`], [`keba`], [`mikrotik`], plus [`dom_local`] for the
+//! machine Dom itself runs on. They are deliberately uniform, and reading one
+//! tells you the shape of all of them:
+//!
+//! - `NAME` and `API_PORT`, and a `detect` that says whether a
+//!   [`crate::fingerprint::Fingerprint`] looks like this device. [`detect_type`]
+//!   is what asks each of them.
+//! - A struct for the device's own API response, and a `fetch_*` that parses one.
+//! - `DeviceRecord`, `save_device`, `load_all` — the device's row.
+//! - A `poll_loop`, spawned once per configured device by `main`, which reads,
+//!   integrates, writes, and updates [`crate::app::App`].
+//!
+//! What lives *here* is everything that would otherwise be written four times,
+//! and each piece of it exists because a divergence between those copies was a
+//! bug:
+//!
+//! - **Bounded reads.** [`MAX_RESPONSE_BYTES`] and `read_capped`. A device's
+//!   answer is read into memory, so a device that never stops talking must not
+//!   be able to exhaust it. It errors rather than truncating, because a
+//!   truncated JSON body is a parse failure reported as if the device were
+//!   broken.
+//! - **Integration across a gap.** [`max_integration_gap_ms`] — a poll loop
+//!   integrates power between consecutive readings, which is only meaningful
+//!   while the two bracket continuous polling. The worst observed case
+//!   attributed 10.8 kWh to one row and inflated a day by 23%.
+//! - **Failure handling.** [`handle_poll_failure`] moves a device through
+//!   Connecting and Lost, and decides when a run of failures is worth asking
+//!   whether the device changed address rather than went away.
+//! - **The tick itself.** [`PollTicker`], which re-reads `poll_interval_secs`
+//!   from the database periodically so changing a device's interval takes effect
+//!   without a restart.
+//! - **Saying when a write failed.** [`note_write_failure`] and
+//!   [`note_write_ok`]. A fetch that keeps working while every write fails looks
+//!   on screen exactly like one that is fine, which it is not.
+//!
+//! [`scan_all_networks`] and [`arp_cache`] are the discovery side: who answers a
+//! ping on every local subnet, and what MAC the kernel has for them — which is
+//! how a device that took a new DHCP lease is recognised as the same hardware.
 pub mod dom_local;
 pub mod keba;
 pub mod mikrotik;

@@ -20,6 +20,27 @@
  *  THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+//! The machine Dom is running on, as an entry in its own device list.
+//!
+//! Every other module in `devices` talks to something across the network. This
+//! one describes the host itself, which is a display concern rather than a
+//! measurement one: nothing polls it, nothing actuates it, and a `dom_local` row
+//! exists so that the computer serving the interface appears in the Devices view
+//! alongside everything it is watching.
+//!
+//! What makes it more than one `INSERT` is the question of which address. A host
+//! has many, and most of them are not "where Dom is on the house network":
+//! loopback says nothing, IPv6 link-local is not routable and there is one per
+//! interface, and a container or virtualisation bridge is genuinely this host but
+//! is not on the LAN. Registering all of them made one computer appear four times
+//! over. [`detect_local_ips`] applies those exclusions — see
+//! `VIRTUAL_IFACE_PREFIXES` for the filter and the direction it is deliberately
+//! wrong in.
+//!
+//! Because that definition has been narrowed since rows were first written,
+//! [`forget_stale_addresses`] exists to remove the ones the old definition left
+//! behind. It only removes rows with no history attached, so narrowing it again
+//! cannot take measurements with it.
 use std::net::IpAddr;
 
 use sqlx::{Row, SqlitePool};
