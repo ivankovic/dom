@@ -191,7 +191,11 @@ pub async fn refresh(pool: &sqlx::SqlitePool, state: &crate::app::SharedState) {
 
     match fetch_nearest(location.east, location.north).await {
         Ok(obs) => {
-            let _ = crate::db::insert_outdoor_temperature(
+            // Logged rather than discarded, as the poll loops do: these rows
+            // are what `TemperatureDaily` and the Environment view's history
+            // chart are built from, and a fetch that keeps succeeding while
+            // every write fails looks, on screen, exactly like one that works.
+            if let Err(e) = crate::db::insert_outdoor_temperature(
                 pool,
                 obs.station.measured_at,
                 &obs.station.id,
@@ -200,7 +204,10 @@ pub async fn refresh(pool: &sqlx::SqlitePool, state: &crate::app::SharedState) {
                 obs.station.altitude_m,
                 obs.distance_km,
             )
-            .await;
+            .await
+            {
+                log::warn!("recording the outdoor temperature failed: {e:#}");
+            }
             let today = chrono::Local::now().date_naive();
             let range = crate::db::outdoor_range_for_day(pool, today)
                 .await

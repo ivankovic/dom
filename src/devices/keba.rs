@@ -384,10 +384,18 @@ pub async fn poll_loop(
             Ok((r2, r3)) => {
                 let power_w = r3.power_mw / 1000.0;
                 let t = ts(poll_time);
-                let _ = save_raw(&pool, device.id, &t, power_w).await;
-                if let Some((prev_power, prev_t)) = prev {
-                    let _ =
-                        save_energy(&pool, device.id, prev_power, prev_t, power_w, poll_time).await;
+                // Logged rather than discarded, as the battery's and the switch's
+                // loops already do. This is the largest load in the house, so a
+                // run of failed writes is the one worth being able to find
+                // afterwards — silently, the series simply has a hole in it.
+                if let Err(e) = save_raw(&pool, device.id, &t, power_w).await {
+                    log::warn!("keba {}: recording this poll failed: {e:#}", device.ip);
+                }
+                if let Some((prev_power, prev_t)) = prev
+                    && let Err(e) =
+                        save_energy(&pool, device.id, prev_power, prev_t, power_w, poll_time).await
+                {
+                    log::warn!("keba {}: recording this interval failed: {e:#}", device.ip);
                 }
 
                 // KEBA can silently ignore an `ena`/`curr` sent while the EV isn't

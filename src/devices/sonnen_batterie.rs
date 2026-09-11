@@ -27,7 +27,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
@@ -91,10 +91,8 @@ pub async fn fetch_status(ip: IpAddr, port: u16, api_key: &str) -> anyhow::Resul
         .await
         .context("send request")?;
 
-    let mut buf = Vec::new();
-    timeout(Duration::from_secs(10), stream.read_to_end(&mut buf))
+    let buf = crate::devices::read_capped(&mut stream, Duration::from_secs(10))
         .await
-        .context("read timeout")?
         .context("read failed")?;
 
     let raw = String::from_utf8_lossy(&buf);

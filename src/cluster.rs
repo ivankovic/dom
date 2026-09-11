@@ -140,13 +140,34 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Decodes a lowercase-or-uppercase hex string, or `None` if it is not one.
+///
+/// Works over `as_bytes()` rather than re-slicing the `&str`, and that is not a
+/// style choice: `&s[i..i + 2]` panics when byte `i + 2` lands inside a
+/// multi-byte character, and every caller here is handed a string straight off
+/// the network — `verify_reply` decodes the `public_key` and `signature` fields
+/// of a `HeartbeatReply` that arrived as JSON from whatever answered at the
+/// probed address. `cluster_discovery_task` probes *every* candidate LAN
+/// address, so "whatever answered" is not necessarily a Dom node; one reply
+/// containing a non-ASCII character in either field used to abort the process,
+/// since release builds set `panic = "abort"`. A malformed value must be a
+/// `None`, exactly as `"zz"` already was.
 pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    fn digit(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
         .collect()
 }
 
@@ -363,6 +384,21 @@ mod tests {
     }
 
     #[test]
+    fn a_multibyte_hex_string_is_rejected_without_panicking() {
+        // These arrive from the network, so "not hex" has to include "not
+        // ASCII": slicing the `&str` two bytes at a time used to panic when a
+        // character straddled the boundary, and `panic = "abort"` in release
+        // turns that into the whole process dying.
+        assert_eq!(from_hex("aéb"), None, "even byte length, split mid-char");
+        assert_eq!(from_hex("é"), None);
+        assert_eq!(from_hex("ééé"), None);
+        assert_eq!(from_hex("00é00"), None);
+        // The replacement character is what `from_utf8_lossy` produces, and is
+        // three bytes wide.
+        assert_eq!(from_hex("0\u{fffd}0\u{fffd}"), None);
+    }
+
+    #[test]
     fn a_reply_verifies_against_its_own_signature() {
         let keypair = test_keypair();
         let reply = sign_reply(&keypair, "node-a", true, "deadbeef");
@@ -394,12 +430,23 @@ mod tests {
             "claiming a different key entirely"
         );
 
-        let mut malformed = original;
+        let mut malformed = original.clone();
         malformed.signature = "not-hex".to_string();
         assert!(
             !verify_reply(&malformed),
             "malformed signature is rejected, not panicked on"
         );
+
+        // The reply is parsed from JSON sent by whatever answered at the probed
+        // address, so its fields can hold any valid UTF-8 at all — not just the
+        // ASCII a real node would send.
+        let mut multibyte_signature = original.clone();
+        multibyte_signature.signature = "déadbeef".to_string();
+        assert!(!verify_reply(&multibyte_signature));
+
+        let mut multibyte_key = original;
+        multibyte_key.public_key = "déadbeef".to_string();
+        assert!(!verify_reply(&multibyte_key));
     }
 
     #[test]

@@ -499,6 +499,15 @@ impl App {
         self.switch_timers.remove(ip);
         self.switch_eco_plans.remove(ip);
         self.last_network_status.remove(ip);
+        // Added with the TLS work, and missed here until the code health pass
+        // of 2026-09-11 — which is the omission the paragraph above warns
+        // about, happening. Left behind, the two of them kept the Network
+        // view's security panel telling a person about an address nothing was
+        // talking to: a certificate warning offering 'k' to accept a pin for a
+        // device that had moved, and a cleartext-credentials warning for
+        // traffic that was no longer being sent.
+        self.cert_alerts.remove(ip);
+        self.cleartext_devices.remove(ip);
     }
 
     /// Live status for a network-infrastructure device: prefers ping-history
@@ -772,5 +781,129 @@ mod tests {
         };
         app.conn_status.insert(ip, ConnStatus::Online);
         assert_eq!(app.network_status(ip), NetworkDeviceStatus::Ok);
+    }
+
+    /// `forget_device` promises to clear *every* map keyed by address, and had
+    /// quietly stopped doing so: `cert_alerts` and `cleartext_devices` arrived
+    /// with the TLS work and were never added to it. There was no test, which
+    /// is why nothing noticed.
+    ///
+    /// Written against the whole struct rather than against a list of fields,
+    /// so the next map added to `App` is caught by this too: it fills every
+    /// address-keyed field, forgets the address, and asserts nothing anywhere
+    /// still mentions it.
+    #[test]
+    fn forgetting_a_device_leaves_nothing_behind_under_its_address() {
+        let ip: IpAddr = "172.16.0.7".parse().unwrap();
+        let other: IpAddr = "172.16.0.8".parse().unwrap();
+        let now = Utc::now();
+
+        let mut app = App::default();
+        for at in [ip, other] {
+            app.conn_status.insert(at, ConnStatus::Lost);
+            app.last_error.insert(at, "unreachable".to_string());
+            app.readings.insert(
+                at,
+                LiveReading {
+                    consumption_w: 1.0,
+                    production_w: 1.0,
+                    pac_w: 0.0,
+                    rsoc: 50.0,
+                    grid_w: 0.0,
+                    remaining_kwh: 1.0,
+                    capacity_kwh: 2.0,
+                    updated_at: now,
+                },
+            );
+            app.switch_readings.insert(
+                at,
+                SwitchReading {
+                    power_w: 1.0,
+                    relay_on: true,
+                    temperature_c: 20.0,
+                    updated_at: now,
+                },
+            );
+            app.mikrotik_readings.insert(
+                at,
+                MikrotikReading {
+                    leases: vec![],
+                    firewall_rules: vec![],
+                    updated_at: now,
+                },
+            );
+            app.keba_readings.insert(
+                at,
+                KebaReading {
+                    power_w: 0.0,
+                    energy_session_kwh: 0.0,
+                    energy_total_kwh: 0.0,
+                    state: 0,
+                    plug: 0,
+                    curr_hw_ma: 0,
+                    updated_at: now,
+                },
+            );
+            app.keba_modes
+                .insert(at, crate::devices::keba::ChargingMode::Disabled);
+            app.polled_ips.insert(at);
+            app.poll_latency_ms.insert(at, 10.0);
+            app.device_energy_today
+                .insert(at, DeviceEnergyToday::default());
+            app.switch_auto_modes.insert(at, SwitchAutoMode::Time);
+            app.switch_timers.insert(at, vec![]);
+            app.switch_eco_plans.insert(
+                at,
+                EcoPlan {
+                    date: now.date_naive(),
+                    on_at: now,
+                    off_at: now,
+                    predicted_grid_wh: None,
+                    on_fired: false,
+                    off_fired: false,
+                },
+            );
+            app.last_network_status
+                .insert(at, NetworkDeviceStatus::Lost);
+            app.cert_alerts.insert(
+                at,
+                CertAlert {
+                    expected: "aa".to_string(),
+                    observed: "bb".to_string(),
+                },
+            );
+            app.cleartext_devices.insert(at);
+        }
+
+        app.forget_device(&ip);
+
+        assert!(!app.conn_status.contains_key(&ip));
+        assert!(!app.last_error.contains_key(&ip));
+        assert!(!app.readings.contains_key(&ip));
+        assert!(!app.switch_readings.contains_key(&ip));
+        assert!(!app.mikrotik_readings.contains_key(&ip));
+        assert!(!app.keba_readings.contains_key(&ip));
+        assert!(!app.keba_modes.contains_key(&ip));
+        assert!(!app.polled_ips.contains(&ip));
+        assert!(!app.poll_latency_ms.contains_key(&ip));
+        assert!(!app.device_energy_today.contains_key(&ip));
+        assert!(!app.switch_auto_modes.contains_key(&ip));
+        assert!(!app.switch_timers.contains_key(&ip));
+        assert!(!app.switch_eco_plans.contains_key(&ip));
+        assert!(!app.last_network_status.contains_key(&ip));
+        assert!(
+            !app.cert_alerts.contains_key(&ip),
+            "a certificate warning for an address that has moved offers 'k' to \
+             pin a device that is not there"
+        );
+        assert!(
+            !app.cleartext_devices.contains(&ip),
+            "nothing is being sent to this address at all, in the clear or otherwise"
+        );
+
+        // The device that did not move keeps everything.
+        assert!(app.conn_status.contains_key(&other));
+        assert!(app.cert_alerts.contains_key(&other));
+        assert!(app.cleartext_devices.contains(&other));
     }
 }

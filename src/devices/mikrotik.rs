@@ -28,7 +28,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
 use sqlx::{Row, SqlitePool};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
@@ -341,10 +341,8 @@ where
         .await
         .context("send request")?;
 
-    let mut buf = Vec::new();
-    timeout(Duration::from_secs(10), stream.read_to_end(&mut buf))
+    let buf = crate::devices::read_capped(&mut stream, Duration::from_secs(10))
         .await
-        .context("read timeout")?
         .context("read failed")?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
@@ -657,22 +655,21 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
                 // rather than recording a bogus huge delta from wraparound.
                 if traffic.rx_byte >= prev.rx_byte && traffic.tx_byte >= prev.tx_byte {
                     let t = crate::devices::ts(chrono::Utc::now());
-                    let _ = save_traffic_delta(
-                        &pool,
-                        device.id,
-                        &t,
-                        "traffic_rx_bytes",
-                        traffic.rx_byte - prev.rx_byte,
-                    )
-                    .await;
-                    let _ = save_traffic_delta(
-                        &pool,
-                        device.id,
-                        &t,
-                        "traffic_tx_bytes",
-                        traffic.tx_byte - prev.tx_byte,
-                    )
-                    .await;
+                    // Logged rather than discarded, as the other three poll
+                    // loops do. These deltas are the only source of the
+                    // Internet-traffic chart, and a write that fails takes that
+                    // interval's traffic with it — `prev_traffic` advances
+                    // regardless, so it is not made up on the next pass.
+                    for (metric, delta) in [
+                        ("traffic_rx_bytes", traffic.rx_byte - prev.rx_byte),
+                        ("traffic_tx_bytes", traffic.tx_byte - prev.tx_byte),
+                    ] {
+                        if let Err(e) =
+                            save_traffic_delta(&pool, device.id, &t, metric, delta).await
+                        {
+                            log::warn!("mikrotik {}: recording {metric} failed: {e:#}", device.ip);
+                        }
+                    }
                 }
             }
             prev_traffic = Some(traffic);

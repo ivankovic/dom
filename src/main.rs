@@ -592,8 +592,18 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
             set.spawn(async move { fingerprint::fingerprint(ip).await });
         }
         let mut fps: Vec<fingerprint::Fingerprint> = Vec::new();
-        while let Some(Ok(fp)) = set.join_next().await {
-            fps.push(fp);
+        while let Some(joined) = set.join_next().await {
+            // One task that did not finish cleanly must not end the round. The
+            // `while let Some(Ok(fp))` this replaces stopped draining at the
+            // first `Err` and silently abandoned every result still in the set.
+            // Release builds abort on panic, so that could not cost a live
+            // cycle its discoveries — but it is the wrong shape, and it does
+            // cost them under test. `cluster_discovery_task` already reads its
+            // own set this way.
+            match joined {
+                Ok(fp) => fps.push(fp),
+                Err(e) => log::warn!("a fingerprint did not complete: {e}"),
+            }
         }
         fps.sort_by_key(|fp| ip_sort_key(fp.ip));
 
@@ -773,10 +783,19 @@ fn merge_device_list(
             open_ports: fp.open_ports.clone(),
             // The same classification used when persisting the device, so the
             // displayed model cannot disagree with the stored type.
+            // Against the `local_ips` this call was handed, not against a
+            // fresh `is_local_ip`, which re-reads the host's interfaces. The
+            // caller's comment already says why one reading per cycle matters —
+            // "what is saved here and what is displayed cannot disagree" — and
+            // this was the one call site inside the function that comment is
+            // about which still did its own. It also cost one `getifaddrs` per
+            // unidentified address, on every cycle.
             name: devices::detect_type(fp)
                 .map(|t| t.display_name())
                 .or_else(|| {
-                    devices::dom_local::is_local_ip(fp.ip).then_some(devices::dom_local::NAME)
+                    local_ips
+                        .contains(&fp.ip)
+                        .then_some(devices::dom_local::NAME)
                 }),
             label: resolve_label(fp.ip, existing, db_labels, dhcp_info),
         })

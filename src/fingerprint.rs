@@ -147,10 +147,22 @@ fn status_code(raw: &str) -> Option<u16> {
     status_str.parse().ok()
 }
 
+/// The `Location` header's value, from anywhere in a raw response.
+///
+/// Matches on `as_bytes()` rather than re-slicing the `&str`, and that is
+/// load-bearing rather than tidiness. `raw` is `String::from_utf8_lossy` of
+/// whatever a probed address sent back, so it very easily contains multi-byte
+/// characters — every invalid byte becomes a three-byte replacement character —
+/// and `&line[..9]` panics when one of them straddles byte 9. A single stray
+/// byte in the `Server:` header of a 302 was enough, and `panic = "abort"` in
+/// release makes that the whole process rather than one probe. Header names are
+/// ASCII by definition, so comparing bytes loses nothing.
 fn extract_location(raw: &str) -> Option<String> {
+    const NAME: &[u8] = b"location:";
     for line in raw.lines() {
-        if line.len() > 9 && line[..9].eq_ignore_ascii_case("location:") {
-            return Some(line[9..].trim().to_string());
+        let bytes = line.as_bytes();
+        if bytes.len() > NAME.len() && bytes[..NAME.len()].eq_ignore_ascii_case(NAME) {
+            return Some(line[NAME.len()..].trim().to_string());
         }
     }
     None
@@ -309,6 +321,22 @@ mod tests {
         assert_eq!(extract_location("HTTP/1.1 200 OK\r\n\r\nbody"), None);
         // Header present but with no value: nothing to redirect to.
         assert_eq!(extract_location("HTTP/1.1 301\r\nLocation:\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn a_response_carrying_multibyte_characters_is_read_without_panicking() {
+        // What a device actually sends is bytes, and `http_get` hands them over
+        // as `String::from_utf8_lossy`, so one invalid byte in a header before
+        // `Location` becomes a three-byte replacement character — which used to
+        // land inside the nine bytes this function compares and panic.
+        let bytes = b"HTTP/1.1 302 Found\r\nServer: \xffRouter\r\nLocation: /login\r\n\r\n";
+        let raw = String::from_utf8_lossy(bytes);
+        assert_eq!(extract_location(&raw).as_deref(), Some("/login"));
+
+        // The same in the body, which `lines()` scans just as readily, and with
+        // no `Location` to find at all.
+        let body = String::from_utf8_lossy(b"HTTP/1.1 302 Found\r\n\r\nSitzung\xffende");
+        assert_eq!(extract_location(&body), None);
     }
 
     #[test]

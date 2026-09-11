@@ -139,6 +139,60 @@ pub fn ts(dt: DateTime<Utc>) -> String {
     dt.format(DB_TIMESTAMP_FMT).to_string()
 }
 
+// ── Reading a device's answer ─────────────────────────────────────────────────
+
+/// Largest reply Dom will read from a device on the LAN.
+///
+/// Every other network read in the project is already bounded in bytes as well
+/// as in time — `fingerprint::http_get` stops at `HTTP_MAX_BYTES`, and
+/// `online::https::get_inner` at `MAX_BODY` — and this is the path that was
+/// missing it. `read_to_end` under a timeout bounds how *long* a device may
+/// answer for, not how much it may say: a device that streams for its whole
+/// ten-second window grows a `Vec` at line speed, which on the Raspberry Pi
+/// this is meant to run on is the whole of memory. Nor does the device have to
+/// be faulty for that to happen; nothing checks that the thing answering at a
+/// remembered address is still the device that used to be there.
+///
+/// Two megabytes is not a measured figure. The largest answers here are the
+/// router's DHCP lease and firewall tables, which are JSON arrays whose length
+/// is the number of leases or rules — order kilobytes on a home network, and
+/// bounded by the router's own configuration either way. The cap is set well
+/// clear of that rather than close to it: what it has to rule out is a reply
+/// that has no end, not one that is merely large.
+pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Reads a device's reply to end of stream, within `within` and
+/// `MAX_RESPONSE_BYTES`.
+///
+/// Exceeding the cap is an error rather than a truncation: every caller parses
+/// what comes back as JSON or as an HTTP status line, and half a reply is not a
+/// smaller answer, it is a wrong one. `fingerprint::http_get` truncates instead
+/// because it only ever looks for substrings.
+pub(crate) async fn read_capped<S>(stream: &mut S, within: Duration) -> anyhow::Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let read = async {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8 * 1024];
+        loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(out);
+            }
+            out.extend_from_slice(&buf[..n]);
+            if out.len() > MAX_RESPONSE_BYTES {
+                anyhow::bail!("the device sent more than {MAX_RESPONSE_BYTES} bytes");
+            }
+        }
+    };
+    tokio::time::timeout(within, read)
+        .await
+        .map_err(|_| anyhow::anyhow!("read timeout"))?
+}
+
 /// Consecutive poll failures tolerated before a device is reported `Lost`.
 /// Up to and including this many failures the device shows as `Connecting`,
 /// which keeps a single dropped packet or a device rebooting from flapping the
@@ -537,6 +591,49 @@ mod tests {
                 assert_ne!(a.display_name(), b.display_name());
             }
         }
+    }
+
+    // ── read_capped ───────────────────────────────────────────────────────────
+    //
+    // Against real `AsyncRead`s rather than a fake one: an endless reader and a
+    // duplex pipe whose other end simply never speaks are exactly the two
+    // devices this guards against, and neither needs a socket to stand in for.
+
+    #[tokio::test]
+    async fn a_reply_that_ends_is_read_whole() {
+        let mut stream = &b"HTTP/1.1 200 OK\r\n\r\n{\"power\":42.0}"[..];
+        let got = read_capped(&mut stream, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            "HTTP/1.1 200 OK\r\n\r\n{\"power\":42.0}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_that_will_not_stop_talking_is_cut_off() {
+        // The failure this exists for: `read_to_end` under a timeout bounds how
+        // long a device may answer for, not how much it may say.
+        let mut endless = tokio::io::repeat(b'x');
+        let err = read_capped(&mut endless, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("more than"),
+            "cut off by the byte cap, not by the clock: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_that_says_nothing_at_all_still_gives_up() {
+        // The write half stays alive and silent, so there is no EOF to end the
+        // read — only the timeout.
+        let (mut ours, _theirs) = tokio::io::duplex(64);
+        let err = read_capped(&mut ours, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("timeout"), "{err:#}");
     }
 
     // ── handle_poll_failure ───────────────────────────────────────────────────

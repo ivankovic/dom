@@ -348,12 +348,18 @@ async fn event_loop(
                                                 None
                                             };
 
-                                        let del: Option<i64> = if is_d {
+                                        // The address travels with the id rather
+                                        // than being re-read after the delete's
+                                        // await: the selection can move while the
+                                        // write is in flight, and the timer being
+                                        // removed belongs to the device that was
+                                        // selected when the key was pressed.
+                                        let del: Option<(IpAddr, i64)> = if is_d {
                                             if let DetailSlot::Timer(idx) = slot {
                                                 app.switch_timers
                                                     .get(&dev.ip)
                                                     .and_then(|t| t.get(idx))
-                                                    .map(|t| t.id)
+                                                    .map(|t| (dev.ip, t.id))
                                             } else {
                                                 None
                                             }
@@ -495,12 +501,32 @@ async fn event_loop(
                         app.timer_dialog = None;
                     }
                 } else if let Some((ip, label)) = rename_save {
-                    // Spawn DB updates in the background to avoid blocking the UI
+                    // Spawned rather than awaited so a slow database cannot
+                    // stall the interface mid-rename. Errors are logged rather
+                    // than put in `last_error`: this runs detached, after the
+                    // in-memory label has already changed, so there is no
+                    // keypress left to report back to — but a rename that the
+                    // next discovery cycle quietly undoes should at least leave
+                    // a reason behind. See `logging`.
                     let pool_clone = pool.clone();
                     let label_clone = label.clone();
                     tokio::spawn(async move {
-                        let _ = crate::db::update_device_label(&pool_clone, ip, &label_clone).await;
-                        let _ = crate::db::update_network_status_events_label(&pool_clone, ip, if label_clone.is_empty() { None } else { Some(&label_clone) }).await;
+                        if let Err(e) =
+                            crate::db::update_device_label(&pool_clone, ip, &label_clone).await
+                        {
+                            log::warn!("could not rename {ip}: {e:#}");
+                        }
+                        let stored =
+                            (!label_clone.is_empty()).then_some(label_clone.as_str());
+                        if let Err(e) = crate::db::update_network_status_events_label(
+                            &pool_clone,
+                            ip,
+                            stored,
+                        )
+                        .await
+                        {
+                            log::warn!("could not relabel {ip}'s past events: {e:#}");
+                        }
                     });
                     let mut app = state.write().unwrap();
                     // Update device label in memory
@@ -516,22 +542,69 @@ async fn event_loop(
                     }
                     app.rename_input = None;
                 } else if let Some((ip, currently_on)) = relay_toggle {
-                    let _ = crate::devices::mystrom_switch::set_relay(ip, crate::devices::mystrom_switch::API_PORT, !currently_on).await;
-                } else if let Some((ip, new_mode)) = auto_toggle {
-                    let _ = crate::db::set_switch_auto_mode(pool, ip, &new_mode).await;
-                    let mut app = state.write().unwrap();
-                    app.switch_auto_modes.insert(ip, new_mode);
-                    let max = max_detail_row(&app, ip);
-                    app.detail_row = app.detail_row.min(max);
-                } else if let Some(timer_id) = timer_delete {
-                    let _ = crate::db::delete_switch_timer(pool, timer_id).await;
-                    let mut app = state.write().unwrap();
-                    if let Some(dev) = app.selected_device().cloned() {
-                        if let Some(t) = app.switch_timers.get_mut(&dev.ip) {
-                            t.retain(|t| t.id != timer_id);
+                    // Reported the way the KEBA mode toggle below reports its
+                    // own refusals, and for the same reason: a switch that is
+                    // off at the wall answers nothing, and discarding that left
+                    // the key press looking like it had simply done nothing.
+                    // `set_relay` already reads the device's reply rather than
+                    // trusting the write — see its doc — so there is an answer
+                    // here worth showing.
+                    match crate::devices::mystrom_switch::set_relay(
+                        ip,
+                        crate::devices::mystrom_switch::API_PORT,
+                        !currently_on,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            state.write().unwrap().last_error.remove(&ip);
                         }
-                        let max = max_detail_row(&app, dev.ip);
-                        app.detail_row = app.detail_row.min(max);
+                        Err(e) => {
+                            state.write().unwrap().last_error.insert(ip, format!("{e:#}"));
+                        }
+                    }
+                } else if let Some((ip, new_mode)) = auto_toggle {
+                    // Memory follows the database rather than leading it. The
+                    // mode is reloaded from `Config` on every discovery cycle
+                    // (see `discovery_task`), so an update that failed while
+                    // memory changed anyway showed the user their new mode and
+                    // then silently reverted it minutes later. `add_switch_timer`
+                    // above is already gated this way.
+                    //
+                    // No `last_error.remove` on success, unlike the two toggles
+                    // either side of this one: those succeed because the device
+                    // itself answered, which does make a stale "connection lost"
+                    // reason wrong. This one only proves the database answered,
+                    // and clearing the reason would leave the Devices view
+                    // showing "Connection lost" with nothing under it.
+                    match crate::db::set_switch_auto_mode(pool, ip, &new_mode).await {
+                        Ok(()) => {
+                            let mut app = state.write().unwrap();
+                            app.switch_auto_modes.insert(ip, new_mode);
+                            let max = max_detail_row(&app, ip);
+                            app.detail_row = app.detail_row.min(max);
+                        }
+                        Err(e) => {
+                            state.write().unwrap().last_error.insert(ip, format!("{e:#}"));
+                        }
+                    }
+                } else if let Some((ip, timer_id)) = timer_delete {
+                    // Same discipline as the auto-mode toggle: a delete that did
+                    // not happen must not disappear from the list, or it comes
+                    // back at the next `load_switch_configs` with no explanation.
+                    let deleted = crate::db::delete_switch_timer(pool, timer_id).await;
+                    let mut app = state.write().unwrap();
+                    match deleted {
+                        Ok(()) => {
+                            if let Some(t) = app.switch_timers.get_mut(&ip) {
+                                t.retain(|t| t.id != timer_id);
+                            }
+                            let max = max_detail_row(&app, ip);
+                            app.detail_row = app.detail_row.min(max);
+                        }
+                        Err(e) => {
+                            app.last_error.insert(ip, format!("{e:#}"));
+                        }
                     }
                 } else if let Some((ip, new_mode)) = keba_mode_toggle {
                     // Only record the new mode as fact once the wallbox actually

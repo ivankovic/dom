@@ -635,21 +635,37 @@ async fn search_orientation(
         window.len(),
         now,
     )
-    .await
-    .filter(|r| crate::solar::daily_rmse_kwh(&[], r.k).is_nan() || r.rmse_w < f64::INFINITY);
+    .await;
 
-    // The refinement only wins if it actually explains the days better; the
-    // coarse winner is already a real answer and is kept otherwise.
-    let chosen = match refined {
-        Some(r) if r.rmse_w < best.rmse_w => r,
-        _ => best,
-    };
+    let chosen = better_plane(best, refined);
     log::info!(
         "solar orientation: {}° tilt / {}° azimuth",
         chosen.tilt_deg,
         chosen.azimuth_deg
     );
     Ok(Some((chosen.tilt_deg, chosen.azimuth_deg)))
+}
+
+/// Which of the two search passes to keep: the refinement, but only if it
+/// explains the days better than the coarse winner already does.
+///
+/// Compared on `daily_rmse_kwh`, which is the same criterion `best_fit` uses to
+/// pick a winner *within* each pass, and it has to be — `solar::daily_rmse_kwh`
+/// records why, with numbers: over the same 44 days, choosing planes by
+/// per-step error gave 10.2% held-out daily error against 8.6% for daily error.
+/// This comparison used to be on `rmse_w`, so the one decision that was not made
+/// by `best_fit` was the one made on the criterion the module rejects.
+///
+/// It also used to be preceded by a filter reading
+/// `daily_rmse_kwh(&[], r.k).is_nan() || r.rmse_w < f64::INFINITY`. That was a
+/// no-op wearing the shape of a validity check: `daily_rmse_kwh` of an empty
+/// slice returns `INFINITY`, which is not NaN, so the first half was always
+/// false and the second half always true for any fit that exists at all.
+fn better_plane(coarse: Calibration, refined: Option<Calibration>) -> Calibration {
+    match refined {
+        Some(r) if r.daily_rmse_kwh < coarse.daily_rmse_kwh => r,
+        _ => coarse,
+    }
 }
 
 /// Fetches each candidate plane in turn and returns the best fit among them.
@@ -854,5 +870,62 @@ mod tests {
         assert!(best_fit([(30, 0, w.as_slice())], &Default::default(), 40, at(0)).is_none());
         // And an empty candidate list is not a fit of zero.
         assert!(best_fit([], &Default::default(), 40, at(0)).is_none());
+    }
+
+    // ── Choosing between the two search passes ────────────────────────────────
+
+    /// A calibration that differs only in the two error figures, so a test can
+    /// set them against each other.
+    fn plane(tilt_deg: i32, rmse_w: f64, daily_rmse_kwh: f64) -> Calibration {
+        Calibration {
+            k: 0.5,
+            tilt_deg,
+            azimuth_deg: 0,
+            days: 21,
+            samples: 400,
+            rmse_w,
+            daily_rmse_kwh,
+            fitted_at: at(0),
+        }
+    }
+
+    #[test]
+    fn the_refinement_is_kept_when_it_explains_the_days_better() {
+        let coarse = plane(35, 200.0, 1.4);
+        let refined = plane(40, 200.0, 0.9);
+        assert_eq!(better_plane(coarse, Some(refined)).tilt_deg, 40);
+    }
+
+    #[test]
+    fn the_coarse_winner_is_kept_when_the_refinement_does_not_improve_on_it() {
+        let coarse = plane(35, 200.0, 0.9);
+        let refined = plane(40, 200.0, 1.4);
+        assert_eq!(better_plane(coarse, Some(refined)).tilt_deg, 35);
+    }
+
+    #[test]
+    fn a_refinement_pass_that_fetched_nothing_leaves_the_coarse_winner_alone() {
+        let coarse = plane(35, 200.0, 0.9);
+        assert_eq!(better_plane(coarse, None).tilt_deg, 35);
+    }
+
+    #[test]
+    fn the_two_passes_are_compared_on_daily_error_not_per_step_error() {
+        // The regression. `solar::daily_rmse_kwh` and SPECS.md both record that
+        // the two criteria disagree and that daily error is the one that
+        // predicts days better — 8.6% against 10.2% over the same 44 days. This
+        // comparison was made on `rmse_w`, so a refinement with the better
+        // daily total was rejected for having noisier individual steps.
+        let coarse = plane(35, 150.0, 1.4);
+        let refined = plane(40, 260.0, 0.9);
+        assert!(
+            refined.rmse_w > coarse.rmse_w,
+            "the refinement is worse per step",
+        );
+        assert_eq!(
+            better_plane(coarse, Some(refined)).tilt_deg,
+            40,
+            "and better per day, which is what decides",
+        );
     }
 }

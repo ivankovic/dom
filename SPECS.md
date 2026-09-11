@@ -533,6 +533,142 @@ A stored value that cannot describe a real supply — zero, negative, four phase
 volts — is refused on write and ignored on read in favour of the default. Eco divides by
 this on every tick, so it must never be able to yield a zero.
 
+## Code health pass (2026-09-11)
+
+A repository-wide pass with robustness as its subject: what happens to a long-running process
+on a Raspberry Pi when something on the network, on the disk or in the data is not what the
+code assumed. Every file in `src/` was opened — the four largest (`db.rs`, `tui/render.rs`,
+and the KEBA and MikroTik device modules) in the parts that bear on that subject rather than
+end to end. It was preceded by a lint sweep (`clippy` with `pedantic` and `nursery`) whose
+1,206 hits were used as pointers to inspect rather than as a fix list; nothing was changed to
+satisfy a style lint.
+
+Fourteen findings were fixed. The rest stay in REVIEW.md.
+
+### Decision: a string from the network is not a string of ASCII
+
+Two functions decoded network input by slicing a `&str` at a fixed byte offset, which panics
+when the offset lands inside a multi-byte character. Both are now fixed, and both were
+reachable from an ordinary LAN:
+
+- `cluster::from_hex` took `&s[i..i + 2]` two bytes at a time. It decodes the `public_key`
+  and `signature` fields of a `HeartbeatReply`, which arrive as JSON from whatever answered
+  the probe — and `cluster_discovery_task` probes *every* candidate address on the LAN at
+  port 7878, not only the configured peer. The nonce check in `heartbeat_once` runs before
+  `verify_reply`, but the nonce is handed to the responder in the request, so it gates
+  nothing here.
+- `fingerprint::extract_location` compared `&line[..9]` against `"location:"`. Its input is
+  `String::from_utf8_lossy` of a probed device's HTTP response, so every invalid byte the
+  device sends becomes a three-byte replacement character. A single stray byte in the
+  `Server:` header of a 302 was enough, which is not an adversarial scenario — it is an
+  embedded web server with a non-UTF-8 model name.
+
+The consequence in both cases is larger than one failed probe, because `[profile.release]`
+sets `panic = "abort"`: any host on the network could stop the process. Both now work over
+`as_bytes()`, and both have a regression test alongside the existing ones that already
+asserted this class — `hex_round_trips_through_arbitrary_bytes` ("non-hex characters") and
+`tampering_with_any_field_breaks_verification` ("malformed signature is rejected, not
+panicked on") had the intent and tested only ASCII. `tui::is_valid_hhmm` had already been
+given the same treatment, test and all, which is why it was not a third instance.
+
+### Decision: every network read is bounded in bytes, not only in time
+
+Four reads from LAN devices — the battery's status, the switch's report, the switch's relay
+acknowledgement and the router's REST reply — used `read_to_end` under a timeout. That
+bounds how *long* a device may answer for, not how much it may say: a device streaming for
+its whole ten-second window grows a `Vec` at line speed, which on the hardware this targets
+is the whole of memory. Nor need the device be faulty; nothing checks that the thing
+answering at a remembered address is still the device that used to be there.
+
+The project already had the answer in two places — `fingerprint::http_get` stops at
+`HTTP_MAX_BYTES`, `online::https::get_inner` at `MAX_BODY` — and the LAN path was the one
+that had skipped it. `devices::read_capped` is now the single reader for all four, capped at
+`MAX_RESPONSE_BYTES`. Two megabytes is deliberately not a measured figure: the largest real
+answers are the router's DHCP lease and firewall tables, whose size is set by the router's
+own configuration and runs to kilobytes, and the cap is placed well clear of that rather
+than close to it. What it has to rule out is a reply with no end, not one that is merely
+large. Exceeding it is an error rather than a truncation, because every caller parses what
+comes back: half a reply is not a smaller answer, it is a wrong one.
+`fingerprint::http_get` keeps truncating, because it only looks for substrings.
+
+KEBA needed nothing — it speaks UDP into a fixed buffer.
+
+### Decision: a key press that did not do anything says so
+
+The Devices view had five actions and three different ideas about failure. The KEBA mode
+toggle was already right, and says why in its own comment: it awaits the wallbox, records
+the new mode only once the device confirms it, and puts the error in `App::last_error`.
+Three lines above it, the myStrom relay toggle discarded the whole `Result`, so a switch
+that is simply off at the wall made Enter look like a key that does nothing.
+
+The other two were worse than silent. `set_switch_auto_mode` and `delete_switch_timer`
+discarded their errors while updating memory anyway — and both are reloaded from the
+database by `discovery_task` every five minutes, so a failed write showed the user their
+change and then quietly undid it, with nothing anywhere to say what had happened.
+
+All five now follow one rule: an action confirmed by a device reports what the device said;
+an action stored in the database changes memory only once the write succeeds. `add_switch_timer`
+already worked this way and is what the other two were made to match. The rename is the one
+exception and deliberately so: it is spawned rather than awaited so a slow database cannot
+stall the interface mid-rename, which means there is no key press left to answer by the time
+it fails — so it logs instead.
+
+### Decision: the refinement pass is judged by the criterion the search uses
+
+`solar::daily_rmse_kwh` and this file both record, with measured numbers, that candidate planes
+are chosen on the RMS error of *daily totals* rather than per-step error: over the same 44 days,
+per-step selection gave 10.2% held-out daily error against 8.6% for daily. `best_fit` does exactly
+that, so each of the orientation search's two passes picked its own winner correctly.
+
+The one comparison `best_fit` does not make — coarse winner against refined winner — was made on
+`rmse_w`. A refinement with the better daily total was therefore rejected for having noisier
+individual steps, which is precisely the failure the decision above exists to avoid, in the last
+place it could still happen.
+
+It sat behind a filter that read
+`daily_rmse_kwh(&[], r.k).is_nan() || r.rmse_w < f64::INFINITY`. That was a no-op wearing the shape
+of a validity check: `daily_rmse_kwh` of an empty slice returns `INFINITY`, which is not NaN, so the
+first half is always false and the second always true for any fit that exists at all.
+
+The choice is now `forecast::better_plane`, a pure function next to the search that compares
+`daily_rmse_kwh`, with the disagreement between the two criteria written as its own test.
+
+### Decision: `forget_device` is tested against the whole struct, not a list of fields
+
+`App::forget_device` clears everything keyed by a device's address when that device turns up at a
+new one. Its own documentation says why it clears *every* such map rather than only the calling
+device type's: "doing it uniformly means a map added later can't be forgotten in one of the callers
+and leave a stale row on screen."
+
+That is what had happened. `cert_alerts` and `cleartext_devices` arrived with the TLS work and were
+never added, so a router that changed address left both behind — and the Network view's security
+panel went on telling a person about an address nothing was talking to, offering 'k' to accept a
+certificate for a device that had moved, and warning about credentials crossing the network in the
+clear that were no longer being sent at all.
+
+There was no test, which is why nothing noticed. The one added fills every address-keyed field,
+forgets the address and asserts that nothing anywhere still mentions it — so the next field added
+to `App` is caught by the same test rather than by the next pass.
+
+### Smaller decisions
+
+- Three of the four places that record what a poll measured discarded the write with
+  `let _ =`: the KEBA loop's two, the MikroTik loop's traffic deltas, and
+  `weather::refresh`'s outdoor reading. The battery's and the switch's loops both log there,
+  and now all of them do. These are not interchangeable with a failed *fetch*, which is
+  visible as `ConnStatus` — a fetch that keeps working while every write fails looks, on
+  screen, exactly like one that works. What that still leaves is in REVIEW.md.
+- `discovery_task` drained its `JoinSet` with `while let Some(Ok(fp))`, which stops at the
+  first task that did not finish cleanly and silently abandons every result still in the set.
+  Release builds abort on panic so this could not lose a production cycle's discoveries, but
+  it is wrong, and `cluster_discovery_task` already reads its set the other way.
+- `merge_device_list` named this machine's own addresses by calling
+  `dom_local::is_local_ip`, which re-reads the host's interfaces, while `local_ips` — read
+  once per cycle for exactly this reason — sat unused in its own parameter list. The comment
+  at the call site describes that fix as already made ("what is saved here and what is
+  displayed cannot disagree"); it had been applied to one of the two readings. It also cost
+  one `getifaddrs` per unidentified address per cycle.
+
 ## Code health pass (2026-08-23)
 
 Twelve findings from the pass recorded in REVIEW.md were fixed. Most were small; the

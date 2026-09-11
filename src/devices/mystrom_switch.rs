@@ -27,7 +27,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
@@ -78,10 +78,8 @@ pub async fn set_relay(ip: IpAddr, port: u16, on: bool) -> anyhow::Result<()> {
         format!("GET /relay?state={state} HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.context("send")?;
 
-    let mut buf = Vec::new();
-    timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
+    let buf = crate::devices::read_capped(&mut stream, Duration::from_secs(3))
         .await
-        .context("read timeout")?
         .context("read failed")?;
     check_relay_reply(&String::from_utf8_lossy(&buf))
 }
@@ -118,10 +116,8 @@ pub async fn fetch_report(ip: IpAddr, port: u16) -> anyhow::Result<Report> {
         .await
         .context("send request")?;
 
-    let mut buf = Vec::new();
-    timeout(Duration::from_secs(10), stream.read_to_end(&mut buf))
+    let buf = crate::devices::read_capped(&mut stream, Duration::from_secs(10))
         .await
-        .context("read timeout")?
         .context("read failed")?;
 
     parse_report(&String::from_utf8_lossy(&buf))
