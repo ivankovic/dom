@@ -136,7 +136,9 @@ pub enum ConnStatus {
 pub struct OutdoorReading {
     pub station_name: String,
     pub temperature_c: f64,
-    pub altitude_m: f64,
+    /// `None` when the published station data carries no altitude — see
+    /// `online::weather::Station::altitude_m`.
+    pub altitude_m: Option<f64>,
     pub distance_km: f64,
     pub measured_at: DateTime<Utc>,
 }

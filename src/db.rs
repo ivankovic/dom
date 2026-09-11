@@ -1409,7 +1409,7 @@ pub async fn insert_outdoor_temperature(
     station_id: &str,
     station_name: &str,
     value_c: f64,
-    altitude_m: f64,
+    altitude_m: Option<f64>,
     distance_km: f64,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(

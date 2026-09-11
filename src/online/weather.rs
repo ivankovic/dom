@@ -52,9 +52,16 @@ pub struct Station {
     pub name: String,
     /// Air temperature, 10-minute mean, in degrees Celsius.
     pub temperature_c: f64,
-    /// Station altitude in metres. Worth showing: a reading from 1880 m means
-    /// something different from one at 550 m.
-    pub altitude_m: f64,
+    /// Station altitude in metres, when the published data gives one.
+    ///
+    /// `Option` rather than a sentinel. This used to fall back to `f64::NAN`
+    /// when the field was absent or would not parse, and `NaN` formatted
+    /// straight through to the Environment view as `· NaN m ·`. That is worse
+    /// than saying nothing, because of what the figure is *for*: a reading from
+    /// 1880 m means something different from one at 550 m, and the altitude is
+    /// there to qualify the temperature. A value that qualifies nothing should
+    /// look like the absence it is.
+    pub altitude_m: Option<f64>,
     /// LV95 easting, metres.
     pub east: f64,
     /// LV95 northing, metres.
@@ -126,8 +133,7 @@ pub fn parse_stations(json: &str) -> anyhow::Result<Vec<Station>> {
                 .properties
                 .altitude
                 .as_deref()
-                .and_then(|a| a.trim().parse().ok())
-                .unwrap_or(f64::NAN),
+                .and_then(|a| a.trim().parse().ok()),
             east: f.geometry.coordinates[0],
             north: f.geometry.coordinates[1],
             measured_at: measured_at.with_timezone(&chrono::Utc),
@@ -243,7 +249,10 @@ mod tests {
         assert!(!s.is_empty());
         let arosa = s.iter().find(|s| s.id == "ARO").expect("ARO in fixture");
         assert_eq!(arosa.name, "Arosa");
-        assert!((arosa.altitude_m - 1880.0).abs() < 0.5, "{arosa:?}");
+        assert!(
+            (arosa.altitude_m.unwrap() - 1880.0).abs() < 0.5,
+            "{arosa:?}"
+        );
         // Swiss air temperature is never anywhere near these bounds.
         assert!((-50.0..50.0).contains(&arosa.temperature_c), "{arosa:?}");
     }
@@ -276,6 +285,31 @@ mod tests {
         let obs = nearest_station(&s, here.east + 5000.0, here.north).unwrap();
         assert_eq!(obs.station.id, "BER");
         assert!((obs.distance_km - 5.0).abs() < 0.001, "{obs:?}");
+    }
+
+    #[test]
+    fn a_station_with_no_usable_altitude_reports_none_rather_than_nan() {
+        // A missing or unparseable altitude used to become `f64::NAN`, which
+        // survives every comparison and formats as `NaN m` in the view. The
+        // temperature is still a real measurement and the station still the
+        // nearest one, so the reading is kept — it is only the qualifier that
+        // is unknown, and it has to look unknown.
+        let json = r#"{"features":[
+            {"id":"AAA","geometry":{"coordinates":[2600000.0,1200000.0]},
+             "properties":{"station_name":"No altitude","value":11.5,
+                           "reference_ts":"2026-08-18T15:50:00Z"}},
+            {"id":"BBB","geometry":{"coordinates":[2600000.0,1200000.0]},
+             "properties":{"station_name":"Blank","value":12.5,"altitude":"   ",
+                           "reference_ts":"2026-08-18T15:50:00Z"}},
+            {"id":"CCC","geometry":{"coordinates":[2600000.0,1200000.0]},
+             "properties":{"station_name":"Odd","value":13.5,"altitude":"n/a",
+                           "reference_ts":"2026-08-18T15:50:00Z"}}
+        ]}"#;
+        let stations = parse_stations(json).unwrap();
+        assert_eq!(stations.len(), 3, "the temperature is still good");
+        for s in &stations {
+            assert_eq!(s.altitude_m, None, "{s:?}");
+        }
     }
 
     #[test]

@@ -68,6 +68,19 @@ fn kwh(v: f64) -> String {
     format!("{v:>7.1}")
 }
 
+/// A station altitude, or an em dash when the published data carries none.
+///
+/// The same choice `pct` makes below, for the same reason: the figure is there
+/// to qualify the temperature beside it, so a value that qualifies nothing has
+/// to read as absent rather than as a number. It used to be `f64::NAN` and
+/// printed as `NaN m`.
+fn altitude(m: Option<f64>) -> String {
+    match m {
+        Some(m) => format!("{m:.0} m"),
+        None => "— m".to_string(),
+    }
+}
+
 /// A percentage, or an em dash when the ratio has no denominator — see
 /// `stats::Totals::self_sufficiency_pct`. Never prints 0% for "unknown".
 fn pct(v: Option<f64>) -> String {
@@ -490,8 +503,9 @@ fn outdoor_lines<'a>(app: &'a App, theme: &Theme) -> Vec<Line<'a>> {
                 Span::from(format!("   {}", o.station_name))
                     .style(Style::default().fg(theme.focus_border)),
                 Span::from(format!(
-                    "  ·  {:.0} m  ·  {:.1} km away",
-                    o.altitude_m, o.distance_km
+                    "  ·  {}  ·  {:.1} km away",
+                    altitude(o.altitude_m),
+                    o.distance_km
                 ))
                 .style(Style::default().fg(theme.inactive)),
             ]));
@@ -2487,12 +2501,34 @@ mod tests {
         app.outdoor = Some(crate::app::OutdoorReading {
             station_name: "Bern / Zollikofen".to_string(),
             temperature_c: 28.2,
-            altitude_m: 555.0,
+            altitude_m: Some(555.0),
             distance_km: 5.1,
             measured_at: chrono::Utc::now(),
         });
         app.outdoor_today = Some((14.6, 29.3));
         app
+    }
+
+    #[test]
+    fn an_unknown_altitude_reads_as_absent_rather_than_as_nan() {
+        // `f64::NAN` formatted straight through as `NaN m`, which is worse than
+        // silence: the altitude is there to qualify the temperature, so one
+        // that qualifies nothing must look like the absence it is.
+        assert_eq!(altitude(Some(555.0)), "555 m");
+        assert_eq!(altitude(Some(1880.4)), "1880 m");
+        assert_eq!(altitude(None), "— m");
+
+        let mut app = with_outdoor(env_app(vec![("192.168.1.10", 21.5)], vec![]));
+        if let Some(o) = app.outdoor.as_mut() {
+            o.altitude_m = None;
+        }
+        let out = draw(&app, 130, 24);
+        assert!(!out.contains("NaN"), "{out}");
+        assert!(
+            out.contains("28.2"),
+            "the reading itself is still shown: {out}"
+        );
+        assert!(out.contains("5.1 km"), "and so is the distance: {out}");
     }
 
     #[test]
