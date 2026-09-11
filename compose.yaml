@@ -1,0 +1,61 @@
+# Brings up two independent `dom` instances — `dom-a` and `dom-b` — as a
+# stand-in for two separate machines, for testing the cluster code (SPECS.md,
+# "High availability: a two-node active/standby cluster") without two
+# Raspberry Pis on hand.
+#
+# Usage: `docker compose up --build`, then e.g. `docker compose logs -f dom-a`.
+# Each service gets its own named volume, so its `db.sqlite`/`dom.log` are
+# fully isolated from the other's — matching two separate machines, not two
+# processes sharing state.
+#
+# Pairing is discovered, not hand-typed: `cluster_discovery_task` finds the
+# other container by probing every IP the existing ping-scan/DHCP-lease
+# discovery already gathers, over the default bridge network — a plain
+# directed TCP connection, not multicast, so unlike the mDNS approach this
+# project rejected (see SPECS.md), nothing here needs `network_mode: host`
+# or a macvlan. `DOM_CLUSTER_IS_PRIMARY` still has to be set by hand (which
+# side should win a tie-break is a human decision, not something to infer);
+# `DOM_CLUSTER_AUTO_PAIR` stands in for the one thing a headless container
+# can't do — press a key in the TUI to confirm pairing — by pinning the
+# first discovered peer automatically. It is an env-var-only test bypass,
+# never written to `Config`, so it can't end up in a real install by
+# accident; a real deployment confirms pairing in the TUI instead (Network
+# view, 'p').
+#
+# What this proves: bring both up, wait roughly a `DISCOVERY_INTERVAL_SECS`
+# cycle for discovery to find and auto-pair them, and each side's log should
+# show it pinned the other's identity, followed by one side reading "cluster:
+# role is now Active" and the other "role is now Standby" — with no
+# split-brain alarm during that startup window (the cold-start fix
+# `cluster::PeerStatus::Establishing` exists for). Then `docker compose stop
+# dom-a` to watch dom-b take over (a `PeerUnreachable` alarm and its own new
+# `LeadershipEpochs` row), and `docker compose start dom-a` again to watch it
+# rejoin as Standby rather than reclaiming Active — the sticky-failback
+# decision, demonstrated rather than just asserted.
+#
+# Neither container is exposed to the host (no TUI to attach to over a
+# non-interactive `docker compose up`) — Dom detects the lack of a terminal
+# and runs headless on its own, exactly as it would under systemd.
+
+services:
+  dom-a:
+    build: .
+    working_dir: /data
+    environment:
+      DOM_CLUSTER_IS_PRIMARY: "true"
+      DOM_CLUSTER_AUTO_PAIR: "true"
+    volumes:
+      - dom-a-data:/data
+
+  dom-b:
+    build: .
+    working_dir: /data
+    environment:
+      DOM_CLUSTER_IS_PRIMARY: "false"
+      DOM_CLUSTER_AUTO_PAIR: "true"
+    volumes:
+      - dom-b-data:/data
+
+volumes:
+  dom-a-data:
+  dom-b-data:

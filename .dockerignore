@@ -1,0 +1,16 @@
+# The database, its SQLite sidecar files, and any hand-taken backups — see
+# .gitignore's comment: the backups alone are multi-gigabyte. None of this
+# belongs in a build context; each container gets its own, empty, via its own
+# mounted volume.
+db.sqlite*
+dom.log
+dom.log.1
+
+# Cargo's own build output — multi-gigabyte and entirely stale outside the
+# container anyway (the builder stage compiles fresh).
+/target
+
+.git
+.serena
+**/*.rs.bk
+**/mutants.out*/
