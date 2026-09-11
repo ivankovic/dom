@@ -30,7 +30,7 @@ use serde::de::{self, Deserializer, Visitor};
 use sqlx::{Row, SqlitePool};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::time::timeout;
 
 use crate::app::{ConnStatus, MikrotikReading, SharedState};
 use crate::fingerprint::Fingerprint;
@@ -614,9 +614,7 @@ async fn record_transport(
 }
 
 pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedState) {
-    let secs = device.poll_interval_secs.max(1) as u64;
-    let mut ticker = interval(Duration::from_secs(secs));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut ticker = crate::devices::PollTicker::new(device.id, device.poll_interval_secs);
 
     let mut failures: u32 = 0;
     // Previous poll's raw counters, kept locally per poll loop (i.e. per
@@ -624,7 +622,7 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
     let mut prev_traffic: Option<InterfaceStats> = None;
 
     loop {
-        ticker.tick().await;
+        ticker.tick(&pool).await;
 
         // Re-read each tick, so accepting a changed certificate in the UI takes
         // effect on the next poll rather than at the next restart.

@@ -375,16 +375,14 @@ pub async fn poll_loop(
             .insert(device.ip, format!("mode reapply: {e:#}"));
     }
 
-    let secs = device.poll_interval_secs.max(1) as u64;
-    let mut ticker = interval(Duration::from_secs(secs));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut ticker = crate::devices::PollTicker::new(device.id, device.poll_interval_secs);
 
     let mut prev: Option<(f64, DateTime<Utc>)> = None;
     let mut prev_plug: Option<u8> = None;
     let mut failures: u32 = 0;
 
     loop {
-        ticker.tick().await;
+        ticker.tick(&pool).await;
         let poll_time = Utc::now();
 
         match fetch_reports(device.ip, device.port).await {

@@ -29,7 +29,7 @@ use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::time::timeout;
 
 use crate::app::{ConnStatus, LiveReading, SharedState};
 use crate::devices::ts;
@@ -344,9 +344,7 @@ async fn write_poll(
 // ── Poll loop ─────────────────────────────────────────────────────────────────
 
 pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedState) {
-    let secs = device.poll_interval_secs.max(1) as u64;
-    let mut ticker = interval(Duration::from_secs(secs));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut ticker = crate::devices::PollTicker::new(device.id, device.poll_interval_secs);
 
     let api_key = device.api_key.clone().unwrap_or_default();
     let mut prev: Option<(Reading, DateTime<Utc>)> = None;
@@ -364,7 +362,7 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
     let mut failures: u32 = 0;
 
     loop {
-        ticker.tick().await;
+        ticker.tick(&pool).await;
         let poll_time = Utc::now();
 
         match fetch_status(device.ip, device.port, &api_key).await {
@@ -386,7 +384,7 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
                         at: *at,
                     }),
                     poll_time,
-                    secs,
+                    ticker.secs(),
                     &mut origin,
                 )
                 .await

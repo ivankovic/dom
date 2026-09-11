@@ -298,6 +298,109 @@ pub async fn handle_poll_failure(
     false
 }
 
+/// How many polls pass between re-readings of a device's configured interval.
+///
+/// `poll_interval_secs` is a column, and a poll loop used to read it once when
+/// it started — so changing a device's interval had no effect until the process
+/// was restarted. Re-reading it on *every* poll is the obvious fix and the
+/// wrong one: it puts a query in front of each poll, which is what SPECS.md's
+/// "one transaction per poll" decision exists to avoid, to learn a number that
+/// changes perhaps once in the life of an installation.
+///
+/// Thirty polls is a minute at the default two-second interval — soon enough
+/// that a change feels like it took, rare enough to cost nothing.
+const INTERVAL_RECHECK_EVERY_POLLS: u32 = 30;
+
+/// A poll loop's ticker, and the configured interval behind it.
+///
+/// All four device types had the same three lines of ticker setup and the same
+/// `poll_interval_secs.max(1) as u64`; this is that, once, plus the re-reading
+/// none of them did.
+pub struct PollTicker {
+    device_id: i64,
+    secs: u64,
+    ticker: tokio::time::Interval,
+    polls_since_recheck: u32,
+}
+
+impl PollTicker {
+    /// Starts a loop ticking at the device's currently configured interval. The
+    /// first tick completes immediately, so a loop polls as soon as it starts.
+    #[must_use]
+    pub fn new(device_id: i64, poll_interval_secs: i64) -> Self {
+        let secs = poll_interval_secs.max(1) as u64;
+        Self {
+            device_id,
+            secs,
+            ticker: Self::build(secs, tokio::time::Instant::now()),
+            polls_since_recheck: 0,
+        }
+    }
+
+    fn build(secs: u64, first: tokio::time::Instant) -> tokio::time::Interval {
+        let mut ticker = tokio::time::interval_at(first, Duration::from_secs(secs));
+        // A poll that overran drops the tick it missed rather than running twice
+        // back to back against a device that is evidently already struggling.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker
+    }
+
+    /// The interval currently in force, in seconds.
+    ///
+    /// Read back rather than remembered by the caller because
+    /// `max_integration_gap_ms` is derived from it: an interval that changed
+    /// while the gap limit did not would either refuse to integrate any
+    /// interval at all, or integrate straight across a real gap.
+    #[must_use]
+    pub fn secs(&self) -> u64 {
+        self.secs
+    }
+
+    /// Waits for the next poll, picking up a changed interval on the way.
+    pub async fn tick(&mut self, pool: &SqlitePool) {
+        self.ticker.tick().await;
+
+        self.polls_since_recheck += 1;
+        if self.polls_since_recheck >= INTERVAL_RECHECK_EVERY_POLLS {
+            self.polls_since_recheck = 0;
+            self.recheck(pool).await;
+        }
+    }
+
+    /// Re-reads the configured interval, and rebuilds the ticker if it changed.
+    ///
+    /// Split from `tick` so the part worth testing does not need a clock: what
+    /// this decides is a function of the database and the interval in force,
+    /// and waiting out thirty real poll intervals to reach it would put a
+    /// minute into the suite for each test. (`tokio`'s pausable clock is the
+    /// other way to do that, and it cannot be used here — it expires sqlx's own
+    /// pool and busy timeouts the moment the runtime goes idle.) The same split
+    /// `elapsed_window` and `cluster::decide_role` already make.
+    ///
+    /// A failed read is not a changed interval: the one in force stays, and the
+    /// next check asks again. Rebuilding starts the new interval from now rather
+    /// than immediately, so a device whose interval was just lengthened is not
+    /// polled once more straight away.
+    async fn recheck(&mut self, pool: &SqlitePool) {
+        let Ok(Some(configured)) = crate::db::poll_interval_secs(pool, self.device_id).await else {
+            return;
+        };
+        let secs = configured.max(1) as u64;
+        if secs != self.secs {
+            log::info!(
+                "device {}: poll interval changed from {}s to {secs}s",
+                self.device_id,
+                self.secs
+            );
+            self.secs = secs;
+            self.ticker = Self::build(
+                secs,
+                tokio::time::Instant::now() + Duration::from_secs(secs),
+            );
+        }
+    }
+}
+
 /// Records that a poll read its device but could not write what it read.
 ///
 /// Both logged and put in front of the user, which is the rule `logging`'s
@@ -617,6 +720,112 @@ mod tests {
                 assert_ne!(a.display_name(), b.display_name());
             }
         }
+    }
+
+    // ── PollTicker ────────────────────────────────────────────────────────────
+    //
+    // Against a real in-memory database rather than a fake, as the
+    // `handle_poll_failure` tests below are, and with the recheck counter driven
+    // directly so a test does not have to wait out thirty real poll intervals.
+
+    /// An in-memory DB holding one switch polled every `secs`; returns (pool, id).
+    async fn db_with_interval(secs: i64) -> (SqlitePool, i64) {
+        let pool = crate::db::init("sqlite://:memory:").await.unwrap();
+        crate::db::upsert_device(&pool, "mystrom_switch", "test", IP_A, secs, None)
+            .await
+            .unwrap();
+        let id = sqlx::query_scalar::<_, i64>("SELECT id FROM Devices WHERE ip = ?")
+            .bind(IP_A.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        (pool, id)
+    }
+
+    #[tokio::test]
+    async fn a_ticker_starts_at_the_configured_interval_and_polls_at_once() {
+        let (pool, id) = db_with_interval(7).await;
+        let mut ticker = PollTicker::new(id, 7);
+        assert_eq!(ticker.secs(), 7);
+        // The first tick completing immediately is what makes a loop poll as
+        // soon as it starts rather than an interval into it.
+        tokio::time::timeout(Duration::from_millis(200), ticker.tick(&pool))
+            .await
+            .expect("the first tick is immediate");
+    }
+
+    #[tokio::test]
+    async fn an_interval_of_zero_or_less_is_read_as_one_second() {
+        // `Duration::from_secs(0)` makes `interval` panic, and the column is a
+        // plain INTEGER with nothing stopping a 0 or a negative going in.
+        let (_pool, id) = db_with_interval(2).await;
+        assert_eq!(PollTicker::new(id, 0).secs(), 1);
+        assert_eq!(PollTicker::new(id, -5).secs(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_changed_interval_is_picked_up_without_a_restart() {
+        // The finding: the interval was read once when the loop started, so a
+        // change to the column did nothing until the process was restarted.
+        let (pool, id) = db_with_interval(2).await;
+        let mut ticker = PollTicker::new(id, 2);
+
+        sqlx::query("UPDATE Devices SET poll_interval_secs = 60 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        ticker.recheck(&pool).await;
+        assert_eq!(ticker.secs(), 60);
+        assert_eq!(
+            crate::devices::max_integration_gap_ms(ticker.secs()),
+            600_000,
+            "the gap limit follows the interval, or it would reject every \
+             interval the device now reports"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_interval_is_left_exactly_as_it_was() {
+        let (pool, id) = db_with_interval(2).await;
+        let mut ticker = PollTicker::new(id, 2);
+        ticker.recheck(&pool).await;
+        assert_eq!(ticker.secs(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_device_leaves_the_interval_in_force() {
+        // A read that comes back with nothing is not a changed interval. The
+        // loop is about to exit anyway; it must not reach `Duration::from_secs(0)`
+        // on the way, which would panic inside `interval`.
+        let (pool, id) = db_with_interval(2).await;
+        let mut ticker = PollTicker::new(id, 2);
+        sqlx::query("DELETE FROM Devices WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        ticker.recheck(&pool).await;
+        assert_eq!(ticker.secs(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_interval_is_re_read_periodically_rather_than_before_every_poll() {
+        // Putting a query in front of every poll is what SPECS.md's "one
+        // transaction per poll" decision exists to avoid; at two seconds that
+        // would be a query every two seconds per device, to learn a number that
+        // changes perhaps once in the life of an installation.
+        let (pool, id) = db_with_interval(2).await;
+        let mut ticker = PollTicker::new(id, 2);
+
+        // The first tick completes immediately, so this costs no real time.
+        ticker.tick(&pool).await;
+        assert_eq!(
+            ticker.polls_since_recheck, 1,
+            "one poll in, and no re-read owed yet — otherwise there is a query \
+             in front of every poll"
+        );
     }
 
     // ── read_capped ───────────────────────────────────────────────────────────
