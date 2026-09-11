@@ -563,6 +563,21 @@ fn restrict_to_owner(uri: &str) {
     }
 }
 
+/// A device's currently configured poll interval, in seconds, or `None` if the
+/// row is gone.
+///
+/// Read periodically by `devices::PollTicker` rather than once when a poll loop
+/// starts, which is what makes a changed interval take effect without a
+/// restart.
+pub async fn poll_interval_secs(pool: &SqlitePool, device_id: i64) -> anyhow::Result<Option<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT poll_interval_secs FROM Devices WHERE id = ?")
+            .bind(device_id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
 /// Reads a setting, or `None` if it was never set. Callers are expected to have
 /// a default rather than treating absence as an error — a fresh database has no
 /// settings at all.
@@ -3374,20 +3389,43 @@ mod tests {
 
     // ── Pruning the raw series ────────────────────────────────────────────────
 
-    /// Seeds one 2s sample per day for `days` days back from today.
-    async fn seed_days(pool: &SqlitePool, id: i64, days: i64, metric: &str) {
-        let today = chrono::Local::now().date_naive();
+    /// Seeds one 2s sample per day for `days` days back, the newest a couple of
+    /// minutes ago. Returns the local days seeded, newest first.
+    ///
+    /// Anchored to *now* rather than to a fixed hour of the day, and that is not
+    /// tidiness. The minute tier only writes minutes that are over, so a sample
+    /// stamped 09:00 was in the *future* for any run between local midnight and
+    /// nine in the morning: today then produced no minute rows and no daily row,
+    /// and the counts came up one short. The suite passed all afternoon and
+    /// failed for the nine hours around midnight, which is exactly the shape of
+    /// bug that goes unnoticed for months.
+    ///
+    /// The days come back so a caller can state its expectations against the
+    /// same anchor — near midnight the newest seeded day may be yesterday, and
+    /// a test that hard-codes "today" would be asserting something else.
+    async fn seed_days(
+        pool: &SqlitePool,
+        id: i64,
+        days: i64,
+        metric: &str,
+    ) -> Vec<chrono::NaiveDate> {
+        // Two minutes, not one: the sample's own minute has to be over, and one
+        // minute would leave that to a rounding boundary.
+        let anchor = chrono::Local::now() - chrono::Duration::minutes(2);
+        let mut seeded = Vec::new();
         for back in 0..days {
-            let d = today - chrono::Duration::days(back);
+            let at = anchor - chrono::Duration::days(back);
             sample(
                 pool,
                 id,
-                &format!("{} 09:00:00", d.format("%Y-%m-%d")),
+                &at.format("%Y-%m-%d %H:%M:%S").to_string(),
                 metric,
                 3600.0,
             )
             .await;
+            seeded.push(at.date_naive());
         }
+        seeded
     }
 
     async fn count(pool: &SqlitePool, sql: &str) -> i64 {
@@ -3414,7 +3452,7 @@ mod tests {
     async fn pruning_removes_rolled_up_days_beyond_the_retention_window() {
         let pool = init("sqlite::memory:").await.unwrap();
         let id = device(&pool, "10.2.0.2").await;
-        seed_days(&pool, id, 20, "consumption").await;
+        let seeded = seed_days(&pool, id, 20, "consumption").await;
 
         rollup_history(&pool, std::time::Duration::ZERO)
             .await
@@ -3425,9 +3463,16 @@ mod tests {
         let removed = prune_energy_2s(&pool, 10).await.unwrap();
         assert!(removed > 0, "old rolled-up days should go");
 
-        // What survives is exactly the retention window.
+        // What survives is exactly the seeded days inside the retention window.
+        // Counted from the same anchor `seed_days` used rather than assumed to
+        // be `RAW_ENERGY_RETENTION_DAYS`: run just after local midnight the
+        // newest seeded day is yesterday, and one fewer day falls inside it.
+        let oldest_kept = chrono::Local::now().date_naive()
+            - chrono::Duration::days(RAW_ENERGY_RETENTION_DAYS - 1);
+        let expected = seeded.iter().filter(|d| **d >= oldest_kept).count();
+        assert!(expected > 0, "the window has to keep something");
         let remaining = count(&pool, "SELECT COUNT(*) FROM Energy").await;
-        assert_eq!(remaining as i64, RAW_ENERGY_RETENTION_DAYS);
+        assert_eq!(remaining as usize, expected);
 
         // And nothing was lost from the tiers that have to outlive the raw rows.
         assert_eq!(
@@ -4041,18 +4086,8 @@ mod tests {
     async fn rollup_energy_daily_backfills_then_settles() {
         let pool = init("sqlite::memory:").await.unwrap();
         let id = device(&pool, "10.0.0.7").await;
-        let today = chrono::Local::now().date_naive();
-        for back in 0..4 {
-            let d = today - chrono::Duration::days(back);
-            sample(
-                &pool,
-                id,
-                &format!("{} 09:00:00", d.format("%Y-%m-%d")),
-                "consumption",
-                3600.0,
-            )
-            .await;
-        }
+        let seeded = seed_days(&pool, id, 4, "consumption").await;
+        let newest = seeded[0];
 
         let first = rollup_history(&pool, std::time::Duration::ZERO)
             .await
@@ -4068,7 +4103,7 @@ mod tests {
             .unwrap();
         assert_eq!(second, DAYS_ALWAYS_REROLLED);
 
-        let got = query_daily_energy(&pool, today - chrono::Duration::days(3), today)
+        let got = query_daily_energy(&pool, newest - chrono::Duration::days(3), newest)
             .await
             .unwrap();
         assert_eq!(got.len(), 4);
