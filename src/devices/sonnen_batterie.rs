@@ -146,9 +146,16 @@ pub async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<DeviceRecord>> {
     let mut out = Vec::new();
     for row in rows {
         let ip_str: String = row.get("ip");
-        let ip = ip_str
-            .parse::<IpAddr>()
-            .with_context(|| format!("bad IP in DB: {ip_str}"))?;
+        // Skipped rather than `?`. Failing the whole query on one unreadable
+        // row cost every device of this type its poll loop, because every
+        // caller — `maybe_spawn_*_poll_loop`, `bootstrap_known_devices`,
+        // `eco_job` — reads an `Err` as "there are none of these". The row is
+        // named in the log so it can be found and fixed. `dom_local::load_all`
+        // and `main::lease_addresses` have always done it this way.
+        let Ok(ip) = ip_str.parse::<IpAddr>() else {
+            log::warn!("ignoring a {NAME} row whose address does not parse: {ip_str:?}");
+            continue;
+        };
         let label: Option<String> = row.get("label");
         out.push(DeviceRecord {
             id: row.get("id"),
@@ -385,6 +392,7 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
                 .await
                 {
                     Ok(integrated) => {
+                        crate::devices::note_write_ok(&state);
                         if let (false, Some((_, prev_t))) = (integrated, prev.as_ref()) {
                             // A skipped interval is a gap in the record, not an
                             // error: logged so a poll loop that keeps stalling is
@@ -398,7 +406,11 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
                             );
                         }
                     }
-                    Err(e) => log::warn!("sonnen {}: recording this poll failed: {e:#}", device.ip),
+                    Err(e) => crate::devices::note_write_failure(
+                        &state,
+                        &format!("sonnen {}", device.ip),
+                        &e,
+                    ),
                 }
 
                 // Persisted about once a minute rather than every poll: losing a

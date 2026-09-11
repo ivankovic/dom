@@ -675,6 +675,20 @@ async fn every_pooled_connection_gets_the_relaxed_sync_setting() {
         .await
         .unwrap();
     assert_eq!(mode, "wal");
+
+    // `busy_timeout` is a connection property too, and for the same reason has
+    // to be set on the options rather than issued as a pragma. Reported in
+    // milliseconds. The value matters less than that every connection has one:
+    // the default is five seconds, which is short for a rollup that deletes in
+    // 20,000-row batches on an SD card, and a connection that missed the
+    // setting would drop a poll's measurements instead of waiting for the lock.
+    let mut timeouts = Vec::new();
+    for _ in 0..8 {
+        timeouts.push(sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout").fetch_one(&pool));
+    }
+    for got in futures::future::join_all(timeouts).await {
+        assert_eq!(got.unwrap(), 30_000, "30s, in milliseconds");
+    }
 }
 
 // ── Today's charts, read from two tiers ───────────────────────────────────────

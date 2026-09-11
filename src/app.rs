@@ -456,6 +456,24 @@ pub struct App {
     /// about a gigabyte a month. That is not something to discover from a file
     /// weeks later — see `crate::logging`.
     pub rollup_error: Option<String>,
+    /// Why the most recent attempt to *record* a measurement failed, if one did.
+    ///
+    /// The counterpart to `conn_status`, and the gap it fills: a poll that
+    /// cannot reach its device is visible on the device's own row, but a poll
+    /// that reads the device perfectly and then fails to write shows nothing at
+    /// all. The views go on displaying live readings, every device stays
+    /// `Online`, and the series quietly fills with holes — the one failure mode
+    /// here that looks exactly like success.
+    ///
+    /// One field rather than one per device, because the thing that failed is
+    /// the database and not the device whose poll happened to hit it: every
+    /// loop would otherwise report the same fault at once, against whichever
+    /// addresses they belong to. Cleared by the next write that succeeds, from
+    /// any loop, since that is what says the database is answering again.
+    ///
+    /// Set through `devices::note_write_failure` so every loop words it the
+    /// same way. See `crate::logging` for why a log line alone is not enough.
+    pub write_error: Option<String>,
     /// Which colour palette to draw with. Auto-detected from the terminal at
     /// startup unless the user has stored an explicit choice, and toggled with
     /// 't' — see `tui::theme`. Stored as the mode rather than a built `Theme`

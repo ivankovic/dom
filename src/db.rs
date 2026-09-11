@@ -25,6 +25,42 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 
+/// How long a statement waits for SQLite's write lock before failing.
+///
+/// SQLite has one writer at a time, so every commit here is either immediate or
+/// a wait. Thirty seconds is long by the standards of a request-serving
+/// application and right for this one: there is no user waiting on any of these
+/// writes, and the alternative to waiting is throwing the sample away.
+const MAX_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a task waits for a *connection from the pool*, as opposed to for the
+/// write lock once it has one.
+///
+/// Necessarily longer than `MAX_WRITE_WAIT`, and that relationship is the whole
+/// point of naming it. A connection held by a writer waiting out the busy
+/// timeout is a connection nobody else can have, so an acquire timeout shorter
+/// than the write wait would let the pool give up first — turning a wait that
+/// was about to succeed into a failed query, which is exactly the outcome
+/// `MAX_WRITE_WAIT` was lengthened to avoid.
+const MAX_POOL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Connections in the pool.
+///
+/// Left at sqlx's own default, but stated, because "ten writers on a
+/// single-writer file" is a tempting thing to cut and cutting it is wrong.
+/// SQLite takes one writer at a time whatever the pool says, so the extra
+/// connections are not extra writers: under WAL, readers do not block at all,
+/// and a writer that cannot have the lock now waits for it (see
+/// `MAX_WRITE_WAIT`) rather than spinning. What the pool size actually bounds is
+/// how many things can be *in flight* at once — nine background tasks, a poll
+/// loop per device, and the view's own queries.
+///
+/// Shrinking it therefore trades a contention that is already handled for one
+/// that is not: a task that cannot get a connection fails on `MAX_POOL_WAIT`
+/// with nothing to retry it. Tried at four, and the on-disk tests began timing
+/// out under load — which is the same failure, arriving earlier.
+const MAX_CONNECTIONS: u32 = 10;
+
 pub async fn init(uri: &str) -> anyhow::Result<SqlitePool> {
     let pool = connect(uri).await?;
     create_devices(&pool).await?;
@@ -63,14 +99,29 @@ async fn connect(uri: &str) -> anyhow::Result<SqlitePool> {
         // takes effect on a new database. An existing one created without it
         // stays as it is until someone runs a full `VACUUM`, which is what
         // rewrites the file format — and after which this keeps it that way.
-        .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental);
+        .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental)
+        // How long a statement waits for the write lock before giving up.
+        //
+        // Stated rather than left at sqlx's five seconds, because five is short
+        // for this workload: the rollup deletes in 20,000-row batches, and on an
+        // SD card one of those can hold the lock for longer than that while nine
+        // poll loops queue behind it. What a timeout expiring costs here is a
+        // poll's measurements — written, dropped, and visible only in the log
+        // (see `MAX_WRITE_WAIT`'s callers). Waiting is strictly better than
+        // losing the sample, and nothing here is interactive: the TUI never
+        // writes on the draw path.
+        .busy_timeout(MAX_WRITE_WAIT);
     let pool = if uri.contains(":memory:") {
         sqlx::pool::PoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
             .await?
     } else {
-        SqlitePool::connect_with(opts).await?
+        sqlx::pool::PoolOptions::new()
+            .max_connections(MAX_CONNECTIONS)
+            .acquire_timeout(MAX_POOL_WAIT)
+            .connect_with(opts)
+            .await?
     };
 
     sqlx::query("PRAGMA journal_mode=WAL")

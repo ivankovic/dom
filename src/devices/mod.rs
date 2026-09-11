@@ -298,6 +298,32 @@ pub async fn handle_poll_failure(
     false
 }
 
+/// Records that a poll read its device but could not write what it read.
+///
+/// Both logged and put in front of the user, which is the rule `logging`'s
+/// module doc sets: a message in a file is one nobody sees, so anything a
+/// person has to act on belongs in `App` too. This qualifies — see
+/// `App::write_error` for why a failed write is invisible without it.
+///
+/// `what` names the device, e.g. `"sonnen 172.16.0.5"`, so the log line says
+/// which loop hit the problem even though the displayed field does not
+/// distinguish them.
+pub fn note_write_failure(state: &SharedState, what: &str, error: &anyhow::Error) {
+    log::warn!("{what}: recording this poll failed: {error:#}");
+    state.write().unwrap().write_error = Some(format!("{what}: {error:#}"));
+}
+
+/// Clears a recorded write failure, once any loop's write succeeds again.
+///
+/// Checks under a read lock first because the overwhelmingly common case is
+/// that there is nothing to clear, and this runs once per poll per device —
+/// every two seconds, for every device in the house.
+pub fn note_write_ok(state: &SharedState) {
+    if state.read().unwrap().write_error.is_some() {
+        state.write().unwrap().write_error = None;
+    }
+}
+
 /// Result of a ping scan - includes both successful and failed attempts.
 #[derive(Debug, Clone)]
 pub struct PingScanResult {

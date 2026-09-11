@@ -189,6 +189,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(solar_task(state.clone(), pool.clone()));
 
     // Background: keeps the daily energy rollup and the statistics view current.
+    // The only one of these nine whose period drifts rather than being fixed —
+    // see its doc for why that is deliberate.
     tokio::spawn(statistics_task(state.clone(), pool.clone()));
 
     // Background: fires scheduled switch timers every 30s.
@@ -277,8 +279,21 @@ async fn prune_task(pool: SqlitePool) {
 ///
 /// Read here rather than during render, so every view stays a pure function of
 /// the state it is handed.
+///
+/// On an `interval` like the other tasks rather than a trailing `sleep`. The
+/// difference is not cosmetic: a `sleep` at the foot of the loop makes the
+/// period *sixty seconds plus however long the four queries took*, which on a
+/// Pi is seconds and used to drift further as the database grew. An `interval`
+/// measures from tick to tick, so the charts refresh on the minute whatever the
+/// queries cost, and `Skip` means a pass that overran drops the tick it missed
+/// instead of running twice back to back.
 async fn chart_refresh_task(state: SharedState, pool: SqlitePool) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        // The first tick completes immediately, so the charts are populated on
+        // startup rather than a minute into it.
+        ticker.tick().await;
         if let Ok(data) = db::query_today_energy(&pool).await {
             state.write().unwrap().energy_chart = data;
         }
@@ -298,7 +313,6 @@ async fn chart_refresh_task(state: SharedState, pool: SqlitePool) {
         {
             state.write().unwrap().temperature_history = rows;
         }
-        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 
@@ -449,6 +463,21 @@ async fn solar_task(state: SharedState, pool: SqlitePool) {
 /// Refreshes the view before rolling up as well as after, so existing figures are
 /// on screen immediately rather than after the first pass completes: the very first
 /// run has the entire recorded history to aggregate.
+///
+/// The one task that deliberately does *not* run on an `interval`, and the
+/// reason is the throttle. `rollup_history` sleeps `ROLLUP_THROTTLE` between
+/// days precisely so it does not starve the poll loops of a shared SD card, and
+/// its first run has the whole history to work through — a pass can take
+/// minutes. An `interval` measures tick to tick, so after a long pass the next
+/// tick is already overdue and fires at once: the throttle would have spread
+/// one pass out and then handed the disk straight to the next. The trailing
+/// `sleep` instead guarantees a quiet gap *between* passes however long a pass
+/// took, which is what the throttle is for in the first place.
+///
+/// The consequence, stated because it is otherwise invisible: this task's period
+/// is `ROLLUP_INTERVAL_SECS` plus the length of a pass, and it drifts. Nothing
+/// depends on it landing at a particular time — the statistics view also reloads
+/// on its own whenever the user changes period.
 async fn statistics_task(state: SharedState, pool: SqlitePool) {
     stats::refresh(&pool, &state).await;
     loop {

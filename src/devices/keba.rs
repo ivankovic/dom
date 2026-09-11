@@ -293,9 +293,16 @@ pub async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<DeviceRecord>> {
     let mut out = Vec::new();
     for row in rows {
         let ip_str: String = row.get("ip");
-        let ip = ip_str
-            .parse::<IpAddr>()
-            .with_context(|| format!("bad IP in DB: {ip_str}"))?;
+        // Skipped rather than `?`. Failing the whole query on one unreadable
+        // row cost every device of this type its poll loop, because every
+        // caller — `maybe_spawn_*_poll_loop`, `bootstrap_known_devices`,
+        // `eco_job` — reads an `Err` as "there are none of these". The row is
+        // named in the log so it can be found and fixed. `dom_local::load_all`
+        // and `main::lease_addresses` have always done it this way.
+        let Ok(ip) = ip_str.parse::<IpAddr>() else {
+            log::warn!("ignoring a {NAME} row whose address does not parse: {ip_str:?}");
+            continue;
+        };
         let label: Option<String> = row.get("label");
         out.push(DeviceRecord {
             id: row.get("id"),
@@ -388,14 +395,21 @@ pub async fn poll_loop(
                 // loops already do. This is the largest load in the house, so a
                 // run of failed writes is the one worth being able to find
                 // afterwards — silently, the series simply has a hole in it.
+                let what = format!("keba {}", device.ip);
+                let mut wrote = true;
                 if let Err(e) = save_raw(&pool, device.id, &t, power_w).await {
-                    log::warn!("keba {}: recording this poll failed: {e:#}", device.ip);
+                    crate::devices::note_write_failure(&state, &what, &e);
+                    wrote = false;
                 }
                 if let Some((prev_power, prev_t)) = prev
                     && let Err(e) =
                         save_energy(&pool, device.id, prev_power, prev_t, power_w, poll_time).await
                 {
-                    log::warn!("keba {}: recording this interval failed: {e:#}", device.ip);
+                    crate::devices::note_write_failure(&state, &what, &e);
+                    wrote = false;
+                }
+                if wrote {
+                    crate::devices::note_write_ok(&state);
                 }
 
                 // KEBA can silently ignore an `ena`/`curr` sent while the EV isn't

@@ -172,9 +172,16 @@ pub async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<DeviceRecord>> {
     let mut out = Vec::new();
     for row in rows {
         let ip_str: String = row.get("ip");
-        let ip = ip_str
-            .parse::<IpAddr>()
-            .with_context(|| format!("bad IP in DB: {ip_str}"))?;
+        // Skipped rather than `?`. Failing the whole query on one unreadable
+        // row cost every device of this type its poll loop, because every
+        // caller — `maybe_spawn_*_poll_loop`, `bootstrap_known_devices`,
+        // `eco_job` — reads an `Err` as "there are none of these". The row is
+        // named in the log so it can be found and fixed. `dom_local::load_all`
+        // and `main::lease_addresses` have always done it this way.
+        let Ok(ip) = ip_str.parse::<IpAddr>() else {
+            log::warn!("ignoring a {NAME} row whose address does not parse: {ip_str:?}");
+            continue;
+        };
         let label: Option<String> = row.get("label");
         out.push(DeviceRecord {
             id: row.get("id"),
@@ -301,7 +308,13 @@ pub async fn poll_loop(pool: SqlitePool, device: DeviceRecord, state: SharedStat
                 )
                 .await
                 {
-                    log::warn!("myStrom {}: recording this poll failed: {e:#}", device.ip);
+                    crate::devices::note_write_failure(
+                        &state,
+                        &format!("myStrom {}", device.ip),
+                        &e,
+                    );
+                } else {
+                    crate::devices::note_write_ok(&state);
                 }
 
                 failures = 0;

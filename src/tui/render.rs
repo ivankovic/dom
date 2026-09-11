@@ -1202,9 +1202,25 @@ fn render_statusbar(f: &mut Frame, area: Rect, app: &App) {
     let hints = format!("{nav}  ·  {focus_hints}");
 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let msg = format!("  {now}  ·  {hints}");
+
+    // A failed *write* replaces the hints outright rather than sitting beside
+    // them. It is the one fault with no home in any single view — every device
+    // still reads fine and every panel still shows live numbers, which is
+    // exactly what makes it worth interrupting for — and the status bar is the
+    // only line on screen in all six views. See `App::write_error`.
+    let line = match &app.write_error {
+        Some(e) => Line::from(vec![
+            Span::from(format!("  {now}  ·  ")),
+            Span::from(format!("not recording measurements — {e}")).style(
+                Style::default()
+                    .fg(theme.status_lost)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        None => Line::from(format!("  {now}  ·  {hints}")),
+    };
     f.render_widget(
-        Paragraph::new(msg).style(
+        Paragraph::new(line).style(
             Style::default()
                 .bg(theme.status_bar_bg)
                 .fg(theme.status_bar_fg),
@@ -2313,6 +2329,60 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // ── The status bar's write-failure line ───────────────────────────────────
+
+    #[test]
+    fn the_status_bar_shows_the_key_hints_when_everything_is_recording() {
+        let out = draw(&App::default(), 160, 6);
+        let bar = out.lines().next().unwrap();
+        assert!(bar.contains("[q] quit"), "{bar}");
+        assert!(!bar.contains("not recording"), "{bar}");
+    }
+
+    #[test]
+    fn a_failed_write_is_stated_in_every_view() {
+        // The failure this exists for is invisible everywhere else: the device
+        // reads fine, so its row says Online and the panels show live numbers,
+        // while nothing is reaching the database. The status bar is the only
+        // line present in all six views, so that is where it has to go.
+        let mut app = App {
+            write_error: Some("sonnen 172.16.0.5: database is locked".to_string()),
+            ..Default::default()
+        };
+
+        for view in [
+            View::Current,
+            View::Energy,
+            View::Network,
+            View::Devices,
+            View::Statistics,
+            View::Environment,
+        ] {
+            app.view = view;
+            let out = draw(&app, 160, 8);
+            let bar = out.lines().next().unwrap();
+            assert!(
+                bar.contains("not recording measurements"),
+                "view did not carry the warning: {bar}"
+            );
+            assert!(bar.contains("database is locked"), "{bar}");
+        }
+    }
+
+    #[test]
+    fn the_write_failure_replaces_the_hints_rather_than_crowding_them() {
+        // At a realistic width the hints alone already fill the line, so
+        // appending would push the warning off the end of a terminal that is
+        // not especially narrow — which is the same as not showing it.
+        let app = App {
+            write_error: Some("keba 172.16.0.9: disk I/O error".to_string()),
+            ..Default::default()
+        };
+        let bar = draw(&app, 100, 6).lines().next().unwrap().to_string();
+        assert!(bar.contains("not recording measurements"), "{bar}");
+        assert!(!bar.contains("[q] quit"), "{bar}");
     }
 
     /// A bucket whose imported energy all reached the house, which is every day
