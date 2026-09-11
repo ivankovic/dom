@@ -3,6 +3,12 @@
 Findings from the repository-wide code health passes. The other findings from those passes
 have since been fixed; see SPECS.md for the decisions taken.
 
+As of 2026-09-12, two things here are genuinely open: how much detail a write failure should
+show ("one write failure looks like all of them"), and whether to drop the now-vestigial
+`resolution` column. Everything else below is marked fixed and kept rather than deleted,
+because in each case the *original reasoning was wrong* in a way worth recording — a finding
+removed without its correction is a finding that gets re-filed.
+
 # From the pass of 2026-09-11
 
 This pass took robustness as its subject. Every file in `src/` was opened; the four largest
