@@ -151,6 +151,278 @@ fn push_bounded(buf: &mut String, c: char) {
     }
 }
 
+// ── Acting on a key press ─────────────────────────────────────────────────────
+//
+// Everything below runs *after* the read lock that decided it has been dropped,
+// which is why each one is its own function: the deciding half is already pure
+// and tested (`apply_key`, `detail_slot`, `toggled_switch_auto_mode`), and the
+// acting half was a two-hundred-line `if`/`else if` chain inlined in
+// `event_loop` that nothing could reach without a terminal. Split out, the
+// database-backed ones are exercisable against an in-memory schema — which is
+// what they needed, since they are where "change memory only once the write
+// succeeds" is decided.
+//
+// The two that command a device (`toggle_relay`, `set_keba_mode`) still need a
+// device, and are here for symmetry rather than for testability.
+
+/// Pins a device's new TLS certificate and clears the alert.
+///
+/// The poll loop re-reads the pin every tick, so the device is reachable again
+/// on its next poll without a restart.
+async fn accept_certificate(pool: &SqlitePool, state: &SharedState, ip: IpAddr, fingerprint: &str) {
+    match crate::db::set_tls_pin(pool, ip, fingerprint).await {
+        Ok(()) => {
+            log::info!("accepted a new TLS certificate for {ip}");
+            state.write().unwrap().cert_alerts.remove(&ip);
+        }
+        Err(e) => log::warn!("could not accept {ip}'s new certificate: {e:#}"),
+    }
+}
+
+/// Pins a discovered peer's address and identity — the one explicit human
+/// action this feature deliberately still requires (see SPECS.md).
+///
+/// `cluster_task` and `cluster_discovery_task` re-read both from `Config` on
+/// their own schedule, so no restart is needed. The prompt is cleared only if
+/// *both* writes landed: a pairing with an address and no pinned key is the
+/// state the pin exists to prevent.
+async fn confirm_cluster_pairing(
+    pool: &SqlitePool,
+    state: &SharedState,
+    prompt: &crate::app::ClusterPairingPrompt,
+) {
+    let addr_result = crate::db::set_cluster_peer_addr(pool, &prompt.addr).await;
+    let key_result = crate::db::set_cluster_peer_pubkey(pool, &prompt.public_key).await;
+    match (addr_result, key_result) {
+        (Ok(()), Ok(())) => {
+            log::info!("cluster: paired with {} at {}", prompt.node_id, prompt.addr);
+            state.write().unwrap().cluster_pairing_prompt = None;
+        }
+        (addr_result, key_result) => {
+            for e in [addr_result.err(), key_result.err()].into_iter().flatten() {
+                log::warn!("cluster: could not save pairing: {e:#}");
+            }
+        }
+    }
+}
+
+/// Looks up a typed address, stores the location it resolves to, and fetches a
+/// reading for it straight away rather than waiting for the next tick.
+async fn save_address(pool: &SqlitePool, state: &SharedState, address: &str) {
+    match crate::online::geocode::lookup(address).await {
+        Ok(place) => {
+            let loc = crate::db::Location {
+                label: place.label,
+                east: place.east,
+                north: place.north,
+                latitude: place.latitude,
+                longitude: place.longitude,
+            };
+            if let Err(e) = crate::db::set_location(pool, &loc).await {
+                state.write().unwrap().last_weather_error =
+                    Some(format!("saving the location failed: {e:#}"));
+            } else {
+                {
+                    let mut app = state.write().unwrap();
+                    app.location = Some(loc);
+                    app.address_input = None;
+                    app.last_weather_error = None;
+                    // The previous location's reading is not this location's;
+                    // clear it rather than leave a number that now means
+                    // somewhere else.
+                    app.outdoor = None;
+                    app.outdoor_today = None;
+                }
+                crate::online::weather::refresh(pool, state).await;
+            }
+        }
+        Err(e) => {
+            // Keep the typed text so it can be corrected rather than retyped.
+            state.write().unwrap().last_weather_error =
+                Some(format!("could not find \"{address}\": {e:#}"));
+        }
+    }
+}
+
+/// Stores a new timer and puts it in the list, in time order.
+///
+/// Memory follows the database: the id comes back from the insert, and without
+/// one there is nothing to delete the row by later.
+async fn add_timer(
+    pool: &SqlitePool,
+    state: &SharedState,
+    ip: IpAddr,
+    time: String,
+    relay_on: bool,
+) {
+    match crate::db::add_switch_timer(pool, ip, &time, relay_on).await {
+        Ok(id) => {
+            let mut app = state.write().unwrap();
+            let entry = app.switch_timers.entry(ip).or_default();
+            entry.push(crate::app::SwitchTimer {
+                id,
+                time_hhmm: time,
+                relay_on,
+            });
+            entry.sort_by(|a, b| a.time_hhmm.cmp(&b.time_hhmm));
+            app.timer_dialog = None;
+        }
+        Err(e) => {
+            state
+                .write()
+                .unwrap()
+                .last_error
+                .insert(ip, format!("{e:#}"));
+        }
+    }
+}
+
+/// Renames a device, in memory now and in the database shortly.
+///
+/// The only action here that does not await its writes. A rename is pure
+/// presentation and the interface should not stutter on one, so the two
+/// statements go to a spawned task; errors are logged rather than put in
+/// `last_error`, because by the time they happen the key press they belong to
+/// is long over and there is nothing left to answer.
+fn rename_device(pool: &SqlitePool, state: &SharedState, ip: IpAddr, label: String) {
+    let pool = pool.clone();
+    let stored = label.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::db::update_device_label(&pool, ip, &stored).await {
+            log::warn!("could not rename {ip}: {e:#}");
+        }
+        let stored = (!stored.is_empty()).then_some(stored.as_str());
+        if let Err(e) = crate::db::update_network_status_events_label(&pool, ip, stored).await {
+            log::warn!("could not relabel {ip}'s past events: {e:#}");
+        }
+    });
+
+    let mut app = state.write().unwrap();
+    let new_label: Option<String> = (!label.is_empty()).then_some(label);
+    if let Some(dev) = app.devices.iter_mut().find(|d| d.ip == ip) {
+        dev.label = new_label.clone();
+    }
+    for event in &mut app.network_status_events {
+        if event.ip == ip {
+            event.label = new_label.clone();
+        }
+    }
+    app.rename_input = None;
+}
+
+/// Commands a switch's relay, and reports what the switch said.
+///
+/// Reported the way `set_keba_mode` reports its own refusals, and for the same
+/// reason: a switch that is off at the wall answers nothing, and discarding
+/// that left the key press looking like it had simply done nothing.
+/// `mystrom_switch::set_relay` already reads the device's reply rather than
+/// trusting the write — see its doc — so there is an answer here worth showing.
+async fn toggle_relay(state: &SharedState, ip: IpAddr, currently_on: bool) {
+    match crate::devices::mystrom_switch::set_relay(
+        ip,
+        crate::devices::mystrom_switch::API_PORT,
+        !currently_on,
+    )
+    .await
+    {
+        Ok(()) => {
+            state.write().unwrap().last_error.remove(&ip);
+        }
+        Err(e) => {
+            state
+                .write()
+                .unwrap()
+                .last_error
+                .insert(ip, format!("{e:#}"));
+        }
+    }
+}
+
+/// Stores a switch's new auto-mode, and shows it only once it is stored.
+///
+/// Memory follows the database rather than leading it. The mode is reloaded
+/// from `Config` on every discovery cycle (see `main::discovery_task`), so an
+/// update that failed while memory changed anyway showed the user their new
+/// mode and then silently reverted it minutes later.
+///
+/// No `last_error.remove` on success, unlike the two device commands either
+/// side of it: those succeed because the device itself answered, which does
+/// make a stale "connection lost" reason wrong. This one only proves the
+/// database answered, and clearing the reason would leave the Devices view
+/// showing "Connection lost" with nothing under it.
+async fn set_auto_mode(
+    pool: &SqlitePool,
+    state: &SharedState,
+    ip: IpAddr,
+    new_mode: SwitchAutoMode,
+) {
+    match crate::db::set_switch_auto_mode(pool, ip, &new_mode).await {
+        Ok(()) => {
+            let mut app = state.write().unwrap();
+            app.switch_auto_modes.insert(ip, new_mode);
+            let max = max_detail_row(&app, ip);
+            app.detail_row = app.detail_row.min(max);
+        }
+        Err(e) => {
+            state
+                .write()
+                .unwrap()
+                .last_error
+                .insert(ip, format!("{e:#}"));
+        }
+    }
+}
+
+/// Deletes a timer, and removes it from the list only once it is gone.
+///
+/// Same discipline as `set_auto_mode`: a delete that did not happen must not
+/// disappear from the list, or it comes back at the next `load_switch_configs`
+/// with no explanation.
+async fn delete_timer(pool: &SqlitePool, state: &SharedState, ip: IpAddr, timer_id: i64) {
+    let deleted = crate::db::delete_switch_timer(pool, timer_id).await;
+    let mut app = state.write().unwrap();
+    match deleted {
+        Ok(()) => {
+            if let Some(t) = app.switch_timers.get_mut(&ip) {
+                t.retain(|t| t.id != timer_id);
+            }
+            let max = max_detail_row(&app, ip);
+            app.detail_row = app.detail_row.min(max);
+        }
+        Err(e) => {
+            app.last_error.insert(ip, format!("{e:#}"));
+        }
+    }
+}
+
+/// Commands a wallbox's charging mode, recording it only once the wallbox
+/// confirms — otherwise the UI would show "Full power" while the charger
+/// silently stayed disabled, or the reverse.
+async fn set_keba_mode(
+    pool: &SqlitePool,
+    state: &SharedState,
+    ip: IpAddr,
+    new_mode: devices::keba::ChargingMode,
+) {
+    match crate::devices::keba::set_mode(ip, crate::devices::keba::API_PORT, new_mode).await {
+        Ok(()) => {
+            if let Err(e) = crate::db::set_keba_mode(pool, ip, new_mode).await {
+                log::warn!("could not store {ip}'s charging mode: {e:#}");
+            }
+            let mut app = state.write().unwrap();
+            app.keba_modes.insert(ip, new_mode);
+            app.last_error.remove(&ip);
+        }
+        Err(e) => {
+            state
+                .write()
+                .unwrap()
+                .last_error
+                .insert(ip, format!("{e:#}"));
+        }
+    }
+}
+
 /// Whether the interface could be started.
 ///
 /// Not an error, because there is nothing wrong: a Dom running as a service on a
@@ -418,212 +690,27 @@ async fn event_loop(
                 }; // read lock dropped here
 
                 if let Some((ip, fingerprint)) = accept_cert {
-                    // Pin the new certificate and clear the alert. The poll loop
-                    // re-reads the pin every tick, so the device is reachable
-                    // again on its next poll without a restart.
-                    match crate::db::set_tls_pin(pool, ip, &fingerprint).await {
-                        Ok(()) => {
-                            log::info!("accepted a new TLS certificate for {ip}");
-                            state.write().unwrap().cert_alerts.remove(&ip);
-                        }
-                        Err(e) => log::warn!("could not accept {ip}'s new certificate: {e:#}"),
-                    }
+                    accept_certificate(pool, state, ip, &fingerprint).await;
                 }
 
                 if let Some(prompt) = confirm_pairing {
-                    // Pin the peer's address and identity — the one explicit human action this
-                    // feature deliberately still requires (see SPECS.md). cluster_task/
-                    // cluster_discovery_task re-read both from Config on their own schedule, no
-                    // restart needed.
-                    let addr_result = crate::db::set_cluster_peer_addr(pool, &prompt.addr).await;
-                    let key_result =
-                        crate::db::set_cluster_peer_pubkey(pool, &prompt.public_key).await;
-                    match (addr_result, key_result) {
-                        (Ok(()), Ok(())) => {
-                            log::info!(
-                                "cluster: paired with {} at {}",
-                                prompt.node_id,
-                                prompt.addr
-                            );
-                            state.write().unwrap().cluster_pairing_prompt = None;
-                        }
-                        (addr_result, key_result) => {
-                            for e in [addr_result.err(), key_result.err()].into_iter().flatten() {
-                                log::warn!("cluster: could not save pairing: {e:#}");
-                            }
-                        }
-                    }
+                    confirm_cluster_pairing(pool, state, &prompt).await;
                 }
 
                 if let Some(address) = address_save {
-                    match crate::online::geocode::lookup(&address).await {
-                        Ok(place) => {
-                            let loc = crate::db::Location {
-                                label: place.label,
-                                east: place.east,
-                                north: place.north,
-                                latitude: place.latitude,
-                                longitude: place.longitude,
-                            };
-                            if let Err(e) = crate::db::set_location(pool, &loc).await {
-                                state.write().unwrap().last_weather_error =
-                                    Some(format!("saving the location failed: {e:#}"));
-                            } else {
-                                {
-                                    let mut app = state.write().unwrap();
-                                    app.location = Some(loc);
-                                    app.address_input = None;
-                                    app.last_weather_error = None;
-                                    // The previous location's reading is not this
-                                    // location's; clear it rather than leave a
-                                    // number that now means somewhere else.
-                                    app.outdoor = None;
-                                    app.outdoor_today = None;
-                                }
-                                // Fetch straight away, so a new address shows a
-                                // reading instead of waiting for the next tick.
-                                crate::online::weather::refresh(pool, state).await;
-                            }
-                        }
-                        Err(e) => {
-                            // Keep the typed text so it can be corrected rather
-                            // than retyped.
-                            state.write().unwrap().last_weather_error =
-                                Some(format!("could not find \"{address}\": {e:#}"));
-                        }
-                    }
+                    save_address(pool, state, &address).await;
                 } else if let Some((ip, time, relay_on)) = timer_dialog_save {
-                    if let Ok(id) = crate::db::add_switch_timer(pool, ip, &time, relay_on).await {
-                        let mut app = state.write().unwrap();
-                        let entry = app.switch_timers.entry(ip).or_default();
-                        entry.push(crate::app::SwitchTimer { id, time_hhmm: time, relay_on });
-                        entry.sort_by(|a, b| a.time_hhmm.cmp(&b.time_hhmm));
-                        app.timer_dialog = None;
-                    }
+                    add_timer(pool, state, ip, time, relay_on).await;
                 } else if let Some((ip, label)) = rename_save {
-                    // Spawned rather than awaited so a slow database cannot
-                    // stall the interface mid-rename. Errors are logged rather
-                    // than put in `last_error`: this runs detached, after the
-                    // in-memory label has already changed, so there is no
-                    // keypress left to report back to — but a rename that the
-                    // next discovery cycle quietly undoes should at least leave
-                    // a reason behind. See `logging`.
-                    let pool_clone = pool.clone();
-                    let label_clone = label.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::db::update_device_label(&pool_clone, ip, &label_clone).await
-                        {
-                            log::warn!("could not rename {ip}: {e:#}");
-                        }
-                        let stored =
-                            (!label_clone.is_empty()).then_some(label_clone.as_str());
-                        if let Err(e) = crate::db::update_network_status_events_label(
-                            &pool_clone,
-                            ip,
-                            stored,
-                        )
-                        .await
-                        {
-                            log::warn!("could not relabel {ip}'s past events: {e:#}");
-                        }
-                    });
-                    let mut app = state.write().unwrap();
-                    // Update device label in memory
-                    let new_label: Option<String> = if label.is_empty() { None } else { Some(label) };
-                    if let Some(dev) = app.devices.iter_mut().find(|d| d.ip == ip) {
-                        dev.label = new_label.clone();
-                    }
-                    // Update label in existing network status events in memory
-                    for event in &mut app.network_status_events {
-                        if event.ip == ip {
-                            event.label = new_label.clone();
-                        }
-                    }
-                    app.rename_input = None;
+                    rename_device(pool, state, ip, label);
                 } else if let Some((ip, currently_on)) = relay_toggle {
-                    // Reported the way the KEBA mode toggle below reports its
-                    // own refusals, and for the same reason: a switch that is
-                    // off at the wall answers nothing, and discarding that left
-                    // the key press looking like it had simply done nothing.
-                    // `set_relay` already reads the device's reply rather than
-                    // trusting the write — see its doc — so there is an answer
-                    // here worth showing.
-                    match crate::devices::mystrom_switch::set_relay(
-                        ip,
-                        crate::devices::mystrom_switch::API_PORT,
-                        !currently_on,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            state.write().unwrap().last_error.remove(&ip);
-                        }
-                        Err(e) => {
-                            state.write().unwrap().last_error.insert(ip, format!("{e:#}"));
-                        }
-                    }
+                    toggle_relay(state, ip, currently_on).await;
                 } else if let Some((ip, new_mode)) = auto_toggle {
-                    // Memory follows the database rather than leading it. The
-                    // mode is reloaded from `Config` on every discovery cycle
-                    // (see `discovery_task`), so an update that failed while
-                    // memory changed anyway showed the user their new mode and
-                    // then silently reverted it minutes later. `add_switch_timer`
-                    // above is already gated this way.
-                    //
-                    // No `last_error.remove` on success, unlike the two toggles
-                    // either side of this one: those succeed because the device
-                    // itself answered, which does make a stale "connection lost"
-                    // reason wrong. This one only proves the database answered,
-                    // and clearing the reason would leave the Devices view
-                    // showing "Connection lost" with nothing under it.
-                    match crate::db::set_switch_auto_mode(pool, ip, &new_mode).await {
-                        Ok(()) => {
-                            let mut app = state.write().unwrap();
-                            app.switch_auto_modes.insert(ip, new_mode);
-                            let max = max_detail_row(&app, ip);
-                            app.detail_row = app.detail_row.min(max);
-                        }
-                        Err(e) => {
-                            state.write().unwrap().last_error.insert(ip, format!("{e:#}"));
-                        }
-                    }
+                    set_auto_mode(pool, state, ip, new_mode).await;
                 } else if let Some((ip, timer_id)) = timer_delete {
-                    // Same discipline as the auto-mode toggle: a delete that did
-                    // not happen must not disappear from the list, or it comes
-                    // back at the next `load_switch_configs` with no explanation.
-                    let deleted = crate::db::delete_switch_timer(pool, timer_id).await;
-                    let mut app = state.write().unwrap();
-                    match deleted {
-                        Ok(()) => {
-                            if let Some(t) = app.switch_timers.get_mut(&ip) {
-                                t.retain(|t| t.id != timer_id);
-                            }
-                            let max = max_detail_row(&app, ip);
-                            app.detail_row = app.detail_row.min(max);
-                        }
-                        Err(e) => {
-                            app.last_error.insert(ip, format!("{e:#}"));
-                        }
-                    }
+                    delete_timer(pool, state, ip, timer_id).await;
                 } else if let Some((ip, new_mode)) = keba_mode_toggle {
-                    // Only record the new mode as fact once the wallbox actually
-                    // confirms it — otherwise the UI would show "Full power" while
-                    // the charger silently stayed disabled (or vice versa).
-                    let result =
-                        crate::devices::keba::set_mode(ip, crate::devices::keba::API_PORT, new_mode)
-                            .await;
-                    match result {
-                        Ok(()) => {
-                            let _ = crate::db::set_keba_mode(pool, ip, new_mode).await;
-                            let mut app = state.write().unwrap();
-                            app.keba_modes.insert(ip, new_mode);
-                            app.last_error.remove(&ip);
-                        }
-                        Err(e) => {
-                            state.write().unwrap().last_error.insert(ip, format!("{e:#}"));
-                        }
-                    }
+                    set_keba_mode(pool, state, ip, new_mode).await;
                 } else {
                     // Key handling is synchronous and runs holding the write lock,
                     // so it records what it wants done and the code below acts on
@@ -1828,5 +1915,215 @@ mod tests {
         }
         assert_eq!(buf.chars().count(), MAX_INPUT_CHARS);
         assert_eq!(buf.len(), MAX_INPUT_CHARS * 2, "two bytes each");
+    }
+
+    // ── Acting on a key press ─────────────────────────────────────────────────
+    //
+    // The half of the interface that `apply_key`'s tests above cannot reach:
+    // what happens *after* the read lock is dropped, once a decision has to go
+    // to the database. Against a real in-memory schema rather than a fake, like
+    // the `handle_poll_failure` tests in `devices`.
+    //
+    // These are the arms this pass changed — each now gates its in-memory
+    // update on the write succeeding, because `discovery_task` reloads switch
+    // configuration from the database every five minutes and would otherwise
+    // silently undo a change the user had been shown.
+
+    /// An in-memory database holding one myStrom switch at `IP`.
+    async fn db_with_switch() -> SqlitePool {
+        let pool = crate::db::init("sqlite://:memory:").await.unwrap();
+        crate::db::upsert_device(&pool, "mystrom_switch", "switch", IP, 2, None)
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn shared(app: App) -> SharedState {
+        std::sync::Arc::new(std::sync::RwLock::new(app))
+    }
+
+    #[tokio::test]
+    async fn accepting_a_certificate_pins_it_and_clears_the_alert() {
+        let pool = db_with_switch().await;
+        let state = shared(App::default());
+        state.write().unwrap().cert_alerts.insert(
+            IP,
+            crate::app::CertAlert {
+                expected: "aa".into(),
+                observed: "bb".into(),
+            },
+        );
+
+        accept_certificate(&pool, &state, IP, "bb").await;
+
+        assert_eq!(
+            crate::db::get_tls_pin(&pool, IP).await.unwrap().as_deref(),
+            Some("bb"),
+            "the poll loop re-reads this, which is what makes the device \
+             reachable again without a restart"
+        );
+        assert!(!state.read().unwrap().cert_alerts.contains_key(&IP));
+    }
+
+    #[tokio::test]
+    async fn confirming_a_pairing_stores_both_halves_and_clears_the_prompt() {
+        let pool = db_with_switch().await;
+        let state = shared(App::default());
+        let prompt = crate::app::ClusterPairingPrompt {
+            addr: "172.16.0.9:7878".into(),
+            node_id: "node-b".into(),
+            public_key: "deadbeef".into(),
+            replaces_pin: false,
+        };
+        state.write().unwrap().cluster_pairing_prompt = Some(prompt.clone());
+
+        confirm_cluster_pairing(&pool, &state, &prompt).await;
+
+        assert_eq!(
+            crate::db::cluster_peer_pubkey(&pool)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("deadbeef"),
+            "the key is the trust anchor, not the address"
+        );
+        assert_eq!(
+            crate::db::cluster_peer_addr(&pool)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("172.16.0.9:7878")
+        );
+        assert!(state.read().unwrap().cluster_pairing_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stored_timer_reaches_the_list_in_time_order() {
+        let pool = db_with_switch().await;
+        let state = shared(App::default());
+        state.write().unwrap().switch_timers.insert(
+            IP,
+            vec![SwitchTimer {
+                id: 99,
+                time_hhmm: "18:00".into(),
+                relay_on: false,
+            }],
+        );
+
+        add_timer(&pool, &state, IP, "07:30".to_string(), true).await;
+
+        let app = state.read().unwrap();
+        let timers = app.switch_timers.get(&IP).unwrap();
+        assert_eq!(
+            timers
+                .iter()
+                .map(|t| t.time_hhmm.as_str())
+                .collect::<Vec<_>>(),
+            vec!["07:30", "18:00"],
+            "the list is what the detail panel draws, so it stays sorted"
+        );
+        assert!(
+            timers.iter().any(|t| t.id != 99 && t.id > 0),
+            "the id comes from the insert — without it there is nothing to \
+             delete the row by later: {timers:?}",
+            timers = timers.iter().map(|t| t.id).collect::<Vec<_>>()
+        );
+        assert!(app.timer_dialog.is_none(), "the dialog closes on success");
+    }
+
+    #[tokio::test]
+    async fn an_auto_mode_reaches_memory_only_once_it_is_stored() {
+        let pool = db_with_switch().await;
+        let state = shared(app_with_switch(Some(SwitchAutoMode::Disabled), 0));
+
+        set_auto_mode(&pool, &state, IP, SwitchAutoMode::Eco).await;
+
+        // Read back through the same loader `discovery_task` uses, since that is
+        // what would overwrite memory five minutes later if the write had not
+        // landed.
+        let (modes, _) = crate::db::load_switch_configs(&pool).await.unwrap();
+        assert_eq!(modes.get(&IP), Some(&SwitchAutoMode::Eco));
+        assert_eq!(
+            state.read().unwrap().switch_auto_modes.get(&IP),
+            Some(&SwitchAutoMode::Eco)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_timer_leaves_both_the_database_and_the_list() {
+        let pool = db_with_switch().await;
+        let state = shared(App::default());
+        let id = crate::db::add_switch_timer(&pool, IP, "07:00", true)
+            .await
+            .unwrap();
+        state.write().unwrap().switch_timers.insert(
+            IP,
+            vec![SwitchTimer {
+                id,
+                time_hhmm: "07:00".into(),
+                relay_on: true,
+            }],
+        );
+
+        delete_timer(&pool, &state, IP, id).await;
+
+        let (_, timers) = crate::db::load_switch_configs(&pool).await.unwrap();
+        assert!(
+            timers.get(&IP).is_none_or(Vec::is_empty),
+            "gone from the database, or it comes back at the next reload"
+        );
+        assert!(
+            state
+                .read()
+                .unwrap()
+                .switch_timers
+                .get(&IP)
+                .is_none_or(Vec::is_empty)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_shows_immediately_and_reaches_the_past_events_too() {
+        let pool = db_with_switch().await;
+        let mut app = app_with_devices(2);
+        app.network_status_events
+            .push(crate::app::NetworkStatusEvent {
+                ip: IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1)),
+                label: Some("old".into()),
+                previous: crate::app::NetworkDeviceStatus::Ok,
+                current: crate::app::NetworkDeviceStatus::Lost,
+                at: chrono::Utc::now(),
+            });
+        let state = shared(app);
+        let renamed = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1));
+
+        // The database half is spawned, deliberately, so the interface does not
+        // stutter on a slow write — only the in-memory half is synchronous.
+        rename_device(&pool, &state, renamed, "Kitchen".to_string());
+
+        let app = state.read().unwrap();
+        assert_eq!(
+            app.devices.iter().find(|d| d.ip == renamed).unwrap().label,
+            Some("Kitchen".to_string())
+        );
+        assert_eq!(
+            app.network_status_events[0].label,
+            Some("Kitchen".to_string()),
+            "a past event names the device it was about, so it follows the rename"
+        );
+        assert!(app.rename_input.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_rename_clears_the_label_rather_than_storing_a_blank() {
+        let pool = db_with_switch().await;
+        let mut app = app_with_devices(1);
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1));
+        app.devices[0].label = Some("Kitchen".into());
+        let state = shared(app);
+
+        rename_device(&pool, &state, ip, String::new());
+
+        assert_eq!(state.read().unwrap().devices[0].label, None);
     }
 }

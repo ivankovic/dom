@@ -53,7 +53,7 @@ pub enum Focus {
     Detail,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SwitchAutoMode {
     Disabled,
     Time,

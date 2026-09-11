@@ -12,9 +12,19 @@
 # `db::init`, within 0.15s of each other, on sqlx's 30-second connection
 # acquire timeout — the signature of the disk, not of a shared path.
 #
-# It has not reproduced since, so this is a declaration of a shared resource
-# rather than a fix for a known bug: these four contend for one disk, so let
-# one run at a time. It costs about a second, and only for them.
+# It reproduced repeatedly on 2026-09-11/12, on a developer machine at load
+# average 8-16 with a live Dom writing an 80 MB WAL beside the repository:
+# `PoolTimedOut` twice, and one run where a test that takes 0.1 s idle took 72
+# seconds. The same suite passed in 3.4 s once the load dropped. So the shape is
+# confirmed and it is the disk, not the code — these four are the only tests
+# that touch one, and on a quiet machine they are unremarkable.
+#
+# This grouping is therefore still a declaration of a shared resource rather
+# than a fix: it stops them contending with *each other*, which is all it can
+# do. It cannot stop them contending with whatever else is using the disk, and
+# on a loaded machine that is what actually bites. Note that `db::connect`'s
+# pool waits up to 60 s for a connection (`MAX_POOL_WAIT`), deliberately, so a
+# genuinely starved run here fails slowly rather than quickly.
 on-disk-database = { max-threads = 1 }
 
 [[profile.default.overrides]]
