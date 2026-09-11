@@ -193,10 +193,142 @@ async fn create_devices(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One of the two series indexes that was originally built over `resolution`.
+///
+/// `Energy` and `EnergyStorage` both carry a `resolution` column that every row
+/// sets to `'2s'` — the coarser tiers live in their own tables instead, for the
+/// reasons recorded above `EnergyMinute`. Both indexes led with it, and neither
+/// needs to: a column with one distinct value narrows nothing.
+struct SeriesIndex {
+    table: &'static str,
+    /// The index as databases made before this change have it.
+    legacy: &'static str,
+    /// Its replacement, over the same columns minus `resolution`.
+    name: &'static str,
+    columns: &'static str,
+}
+
+/// Both of them, in the order `create_schema` creates their tables.
+const SERIES_INDEXES: [SeriesIndex; 2] = [
+    SeriesIndex {
+        table: "Energy",
+        legacy: "idx_energy_metric_res_time",
+        name: "idx_energy_metric_time",
+        columns: "device_id, metric, timestamp DESC",
+    },
+    SeriesIndex {
+        table: "EnergyStorage",
+        legacy: "idx_energystorage_res_time",
+        name: "idx_energystorage_time",
+        columns: "device_id, timestamp DESC",
+    },
+];
+
+/// Whether an index of this name exists.
+async fn index_exists(pool: &SqlitePool, name: &str) -> anyhow::Result<bool> {
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?")
+            .bind(name)
+            .fetch_one(pool)
+            .await?;
+    Ok(n > 0)
+}
+
+/// Creates the resolution-free index, unless the legacy one is still there.
+///
+/// The conditional is the whole point of this function. Both `CREATE INDEX IF
+/// NOT EXISTS` statements are individually idempotent, but the *pair* is not: on
+/// an existing database that has not been repacked, creating the new index
+/// without dropping the old one leaves both, which on a four-day `Energy` is
+/// ~39 MB of duplicate index on top of the ~84 MB already there. Since
+/// `create_schema` runs unattended on every startup, that would happen silently
+/// and immediately.
+///
+/// So a database keeps whichever one it has. A new database gets the new index
+/// and never sees the old name; an existing one is left alone until someone runs
+/// [`repack_series_indexes`] deliberately.
+async fn create_series_index(pool: &SqlitePool, idx: &SeriesIndex) -> anyhow::Result<()> {
+    if index_exists(pool, idx.legacy).await? {
+        return Ok(());
+    }
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+        idx.name, idx.table, idx.columns
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The environment variable that asks for [`repack_series_indexes`] to run.
+///
+/// Behind a variable rather than done on startup because it rewrites an index
+/// over the whole table: seconds on a developer machine, and it holds the write
+/// lock for all of them. That is not something to do to someone unannounced
+/// while they are waiting for the TUI to appear.
+pub const MIGRATE_ENV: &str = "DOM_MIGRATE_ENERGY";
+
+/// Rebuilds both series indexes without `resolution`. Returns the ones it did.
+///
+/// Each index is replaced in its own transaction, so an interrupted run leaves
+/// every index either as it was or as it should be, and the database is
+/// queryable at both. There is no intermediate state to resume from: re-running
+/// this picks up whichever ones are still on the old name.
+///
+/// Measured on a synthetic `Energy` of 1,036,800 rows — four days of six metrics
+/// at 2s, which is what retention holds — with the index built incrementally as
+/// production builds it, then `PRAGMA incremental_vacuum` to hand the freed pages
+/// back:
+///
+/// | | file | `Energy` | series idx | time idx |
+/// |---|---|---|---|---|
+/// | as production grows it | 171.6 MB | 48 | 84 | 30 |
+/// | after this | **123.7 MB** | 48 | 39 | 30 |
+///
+/// Two things are worth separating there, because the finding that prompted this
+/// had them confused. Dropping `resolution` from the *keys* is worth ~3 MB of
+/// that; the other ~45 MB is page density. An index maintained by inserts that
+/// arrive in an order it does not share ends up around half full, and
+/// `incremental_vacuum` hands back whole free pages without ever repacking
+/// partially-full ones — so a database that has been faithfully reclaiming space
+/// still carries all of it. Rebuilding the index is what packs the pages, and it
+/// is the larger half of the win by fifteen times.
+///
+/// Which also means this is not a one-off: the rebuilt index fragments again as
+/// rows arrive. What it is not is a reason to drop the column from the tables.
+/// That was the original finding, and measured it is the worse trade — SQLite's
+/// `ALTER TABLE ... DROP COLUMN` rewrites rows in place and *fragments the
+/// table* doing it (48 MB to 53), so it recovers 42.6 MB against this 47.9 while
+/// needing a second rewrite to undo its own damage, a larger WAL (140 MB against
+/// 90), and an edit to every query that names the column. The column is
+/// misleading and costs almost nothing; the index cost real space.
+pub async fn repack_series_indexes(pool: &SqlitePool) -> anyhow::Result<Vec<&'static str>> {
+    let mut done = Vec::new();
+    for idx in &SERIES_INDEXES {
+        if !index_exists(pool, idx.legacy).await? {
+            continue;
+        }
+        let mut tx = pool.begin().await?;
+        sqlx::query(&format!("DROP INDEX {}", idx.legacy))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(&format!(
+            "CREATE INDEX {} ON {} ({})",
+            idx.name, idx.table, idx.columns
+        ))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        done.push(idx.table);
+    }
+    Ok(done)
+}
+
 /// Creates every other table, each followed by the indexes over it.
 ///
 /// All of it is `IF NOT EXISTS`, so this runs on every startup and does nothing
-/// to a database that already has them.
+/// to a database that already has them — with the one exception noted on
+/// [`create_series_index`].
 async fn create_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS SwitchTimers (
@@ -241,12 +373,7 @@ async fn create_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_energy_metric_res_time
-         ON Energy (device_id, metric, resolution, timestamp DESC)",
-    )
-    .execute(pool)
-    .await?;
+    create_series_index(pool, &SERIES_INDEXES[0]).await?;
 
     // The index above leads with `device_id`, so a query that asks "what happened
     // between these two instants", across devices, cannot use it and falls back
@@ -273,12 +400,7 @@ async fn create_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_energystorage_res_time
-         ON EnergyStorage (device_id, resolution, timestamp DESC)",
-    )
-    .execute(pool)
-    .await?;
+    create_series_index(pool, &SERIES_INDEXES[1]).await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS NetworkStatusEvents (
@@ -4604,5 +4726,162 @@ mod tests {
             cluster_peer_pubkey(&pool).await.unwrap(),
             Some("abcd1234".to_string())
         );
+    }
+
+    // ── The series indexes over `resolution` ──────────────────────────────────
+
+    /// The legacy index, as a database made before the repack has it.
+    async fn with_legacy_indexes(pool: &SqlitePool) {
+        for idx in &SERIES_INDEXES {
+            sqlx::query(&format!("DROP INDEX IF EXISTS {}", idx.name))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "CREATE INDEX idx_energy_metric_res_time
+             ON Energy (device_id, metric, resolution, timestamp DESC)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_energystorage_res_time
+             ON EnergyStorage (device_id, resolution, timestamp DESC)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_database_gets_the_series_indexes_without_resolution() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        for idx in &SERIES_INDEXES {
+            assert!(
+                index_exists(&pool, idx.name).await.unwrap(),
+                "{} should have been created",
+                idx.name
+            );
+            assert!(
+                !index_exists(&pool, idx.legacy).await.unwrap(),
+                "{} should never appear on a new database",
+                idx.legacy
+            );
+        }
+    }
+
+    /// The trap: both `CREATE INDEX IF NOT EXISTS` statements are idempotent on
+    /// their own, so nothing errors — a database would just quietly carry two
+    /// indexes over the same rows, which on a four-day `Energy` is ~39 MB of
+    /// duplicate. `create_schema` runs on every startup, so it would be the next
+    /// one.
+    #[tokio::test]
+    async fn an_unrepacked_database_does_not_gain_a_second_index_on_startup() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        with_legacy_indexes(&pool).await;
+
+        create_schema(&pool).await.unwrap();
+
+        for idx in &SERIES_INDEXES {
+            assert!(
+                index_exists(&pool, idx.legacy).await.unwrap(),
+                "{} should have been left alone",
+                idx.legacy
+            );
+            assert!(
+                !index_exists(&pool, idx.name).await.unwrap(),
+                "{} was created alongside the index it replaces",
+                idx.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repacking_replaces_both_legacy_indexes_and_then_has_nothing_to_do() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        with_legacy_indexes(&pool).await;
+
+        let done = repack_series_indexes(&pool).await.unwrap();
+        assert_eq!(done, vec!["Energy", "EnergyStorage"]);
+        for idx in &SERIES_INDEXES {
+            assert!(index_exists(&pool, idx.name).await.unwrap());
+            assert!(!index_exists(&pool, idx.legacy).await.unwrap());
+        }
+
+        // Idempotent, which is what makes an interrupted run safe to repeat.
+        assert!(repack_series_indexes(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repacking_a_database_that_never_had_the_legacy_indexes_is_a_no_op() {
+        let pool = init("sqlite::memory:").await.unwrap();
+        assert!(repack_series_indexes(&pool).await.unwrap().is_empty());
+        for idx in &SERIES_INDEXES {
+            assert!(index_exists(&pool, idx.name).await.unwrap());
+        }
+    }
+
+    /// Every read still filters `resolution = '2s'`, and the column stays — so
+    /// the queries must return the same answers with the column gone from the
+    /// keys. This asserts that against the minute rollup, which is the query that
+    /// reads the 2s tier by `device_id` and a time range, and so is the one this
+    /// index exists to serve.
+    #[tokio::test]
+    async fn the_minute_rollup_reads_the_same_rows_before_and_after_a_repack() {
+        async fn minutes(pool: &SqlitePool) -> Vec<(String, String, f64, f64)> {
+            sqlx::query(
+                "SELECT minute, metric, energy_ws, peak_w FROM EnergyMinute
+                 ORDER BY minute, metric",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("minute"),
+                    r.get::<String, _>("metric"),
+                    r.get::<f64, _>("energy_ws"),
+                    r.get::<f64, _>("peak_w"),
+                )
+            })
+            .collect()
+        }
+
+        let d = day("2026-03-04");
+        let mut results = Vec::new();
+
+        for repack in [false, true] {
+            let pool = init("sqlite::memory:").await.unwrap();
+            with_legacy_indexes(&pool).await;
+            if repack {
+                assert_eq!(
+                    repack_series_indexes(&pool).await.unwrap(),
+                    vec!["Energy", "EnergyStorage"]
+                );
+            }
+            let id = device(&pool, "10.0.0.1").await;
+            for (t, metric, ws) in [
+                ("2026-03-04 08:00:00", "consumption", 200.0),
+                ("2026-03-04 08:00:02", "consumption", 240.0),
+                ("2026-03-04 08:00:04", "production", -60.0),
+                ("2026-03-04 08:01:00", "consumption", 120.0),
+                // A different day, which the rollup must not pick up.
+                ("2026-03-05 08:00:00", "consumption", 999.0),
+            ] {
+                sample(&pool, id, t, metric, ws).await;
+            }
+
+            rollup_energy_minute(&pool, id, d, "2030-01-01 00:00:00")
+                .await
+                .unwrap();
+            results.push(minutes(&pool).await);
+        }
+
+        assert_eq!(results[0], results[1]);
+        // And that it read anything at all, so an empty match cannot pass this:
+        // two metrics in the first minute and one in the second.
+        assert_eq!(results[0].len(), 3);
     }
 }

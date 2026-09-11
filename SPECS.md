@@ -739,6 +739,82 @@ the seeded days inside the window rather than assuming that count is
 The general form, worth keeping: a test that pins a wall-clock *time of day* has a hidden
 precondition about when the suite runs. Anchoring to the instant the test starts does not.
 
+### Decision: the `Energy` index was fragmentation, not the columns in it — repack it, keep them
+
+REVIEW.md carried two findings about the 2-second tier: that `Energy.resolution` is vestigial
+(every row is `'2s'`; the coarser tiers have their own tables), and that
+`idx_energy_metric_res_time` was "914 MB against a 555 MB table" because it carries `metric`
+and `resolution` as TEXT. The remedy both pointed at was a table rewrite interning them as
+integers, worth doing "only alongside some other migration that already has to".
+
+Both figures predate retention, so the first thing was to re-measure. On a synthetic `Energy`
+of 1,036,800 rows — four days of six metrics at 2s, which is what retention holds — with the
+index built incrementally by the inserts, as production builds it, and freed pages handed back
+with `PRAGMA incremental_vacuum`:
+
+| | file | `Energy` | series idx | time idx |
+|---|---|---|---|---|
+| as production grows it | 171.6 MB | 48 | 84 | 30 |
+| after `DROP`/`CREATE INDEX` without `resolution` | **123.7 MB** | 48 | 39 | 30 |
+| after `ALTER TABLE DROP COLUMN resolution` | 129.0 MB | 53 | 39 | 30 |
+| after a full `VACUUM`, schema untouched | 124.1 MB | 48 | 42 | 27 |
+
+The diagnosis in the finding is wrong, and the last two rows are why. Dropping `resolution`
+from the index keys is worth ~3 MB of the 84; the other ~45 is **page density**. An index
+maintained by inserts arriving in an order it does not share ends up around half full, and
+`auto_vacuum=INCREMENTAL` hands back whole free pages without ever repacking partially-full
+ones — so a database that has been faithfully reclaiming space still carries all of it.
+Rebuilding the index is what packs the pages, and it is the larger half of the win by fifteen
+times. It also means "the index is larger than the table" was an artifact: repacked, it is
+39 MB against 48.
+
+So the fix is the index, not the schema. `db::repack_series_indexes` drops each of the two
+`resolution`-leading indexes and recreates it without the column, one transaction each.
+
+Dropping the column from the tables was measured and **declined**. SQLite's `ALTER TABLE ...
+DROP COLUMN` rewrites rows in place and fragments the table doing it (48 MB to 53), so it
+recovers 42.6 MB against the repack's 47.9 while needing a larger WAL (140 MB against 90), a
+second rewrite to undo its own damage, and an edit to every query naming the column. Interning
+`metric` as an integer was declined on the same evidence: against a repacked index it is worth
+single-digit MB, and it costs a rewrite of five tables. The column is misleading, which is a
+real cost — but it is a documentation cost, where the index cost space.
+
+There was one measured surprise in favour of the repack beyond size. The prune query
+(`WHERE resolution = '2s' AND date(timestamp, 'localtime') < ? ... LIMIT ?`) was being served
+by the old index as a covering scan, in `(device_id, metric, timestamp DESC)` order — which is
+not date order, so it read until it happened to accumulate `LIMIT` old rows. Without
+`resolution` in the index it falls back to a table scan, and rowid order *is* arrival order,
+so the oldest rows come first and the limit is met immediately: 0.073 s to 0.004 s. The other
+five `resolution = '2s'` sites keep their plans, modulo the index's new name.
+
+`VACUUM` recovers almost as much as the repack (124.1 vs 123.7 MB) and needs no code at all.
+It is not what shipped because it rewrites the entire file and needs room for a second copy,
+and because `reclaim_free_pages` already covers the file-growth half of the problem — but it
+is the right tool if the goal is the whole file rather than this index, and the table above is
+the reason to reach for it deliberately rather than expect `incremental_vacuum` to do it.
+
+Three consequences worth stating:
+
+- **The pair of `CREATE INDEX IF NOT EXISTS` statements is not idempotent even though each
+  one is.** `create_schema` runs unattended on every startup; creating the new index there
+  without dropping the old would leave an existing database carrying both — ~39 MB of
+  duplicate, silently, on the next start. `create_series_index` therefore creates the new
+  index only when the legacy one is absent, so a database keeps whichever it has, and a test
+  asserts exactly that.
+- **The repack is opt-in, behind `DOM_MIGRATE_ENERGY`**, because it holds the write lock over
+  a whole-table index rebuild and that is not something to do to someone waiting for the TUI.
+  A failure there is reported and startup continues: every index is either old or new, and
+  both are correct.
+- **It is not permanent.** The rebuilt index fragments again as rows arrive. This buys back
+  what has accumulated; it does not change the mechanism.
+
+Two caveats on the numbers. They come from a synthetic table with no deletes, where production
+prunes — on a `timestamp DESC` index new keys insert at the front of each metric's range while
+pruning frees pages at the back, so live fragmentation is plausibly worse than measured rather
+than better. And the live database is far larger than four days of data because it grew before
+retention existed; these figures are what a repack recovers from *this* table shape, not a
+prediction for that file.
+
 ### Smaller decisions
 
 - Three of the four places that record what a poll measured discarded the write with

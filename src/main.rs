@@ -141,6 +141,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pool = db::init("sqlite://db.sqlite").await?;
+
+    // Asked for by hand, and reported here rather than only to the log: it holds
+    // the write lock over a whole-table index rebuild, so the startup it delays
+    // is this one, and whoever set the variable is the one waiting.
+    if std::env::var_os(db::MIGRATE_ENV).is_some() {
+        println!("{}: repacking series indexes…", db::MIGRATE_ENV);
+        match db::repack_series_indexes(&pool).await {
+            Ok(done) if done.is_empty() => println!("  nothing to do — already repacked"),
+            Ok(done) => println!("  rebuilt the index over {}", done.join(" and ")),
+            // Not fatal. Every index is either old or new, both are correct, and
+            // refusing to start over a space optimization would be the worse bug.
+            Err(e) => eprintln!("  failed, leaving the indexes as they were — {e}"),
+        }
+    }
+
     let state = app::new_shared();
 
     // Colour theme: an explicit choice the user made with 't' in a previous run

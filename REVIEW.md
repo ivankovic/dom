@@ -70,22 +70,41 @@ Still true as of 2026-09-11, and now the oldest thing on this list. `alarm.rs` a
 `cluster.rs`, added since, both open with one — so the convention is not in doubt, only
 unapplied to the files that predate it.
 
-## `Energy.resolution` is now vestigial
+## `Energy.resolution` is still vestigial, and the column is now the whole of it
 
-Every row in `Energy` has `resolution = '2s'`, and the coarser tiers live in their own tables — for
-the reasons recorded in SPECS.md. The column and its `CHECK (resolution IN ('2s','1min','10min'))`
-constraint remain, and every query still filters on it. Harmless, but it reads as though the table
-holds multiple resolutions when it does not, and it costs a repeated TEXT value per row in both the
-table and the 914 MB index.
+Every row in `Energy` has `resolution = '2s'`, and the coarser tiers live in their own tables —
+for the reasons recorded in SPECS.md. The column and its
+`CHECK (resolution IN ('2s','1min','10min'))` remain, and every query still filters on it. The
+same is true of `EnergyStorage`.
+
+**The index half of this was fixed on 2026-09-12 and the space claim below it was wrong;** see
+SPECS.md, "the `Energy` index was fragmentation, not the columns in it". Both
+`resolution`-leading indexes are now rebuilt without the column by
+`db::repack_series_indexes`, behind `DOM_MIGRATE_ENERGY`.
+
+What is left is only the column, and only as a readability problem: the table reads as though
+it holds multiple resolutions when it does not. Measured, removing it is worth ~3 MB of a
+124 MB database and *costs* space the way SQLite implements it — `ALTER TABLE ... DROP COLUMN`
+rewrites rows in place and fragments the table, 48 MB to 53, so the drop has to be followed by
+a `VACUUM` to come out ahead of where it started. Left open because the honest justification is
+now clarity rather than space, which makes it a judgement about how much a misleading schema is
+worth, and because it is the one change here that requires editing every query that names the
+column (~15 sites) and so cannot be made optional.
 
 ## The `Energy` index is larger than the table
 
-`idx_energy_metric_res_time` was 914 MB against a 555 MB table, or 75 bytes per row against 46,
-because it carries `metric` and `resolution` as TEXT for every row. Interning both as small integers
-would shrink it substantially.
+**Fixed on 2026-09-12, and the finding's reasoning was wrong.** It was recorded as 914 MB
+against a 555 MB table "because it carries `metric` and `resolution` as TEXT for every row",
+with interning both as integers as the remedy. Re-measured on a retention-bounded four-day
+table, with the index built incrementally as production builds it, the figures are 84 MB against
+48 — and the TEXT columns are ~3 MB of that. The other ~45 MB is page density: an index
+maintained by inserts that do not arrive in its key order settles at around half full, and
+`incremental_vacuum` returns whole free pages without ever repacking partially-full ones.
 
-Independent of retention: pruning fixed the *growth*, this would fix the *density*. It needs a rewrite
-of the table, so it is worth doing only alongside some other migration that already has to.
+So "larger than the table" was an artifact of fragmentation, not of column width — repacked, the
+index is 39 MB against a 48 MB table. Rebuilding it recovers 47.9 MB, more than dropping the
+column would (42.6) and about the same as a full `VACUUM` (47.5). The interning the finding
+asked for was declined on that evidence; the table of measurements is in SPECS.md.
 
 # From the pass of 2026-08-17
 
