@@ -1,6 +1,9 @@
 # Developement Workflow
 
-- DO NOT USE GIT COMMIT. NEVER COMMIT. ONLY HUMANS SHOULD COMMIT.
+- Do not commit unless you are asked to, in that turn, in as many words. The default is to
+leave finished work in the working tree and say what you would have written as the message.
+"Commit this", "commit and push" or similar is the exception, and only for what that request
+covers — never as tidying-up at the end of some other task, and never on the default branch.
 
 - Always read the README.md file in the root of the repository. Always.
 - Always read README.md in any directory in this repository before you read or write any files in
