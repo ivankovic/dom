@@ -22,10 +22,12 @@
 
 //! Dom, as a library: every module the binary is assembled from.
 //!
-//! `main.rs` is the application — the tokio runtime, the background tasks, the
-//! terminal — and everything it does is built out of the modules declared here.
-//! The split exists so the parts can be tested without one: an integration test,
-//! or `cargo test`, links this crate and never starts a runtime or a TUI.
+//! `main.rs` is the binary, and it is not thin: it holds the tokio runtime, the
+//! twelve background tasks, the startup order they depend on, and its own tests.
+//! What lives *here* is everything those tasks are built out of. The split exists
+//! so those parts can be exercised without a runtime or a terminal — an
+//! integration test links this crate and starts neither — so if you are looking
+//! for a task, look in `main.rs`; for what it does, look below.
 //!
 //! Read [`db`] first if you are looking for where data lives, [`app`] for what
 //! the interface currently believes, and SPECS.md for why any of it is shaped

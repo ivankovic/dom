@@ -24,16 +24,22 @@
 //!
 //! Each submodule owns one kind of device — [`mystrom_switch`],
 //! [`sonnen_batterie`], [`keba`], [`mikrotik`], plus [`dom_local`] for the
-//! machine Dom itself runs on. They are deliberately uniform, and reading one
-//! tells you the shape of all of them:
+//! machine Dom itself runs on. Reading one gives you roughly the shape of all of
+//! them:
 //!
 //! - `NAME` and `API_PORT`, and a `detect` that says whether a
 //!   [`crate::fingerprint::Fingerprint`] looks like this device. [`detect_type`]
 //!   is what asks each of them.
-//! - A struct for the device's own API response, and a `fetch_*` that parses one.
+//! - A struct for the device's own API response, and something that fetches one.
 //! - `DeviceRecord`, `save_device`, `load_all` — the device's row.
 //! - A `poll_loop`, spawned once per configured device by `main`, which reads,
 //!   integrates, writes, and updates [`crate::app::App`].
+//!
+//! Two diverge on the fetch, for reasons in their own docs: [`keba`] speaks
+//! line-oriented UDP and reads two reports at once, and [`mikrotik`] fetches
+//! through an authenticated `Session` rather than a free function, because it
+//! makes several requests per poll over one connection. [`dom_local`] has no
+//! fetch at all — nothing polls the local machine.
 //!
 //! What lives *here* is everything that would otherwise be written four times,
 //! and each piece of it exists because a divergence between those copies was a
