@@ -543,7 +543,10 @@ end to end. It was preceded by a lint sweep (`clippy` with `pedantic` and `nurse
 1,206 hits were used as pointers to inspect rather than as a fix list; nothing was changed to
 satisfy a style lint.
 
-Fourteen findings were fixed. The rest stay in REVIEW.md.
+Fourteen findings were fixed in the pass itself. The pending list it left was then worked
+through on 2026-09-12 — those decisions are the later subsections below, from "a failure that
+reaches the database" onwards. What is still in REVIEW.md is what needs a judgement that has
+not been made.
 
 ### Decision: a string from the network is not a string of ASCII
 
@@ -650,6 +653,92 @@ There was no test, which is why nothing noticed. The one added fills every addre
 forgets the address and asserts that nothing anywhere still mentions it — so the next field added
 to `App` is caught by the same test rather than by the next pass.
 
+### Decision: a failure that reaches the database has one place to appear
+
+`conn_status` says when a device cannot be reached. Nothing said when a device was read
+perfectly and the *write* failed — the views went on showing live readings, every device stayed
+`Online`, and the series quietly filled with holes. It is the only failure here that looks
+exactly like success.
+
+`App::write_error` is that fault's home, set through `devices::note_write_failure` so all four
+loops word it identically, and shown in the status bar because that is the only line present in
+all six views. One field rather than one per device: what failed is the database, not the device
+whose poll happened to hit it, and every loop would otherwise report the same fault at once
+against whichever addresses they belong to. Any loop's next successful write clears it, because
+that is what says the database is answering again.
+
+### Decision: one wait budget for the database, stated
+
+`db::connect` reasoned carefully about `synchronous` and `auto_vacuum` and left `busy_timeout`
+at sqlx's default five seconds. Five is short here: the rollup deletes in 20,000-row batches,
+and on an SD card one of those can hold the write lock longer than that while nine poll loops
+queue behind it. What a timeout expiring costs is a poll's measurements, and there is no user
+waiting on any of these writes — so waiting is strictly better than losing the sample.
+
+Thirty seconds now, asserted per connection alongside `synchronous`, with the pool's acquire
+timeout necessarily *longer* at sixty. That relationship is the point: a connection held by a
+writer waiting out the busy timeout is a connection nobody else can have, so a shorter acquire
+timeout would let the pool give up first and turn a wait that was about to succeed into a failed
+query.
+
+`max_connections` stays at sqlx's ten, and now says why rather than being left unexamined.
+"Ten writers on a single-writer file" is a tempting thing to cut, and cutting it is wrong: under
+WAL the extra connections are not extra writers — readers never block, and a writer that cannot
+have the lock waits for it. What the pool size bounds is how many things can be *in flight*.
+Tried at four; the on-disk tests began timing out under load, which is the same contention
+arriving earlier and with nothing to retry it.
+
+### Decision: one unreadable row is not an empty device list
+
+Every device module's `load_all` parsed the `ip` column with `?`, so a single unreadable value
+failed the whole query — and every caller reads an `Err` as "there are none of these". One bad
+row therefore stopped polling every battery, or every switch, silently. The row is skipped and
+named in the log now, which is what `dom_local::load_all` and `main::lease_addresses` always did.
+
+### Decision: an unknown altitude is an absence, not a number
+
+`weather::parse_stations` fell back to `f64::NAN` when a station's altitude would not parse, and
+the Environment view printed `· NaN m ·`. The altitude is there to stop the temperature reading
+as "outside the house" — a reading from 1880 m means something different from one at 550 m — so
+a value that qualifies nothing has to look absent. `Option<f64>` through weather, db and app,
+and an em dash in the view, which is the choice `pct` already makes for a ratio with no
+denominator.
+
+### Decision: a poll interval is re-read, but not before every poll
+
+A poll loop built its ticker from `poll_interval_secs` once, so changing a device's interval did
+nothing until a restart. Re-reading before every poll is the obvious fix and the wrong one: it
+puts a query in front of each poll, which is what the "one transaction per poll" decision above
+exists to avoid, to learn a number that changes perhaps once in the life of an installation.
+
+`devices::PollTicker` re-reads every thirty polls — a minute at the default interval — and
+rebuilds only on a real change, starting the new interval from now so a device whose interval was
+just lengthened is not polled once more immediately. It also absorbs the ticker setup all four
+modules had a copy of, and hands the interval back through `secs()` so `max_integration_gap_ms`
+follows it: an interval that changed while the gap limit did not would either refuse every
+interval or integrate straight across a real gap.
+
+The re-read is split from the tick so the decision can be tested without a clock. Tokio's
+pausable clock cannot stand in here — it expires sqlx's own pool and busy timeouts the moment the
+runtime goes idle.
+
+### Decision: a test's own clock is part of its setup
+
+Two rollup tests seeded their samples at 09:00 local. The minute tier only writes minutes that
+are over, so for any run between local midnight and nine in the morning today's sample was in
+the future, today produced no minute rows and no daily row, and both tests came up one day
+short. They had been wrong since they were written and only ever failed to someone working
+late — found here by the clock rolling past midnight in the middle of a session, and confirmed
+against the unmodified tree before anything was changed.
+
+Samples are now placed a whole number of days before *now*. `seed_days` returns the local days
+it seeded, because just after midnight the newest is yesterday: the retention assertion counts
+the seeded days inside the window rather than assuming that count is
+`RAW_ENERGY_RETENTION_DAYS`. That is the same statement, and true at every hour.
+
+The general form, worth keeping: a test that pins a wall-clock *time of day* has a hidden
+precondition about when the suite runs. Anchoring to the instant the test starts does not.
+
 ### Smaller decisions
 
 - Three of the four places that record what a poll measured discarded the write with
@@ -662,6 +751,15 @@ to `App` is caught by the same test rather than by the next pass.
   first task that did not finish cleanly and silently abandons every result still in the set.
   Release builds abort on panic so this could not lose a production cycle's discoveries, but
   it is wrong, and `cluster_discovery_task` already reads its set the other way.
+- `resolve_redirect` split an authority with `rfind(':')`, which cannot tell an IPv6 address's
+  own colons from a port separator: `[::1]:8080` kept the brackets on the host, which
+  `IpAddr::from_str` rejects, so the redirect was followed against the address already being
+  probed. `split_authority` handles the bracketed form the URL grammar specifies, and reads an
+  unbracketed authority with more than one colon as the address it obviously is.
+- `chart_refresh_task` ended on a trailing `sleep`, making its period sixty seconds *plus* four
+  queries; it is on an `interval` like the other seven. `statistics_task` keeps its `sleep`
+  deliberately — the throttle exists to leave the disk alone between passes, and an `interval`
+  would hand it straight to the next one — and now says so, at the call site as well.
 - `merge_device_list` named this machine's own addresses by calling
   `dom_local::is_local_ip`, which re-reads the host's interfaces, while `local_ips` — read
   once per cycle for exactly this reason — sat unused in its own parameter list. The comment

@@ -8,13 +8,15 @@ have since been fixed; see SPECS.md for the decisions taken.
 This pass took robustness as its subject. Every file in `src/` was opened; the four largest
 (`db.rs`, `tui/render.rs`, and the KEBA and MikroTik device modules) were read in the parts
 bearing on that subject rather than end to end, so a later pass over those four for
-*anything else* would still find new ground. Fourteen findings were fixed — see SPECS.md,
-"Code health pass (2026-09-11)". What remains is what needed a judgement call or a larger
-change.
+*anything else* would still find new ground. Fourteen findings were fixed in the pass itself,
+and the pending list was then worked through on 2026-09-12 — see SPECS.md, "Code health pass
+(2026-09-11)". What remains is what needed a judgement call or a larger change.
 
-`tests/` was not read, only run. Two of the fixes came from noticing that a behaviour
-nothing asserted had quietly stopped happening (`App::forget_device`, and the orientation
-search's refinement pass), so what the suite does *not* cover is worth a pass of its own.
+`tests/` was not read, only run. Three of the fixes came from noticing that a behaviour
+nothing asserted had quietly stopped happening (`App::forget_device` and the orientation
+search's refinement pass), or that an assertion was quietly wrong (`seed_days`, which made two
+rollup tests fail for nine hours every night). What the suite does *not* cover, and what it
+covers incorrectly, is worth a pass of its own.
 
 It was preceded by a lint sweep: `clippy` with `pedantic` and `nursery` reports 1,206 hits,
 almost all of them style (`missing_errors_doc`, `must_use_candidate`, `doc_markdown`). They
@@ -24,75 +26,20 @@ it now reports twenty, plus two `significant_drop_in_scrutinee` at `keba.rs`. No
 a lock held across an `await` — that remains true — but the claim as written is no longer
 accurate about the lint.
 
-## Nothing sets `busy_timeout`
+## One write failure looks like all of them
 
-`db::connect` reasons explicitly about `synchronous`, `auto_vacuum` and WAL, and says why
-each is set on the *options* rather than as a pragma. It does not mention `busy_timeout`,
-so the database runs on sqlx's five-second default with sqlx's ten-connection default pool,
-against nine background tasks and a rollup that deletes in 20,000-row batches, all on one
-SD card.
+`App::write_error` now says that recording a measurement failed, and the status bar shows it.
+What it cannot say is *how much* has failed: it holds the most recent message, so one
+transient `SQLITE_BUSY` on one device and a disk that has been refusing every write for an
+hour read identically, and the field clears as soon as any loop's next write succeeds.
 
-Not a confirmed bug, and the failure mode is contained: `handle_poll_failure` is reached
-only from the *fetch* in all four poll loops — checked in each — so a write that fails on a
-busy database does not get reported as an unreachable device. What it does instead is the
-entry above this one. But `busy_timeout` is the one connection-level setting the file
-deliberately reasons about and then leaves at a default it does not name, and ten writer
-connections to a single-writer database is not obviously the right shape.
+That was the right first move — the failure was invisible, and now it is not — but "one
+device hiccuped" and "nothing has been recorded since Tuesday" are different situations and
+the user cannot currently tell them apart. A count of consecutive failures, or the instant of
+the last successful write, would separate them. Left open because which of those to show is a
+judgement about the interface, not about the mechanism.
 
-Related, and the reason this is written down at all: `tests/db.rs`'s
-`freed_pages_are_handed_back_rather_than_hoarded` failed with `PoolTimedOut` during this
-pass's baseline run, on a machine at load average 16, and then passed alone in 13.5 s.
-`.config/nextest.toml` records that flake as having "not reproduced since". It has now.
 
-## The poll-write failure path is a log line and nothing else
-
-`logging`'s own module doc sets the rule: "a message written here is one the user will not see
-unless they go looking. Anything a person needs to *act* on belongs in `App` as well." That is
-what `rollup_error` exists for.
-
-A poll that fetches fine but fails to *record* is the same class of thing and does not follow
-it. All four device loops and `weather::refresh` now `log::warn!` and carry on — which is an
-improvement on discarding it, and still only a file. A database that keeps refusing writes
-leaves the views showing live readings, `ConnStatus::Online` against every device, and a series
-quietly full of holes.
-
-Not carried further here because it needs a judgement about shape rather than a line of code:
-it is not per-device (the database is one resource, and every loop would report the same failure
-at once), so it is not `last_error`, and the honest thing is probably one field like
-`rollup_error` naming the most recent write failure across all of them. Worth deciding before
-adding a sixth device type.
-
-## A station with no altitude renders as `NaN m`
-
-`weather::parse_stations` falls back to `f64::NAN` when a station's `altitude` field is
-absent or will not parse, and the Environment view formats it with `{:.0}` — so the panel
-reads `· NaN m · 12.3 km away`. The column is nullable, so nothing is lost in storage; this
-is only what a person sees.
-
-It matters more than a cosmetic glitch because of what the figure is *for*: the module doc
-says the altitude is "worth showing: a reading from 1880 m means something different from one
-at 550 m", and `OutdoorReading`'s doc says the distance and altitude "qualify the reading".
-A `NaN` does not qualify anything.
-
-`Option<f64>` is the honest type and there is already a convention for rendering one — `pct`
-prints a padded em dash rather than a misleading zero. Left as a finding rather than fixed
-because it is a type change across `weather`, `db`, `app` and `render` for a display defect,
-which is a different trade than the rest of this pass was making.
-
-## `load_all` lets one bad row disable every device of a type
-
-Each device module's `load_all` parses the `ip` column with `?`, so a single unparseable
-value fails the whole query. Every caller reads that as "no devices of this type":
-`maybe_spawn_*_poll_loop` returns without spawning, `eco_job` skips its tick, and
-`bootstrap_known_devices` adds nothing. One corrupt row therefore stops polling for every
-battery, or every switch, silently.
-
-Two places in the same codebase already solve it the other way: `main::lease_addresses`
-with `filter_map(|lease| lease.address.parse().ok())`, and — in a `load_all` of its own —
-`dom_local::load_all`, which skips a bad row with `if let Ok(ip)`. The rows here are written
-by Dom itself, so this is latent rather than broken, which is also why it is a judgement
-call: skipping the row needs somewhere to say that it was skipped, or a device disappears
-with no more explanation than it has now.
 
 # From the pass of 2026-08-23
 
@@ -123,18 +70,6 @@ Still true as of 2026-09-11, and now the oldest thing on this list. `alarm.rs` a
 `cluster.rs`, added since, both open with one — so the convention is not in doubt, only
 unapplied to the files that predate it.
 
-## `main` spawns two tasks inline and the rest as named functions
-
-**Half fixed on 2026-09-11.** The two anonymous `async move` blocks are now `prune_task` and
-`chart_refresh_task`, named and documented like the other seven.
-
-What remains is the part that cut across that split rather than along it: seven of the nine
-drive their loop with `interval` and `MissedTickBehavior::Skip`, while two — `chart_refresh_task`
-and `statistics_task` — end with a bare `sleep`, so their period drifts by however long the
-work above them took. That is defensible for `statistics_task`, whose pass is deliberately
-throttled and of variable length, but it is not stated anywhere, and nothing at the call site
-distinguishes any of the nine from the others.
-
 ## `Energy.resolution` is now vestigial
 
 Every row in `Energy` has `resolution = '2s'`, and the coarser tiers live in their own tables — for
@@ -151,24 +86,6 @@ would shrink it substantially.
 
 Independent of retention: pruning fixed the *growth*, this would fix the *density*. It needs a rewrite
 of the table, so it is worth doing only alongside some other migration that already has to.
-
-## Poll intervals are read once at spawn time
-
-A poll loop reads `poll_interval_secs` from its `DeviceRecord` when it starts and builds
-its ticker from it. Changing a device's interval in the DB therefore has no effect until
-the process restarts. Nothing in the UI currently edits intervals, so this is latent
-rather than broken — worth knowing before adding that.
-
-## `resolve_redirect` cannot follow a redirect to an IPv6 literal
-
-The host/port split uses `rfind(':')`. For `http://[::1]:8080/x` that does pick the right
-port, but the host comes out as `[::1]`, which `IpAddr::from_str` rejects (it does not
-accept brackets) — so the redirect is followed against the address already being probed
-instead of the one named. A bare IPv6 authority is misread outright.
-
-Harmless today: local devices redirect to IPv4 addresses or to hostnames, and the
-fall-back-to-the-probed-address behaviour is deliberate for hostnames. It would matter for
-a device that redirects across hosts on an IPv6-only segment.
 
 # From the pass of 2026-08-17
 
