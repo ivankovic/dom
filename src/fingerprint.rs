@@ -168,6 +168,44 @@ fn extract_location(raw: &str) -> Option<String> {
     None
 }
 
+/// Splits an HTTP authority into its host and port, defaulting the port to 80.
+///
+/// An IPv6 literal is bracketed in a URL — `[::1]`, `[::1]:8080` — precisely
+/// because the address's own colons are otherwise indistinguishable from a port
+/// separator. `rfind(':')` alone therefore got both forms wrong: it picked the
+/// right port out of `[::1]:8080` but left the host as `[::1]`, which
+/// `IpAddr::from_str` rejects (it does not accept the brackets), so the redirect
+/// was followed against the address already being probed rather than the one
+/// named; and it split a bare `::1` into a host of `:` and a port of 1.
+///
+/// A bare, unbracketed IPv6 authority is not valid in a URL, but reading it as
+/// the address it obviously is beats inventing a port from its last group. The
+/// giveaway is more than one colon with no brackets: a host name or IPv4 address
+/// has at most one, separating the port.
+fn split_authority(authority: &str) -> (&str, u16) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // `]` is ASCII, so every index derived from it is a char boundary.
+        let Some(close) = rest.find(']') else {
+            return (authority, 80);
+        };
+        let port = rest[close + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(80);
+        return (&rest[..close], port);
+    }
+    if authority.matches(':').count() > 1 {
+        return (authority, 80);
+    }
+    match authority.rfind(':') {
+        Some(i) => (
+            &authority[..i],
+            authority[i + 1..].parse::<u16>().unwrap_or(80),
+        ),
+        None => (authority, 80),
+    }
+}
+
 /// Resolves a Location header value to (ip, port, path).
 /// Returns None for HTTPS (no TLS support) or unparseable locations.
 fn resolve_redirect(
@@ -187,13 +225,7 @@ fn resolve_redirect(
             "/".to_string()
         };
 
-        let (host, port) = match host_port.rfind(':') {
-            Some(i) => (
-                &host_port[..i],
-                host_port[i + 1..].parse::<u16>().unwrap_or(80),
-            ),
-            None => (host_port, 80u16),
-        };
+        let (host, port) = split_authority(host_port);
         // If the host doesn't parse as an IP address (e.g. "router.local"), fall
         // back to the original IP — we're fingerprinting a known local device.
         let ip = host.parse::<IpAddr>().unwrap_or(original_ip);
@@ -337,6 +369,65 @@ mod tests {
         // no `Location` to find at all.
         let body = String::from_utf8_lossy(b"HTTP/1.1 302 Found\r\n\r\nSitzung\xffende");
         assert_eq!(extract_location(&body), None);
+    }
+
+    #[test]
+    fn an_authority_splits_into_host_and_port() {
+        assert_eq!(split_authority("172.16.20.9:8080"), ("172.16.20.9", 8080));
+        assert_eq!(split_authority("172.16.20.9"), ("172.16.20.9", 80));
+        assert_eq!(split_authority("router.local:81"), ("router.local", 81));
+        // A port that is not a number is not a reason to abandon the host.
+        assert_eq!(split_authority("172.16.20.9:http"), ("172.16.20.9", 80));
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_authority_keeps_its_address_and_its_port_apart() {
+        // The brackets exist because the address's own colons are otherwise
+        // indistinguishable from a port separator. They also have to come off:
+        // `IpAddr::from_str` does not accept them, so leaving them on meant the
+        // redirect was followed against the address already being probed.
+        assert_eq!(split_authority("[::1]:8080"), ("::1", 8080));
+        assert_eq!(split_authority("[::1]"), ("::1", 80));
+        assert_eq!(
+            split_authority("[fe80::1ff:fe23:4567:890a]:81"),
+            ("fe80::1ff:fe23:4567:890a", 81)
+        );
+        assert!(
+            "::1".parse::<std::net::IpAddr>().is_ok(),
+            "the point of stripping the brackets",
+        );
+    }
+
+    #[test]
+    fn a_bare_ipv6_authority_is_read_as_an_address_not_as_a_port() {
+        // Not valid in a URL, but reading it as the address it obviously is
+        // beats inventing a port out of its last group — which is what
+        // `rfind(':')` did, splitting this into a host of ":" and port 1.
+        assert_eq!(split_authority("::1"), ("::1", 80));
+        assert_eq!(
+            split_authority("fe80::1ff:fe23:4567:890a"),
+            ("fe80::1ff:fe23:4567:890a", 80)
+        );
+    }
+
+    #[test]
+    fn an_unterminated_bracket_is_left_alone_rather_than_guessed_at() {
+        assert_eq!(split_authority("[::1"), ("[::1", 80));
+    }
+
+    #[test]
+    fn a_redirect_to_an_ipv6_literal_is_followed_to_that_address() {
+        // The whole point: this used to resolve to `IP`, the address already
+        // being probed, because `[::1]` does not parse as an `IpAddr`.
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(
+            resolve_redirect("http://[::1]:8080/x", IP, 80),
+            Some((v6, 8080, "/x".to_string()))
+        );
+        assert_eq!(
+            resolve_redirect("http://[::1]/x", IP, 80),
+            Some((v6, 80, "/x".to_string()))
+        );
     }
 
     #[test]
