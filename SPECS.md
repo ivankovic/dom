@@ -1893,3 +1893,71 @@ container's volume (a fresh random keypair, simulating a reinstalled peer) and r
 same address produced repeated, correctly-labeled `PeerIdentityMismatch` warnings on the other side
 — "answered by an identity that doesn't match the pin... treating as unreachable until re-paired" —
 rather than either silently trusting the new key or silently getting stuck with no explanation.
+
+## Discovery re-probes only what it does not already know (2026-09-17)
+
+### Problem
+
+Finding what exists and re-confirming what is already known shared one cost.
+
+Every `DISCOVERY_INTERVAL_SECS`, `discovery_task` rebuilt its target list — the union of the last
+ping scan and the router's DHCP leases, both already in memory, both free — and then handed *every*
+address in it to `fingerprint::fingerprint`. Nothing distinguished an address seen for the first
+time from a speaker identified weeks earlier: `merge_scan_targets` returns what exists, and the
+whole of it went back on the wire.
+
+Each fingerprint is a twelve-port TCP scan (`fingerprint::PROBE_PORTS`) plus two HTTP requests per
+open web port. Across the ~35 addresses in this house that is roughly 500 connection attempts every
+five minutes, indefinitely, against a device list that changes a few times a year.
+
+It was also unbounded — one `JoinSet::spawn` per address, no limit — so a cycle arrived as a single
+simultaneous burst. Measured from the router with a full packet capture on 2026-09-14: 853
+connection attempts to 35 addresses across 13 ports, in one unbroken 206-second run.
+
+The cost is not the connects themselves but where they land. Half the devices here are on 2.4 GHz,
+every Sonos among them, and a probe to one of those is airtime taken from whatever else is using the
+band plus a RST the device has to send back. The playback dropouts this was investigated alongside
+are a contention problem, and discovery was one of the contributors.
+
+### Decision: cache the fingerprint, key it on the MAC, bound the concurrency
+
+`plan_fingerprints` splits the target list in two before anything touches the network. An address
+whose cached fingerprint is younger than `FINGERPRINT_TTL_SECS` (six hours) *and* still answers to
+the same MAC in the ARP cache is served from `CachedFingerprint`; everything else is probed.
+
+Both halves have to hold. The TTL alone would let a device swapped onto a familiar address go
+unnoticed for six hours. The MAC alone would never expire an entry at all. Together, the only reason
+to re-probe is that something may actually have changed — the same identity rule `db::upsert_device`
+already applies, moved one step earlier.
+
+`fps` stays the complete list. `merge_device_list` builds the Devices view by mapping over it, so an
+address missing from it vanishes from the UI; a reused entry is indistinguishable downstream from
+one probed a moment ago. That is why this is a cache and not a skip.
+
+Discovery's *cadence* is untouched. The target list is still rebuilt every five minutes and a new or
+moved address is still fingerprinted on the next cycle. What changed is that re-confirming forty
+known devices no longer costs anything, so the comment defending `DISCOVERY_INTERVAL_SECS` stands as
+written.
+
+`'s'` ("rescan now") clears the cache first. Asking for a rescan and being handed the previous
+answer would be the wrong behaviour, and it is the escape hatch while a device is being worked on.
+
+A `Semaphore` of `FINGERPRINT_CONCURRENCY` (12) bounds the probes. The work is identical; it arrives
+as a stream rather than all at once, so discovery no longer competes with itself — or with the
+devices it is scanning — for the air.
+
+### What this leaves
+
+In steady state a cycle makes no network requests at all: every address is known, and each is
+re-read once per six hours, spread out. A new device still shows up within five minutes.
+
+Not done: trimming `PROBE_PORTS` per already-identified device type. It reads like the obvious third
+saving and is a false one. `devices::detect_type` classifies from the *pattern* of open ports —
+`sonnen_batterie::detect` needs 8080 and 8883 together — and the Devices view shows `open_ports` as
+found. A narrowed re-probe would either reclassify the device as something else or quietly stop
+showing ports it still has, to save a handful of connects six hours apart.
+
+Tests are in `main.rs`'s module and are pure: a fresh entry for the same device is reused, an entry
+past the TTL is probed, a changed MAC on a familiar address is probed, an unknown address is probed,
+and an entry taken when the address had no ARP record still matches one that has none now (both
+`None` is the same device as far as this can tell, and must not re-probe every cycle).

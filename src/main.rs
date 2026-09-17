@@ -75,13 +75,13 @@
 //! panic in any of these the end of the whole process. That is the reason the
 //! robustness work recorded in SPECS.md went where it did.
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Timelike, Utc};
 use sqlx::SqlitePool;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 use dom::app::{SharedState, SwitchAutoMode};
 use dom::{alarm, app, cluster, db, devices, fingerprint, logging, online, solar, stats, tui};
@@ -106,6 +106,27 @@ const PING_SCAN_STEADY_INTERVAL_SECS: u64 = 4 * 60 * 60;
 /// around it was slowed down: this one is not chatter on behalf of a view, it is
 /// how the app learns what exists.
 const DISCOVERY_INTERVAL_SECS: u64 = 5 * 60;
+/// How long a fingerprint is reused before that device is probed over the
+/// network again.
+///
+/// Learning what exists and re-confirming what is already known are two
+/// different jobs that used to share one cost. The target list is rebuilt every
+/// `DISCOVERY_INTERVAL_SECS` from the ping scan and the router's leases, which
+/// is free — both are already in memory — so a new or moved address is still
+/// noticed within five minutes. Re-running a twelve-port scan against a speaker
+/// identified weeks ago is what does not need to happen at that rate: it is a
+/// burst of TCP connects per device per cycle, and on 2.4 GHz that is airtime
+/// taken from whatever else lives there. A cached fingerprint is dropped early
+/// anyway whenever the MAC at the address changes, so a device swapped onto an
+/// address is re-read on the next cycle rather than waiting out this interval.
+const FINGERPRINT_TTL_SECS: u64 = 6 * 60 * 60;
+/// How many addresses are fingerprinted at once.
+///
+/// Every target used to be spawned at once, so a cycle arrived as one
+/// simultaneous burst across the whole house. The work is identical either way;
+/// spreading it just stops discovery from competing with itself — and with the
+/// devices it is scanning — for the air.
+const FINGERPRINT_CONCURRENCY: usize = 12;
 /// Cap on the in-memory (and bootstrap-loaded) network status event list
 /// shown in the Network view.
 const NETWORK_STATUS_HISTORY_LEN: i64 = 200;
@@ -662,10 +683,19 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
     // interval the scheduler catches up with one extra run, not many.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
 
+    // Survives across cycles: the point of it is that an address identified on
+    // an earlier pass is not probed again on this one.
+    let mut fingerprints: HashMap<IpAddr, CachedFingerprint> = HashMap::new();
+
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {}
-            _ = rescan.notified() => {}
+        // "Rescan now" is a request to re-read the network, not to have the
+        // last answer repeated back, so it empties the cache first.
+        let forced = tokio::select! {
+            _ = ticker.tick() => false,
+            _ = rescan.notified() => true,
+        };
+        if forced {
+            fingerprints.clear();
         }
 
         let next_at = Utc::now()
@@ -685,11 +715,33 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
         let lease_ips = lease_addresses(&state.read().unwrap());
         let fingerprint_targets = merge_scan_targets(&devs, lease_ips);
 
+        // Judged against what is at each address *now*: an entry survives only
+        // while it is recent and the MAC there still matches. The ARP read
+        // after the probes below is the one that stamps identity, and sees
+        // whatever this cycle just resolved.
+        let (mut fps, to_probe) = plan_fingerprints(
+            &fingerprint_targets,
+            &fingerprints,
+            &devices::arp_cache(),
+            Duration::from_secs(FINGERPRINT_TTL_SECS),
+            Instant::now(),
+        );
+
+        // Bounded, so a cycle is a stream of probes rather than one burst
+        // arriving at every address in the house simultaneously.
+        let limit = Arc::new(Semaphore::new(FINGERPRINT_CONCURRENCY));
         let mut set = tokio::task::JoinSet::new();
-        for ip in fingerprint_targets {
-            set.spawn(async move { fingerprint::fingerprint(ip).await });
+        for ip in to_probe {
+            let limit = Arc::clone(&limit);
+            set.spawn(async move {
+                // Held for the probe and released with the task. `acquire_owned`
+                // fails only on a closed semaphore, and this one outlives the
+                // set holding the handles.
+                let _permit = limit.acquire_owned().await;
+                fingerprint::fingerprint(ip).await
+            });
         }
-        let mut fps: Vec<fingerprint::Fingerprint> = Vec::new();
+        let mut probed: Vec<fingerprint::Fingerprint> = Vec::new();
         while let Some(joined) = set.join_next().await {
             // One task that did not finish cleanly must not end the round. The
             // `while let Some(Ok(fp))` this replaces stopped draining at the
@@ -699,22 +751,39 @@ async fn discovery_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify
             // cost them under test. `cluster_discovery_task` already reads its
             // own set this way.
             match joined {
-                Ok(fp) => fps.push(fp),
+                Ok(fp) => probed.push(fp),
                 Err(e) => log::warn!("a fingerprint did not complete: {e}"),
             }
         }
-        fps.sort_by_key(|fp| ip_sort_key(fp.ip));
 
         // Stable per-device identity (MAC address), independent of IP, so a
         // device with a new DHCP lease is recognized as the same device
         // rather than registered a second time — see db::upsert_device.
         let mac_by_ip = devices::arp_cache();
-        let fingerprint_for = |ip: IpAddr| -> Option<String> {
-            match ip {
-                IpAddr::V4(v4) => mac_by_ip.get(&v4).cloned(),
-                IpAddr::V6(_) => None,
-            }
-        };
+        let fingerprint_for = |ip: IpAddr| -> Option<String> { mac_at(ip, &mac_by_ip) };
+
+        // Keep what this cycle learned, against the MAC that was there when it
+        // was read, and drop addresses that are no longer targets so the map
+        // cannot grow without bound.
+        let taken = Instant::now();
+        for fp in &probed {
+            fingerprints.insert(
+                fp.ip,
+                CachedFingerprint {
+                    fp: fp.clone(),
+                    mac: mac_at(fp.ip, &mac_by_ip),
+                    at: taken,
+                },
+            );
+        }
+        let still_a_target: HashSet<IpAddr> = fingerprint_targets.iter().copied().collect();
+        fingerprints.retain(|ip, _| still_a_target.contains(ip));
+
+        // Everything downstream — the persisted types, the poll loops, the
+        // device list — reads one list, whether an entry was probed just now or
+        // carried over.
+        fps.extend(probed);
+        fps.sort_by_key(|fp| ip_sort_key(fp.ip));
 
         // Persist newly discovered devices and start poll loops. Each device is
         // classified once, by `devices::detect_type`, so the type stored here is
@@ -2315,6 +2384,55 @@ fn merge_scan_targets(
     ips
 }
 
+/// A fingerprint carried over from an earlier discovery cycle.
+struct CachedFingerprint {
+    fp: fingerprint::Fingerprint,
+    /// The MAC at that address when the fingerprint was taken. Identity is the
+    /// MAC rather than the address (see `db::upsert_device`), so a different one
+    /// now means a different device holds the address and this entry describes
+    /// something that is no longer there.
+    mac: Option<String>,
+    at: Instant,
+}
+
+/// The MAC the kernel's ARP cache holds for an address, if any.
+///
+/// IPv6 has no entry there, so those are always `None` — the same rule
+/// `discovery_task` applies when it stamps identity onto a discovered device.
+fn mac_at(ip: IpAddr, macs: &HashMap<Ipv4Addr, String>) -> Option<String> {
+    match ip {
+        IpAddr::V4(v4) => macs.get(&v4).cloned(),
+        IpAddr::V6(_) => None,
+    }
+}
+
+/// Split discovery's targets into the fingerprints that can be reused as they
+/// are and the addresses that have to go back on the wire.
+///
+/// An entry is reused only while it is both recent and still about the same
+/// device: taken within `ttl`, and with the MAC at that address unchanged
+/// since. Anything else — never seen, aged out, or a different device now
+/// answering at a familiar address — is probed again.
+fn plan_fingerprints(
+    targets: &[IpAddr],
+    cache: &HashMap<IpAddr, CachedFingerprint>,
+    macs: &HashMap<Ipv4Addr, String>,
+    ttl: Duration,
+    now: Instant,
+) -> (Vec<fingerprint::Fingerprint>, Vec<IpAddr>) {
+    let mut reused = Vec::new();
+    let mut probe = Vec::new();
+    for &ip in targets {
+        match cache.get(&ip) {
+            Some(entry) if now.duration_since(entry.at) < ttl && entry.mac == mac_at(ip, macs) => {
+                reused.push(entry.fp.clone());
+            }
+            _ => probe.push(ip),
+        }
+    }
+    (reused, probe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3358,5 +3476,125 @@ mod tests {
         let now = at("07:00");
         let window = elapsed_window(now - tick * 3, now);
         assert!(window.contains(&"07:00".to_string()), "{window:?}");
+    }
+
+    const TEST_TTL: Duration = Duration::from_secs(60);
+
+    fn a_fingerprint(ip: IpAddr) -> fingerprint::Fingerprint {
+        fingerprint::Fingerprint {
+            ip,
+            open_ports: vec![80, 443],
+            http: vec![],
+        }
+    }
+
+    fn arp(entries: &[(&str, &str)]) -> HashMap<Ipv4Addr, String> {
+        entries
+            .iter()
+            .map(|(ip, mac)| (ip.parse().unwrap(), (*mac).to_string()))
+            .collect()
+    }
+
+    /// A cache holding one address, fingerprinted `age` before `now`.
+    fn cache_of(
+        ip: IpAddr,
+        mac: Option<&str>,
+        now: Instant,
+        age: Duration,
+    ) -> HashMap<IpAddr, CachedFingerprint> {
+        HashMap::from([(
+            ip,
+            CachedFingerprint {
+                fp: a_fingerprint(ip),
+                mac: mac.map(str::to_string),
+                at: now - age,
+            },
+        )])
+    }
+
+    #[test]
+    fn a_fresh_entry_for_the_same_device_is_reused_instead_of_probed() {
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        // `now` is offset from the real clock so subtracting an age cannot
+        // underflow the monotonic instant on a machine that just booted.
+        let now = Instant::now() + Duration::from_secs(3600);
+        let cache = cache_of(ip, Some("aa:bb:cc:dd:ee:ff"), now, Duration::from_secs(10));
+        let macs = arp(&[("192.168.1.10", "aa:bb:cc:dd:ee:ff")]);
+
+        let (reused, probe) = plan_fingerprints(&[ip], &cache, &macs, TEST_TTL, now);
+
+        assert_eq!(reused.len(), 1, "the cached fingerprint should be reused");
+        assert_eq!(reused[0].ip, ip);
+        assert!(probe.is_empty(), "nothing should go back on the wire");
+    }
+
+    #[test]
+    fn an_entry_older_than_the_ttl_is_probed_again() {
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let now = Instant::now() + Duration::from_secs(3600);
+        let cache = cache_of(ip, Some("aa:bb:cc:dd:ee:ff"), now, Duration::from_secs(600));
+        let macs = arp(&[("192.168.1.10", "aa:bb:cc:dd:ee:ff")]);
+
+        let (reused, probe) = plan_fingerprints(&[ip], &cache, &macs, TEST_TTL, now);
+
+        assert!(reused.is_empty());
+        assert_eq!(probe, vec![ip]);
+    }
+
+    #[test]
+    fn a_different_device_on_a_familiar_address_is_probed_again() {
+        // The entry is well within the TTL, but the MAC there has changed, so it
+        // describes a device that no longer holds the address.
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let now = Instant::now() + Duration::from_secs(3600);
+        let cache = cache_of(ip, Some("aa:bb:cc:dd:ee:ff"), now, Duration::from_secs(1));
+        let macs = arp(&[("192.168.1.10", "11:22:33:44:55:66")]);
+
+        let (reused, probe) = plan_fingerprints(&[ip], &cache, &macs, TEST_TTL, now);
+
+        assert!(reused.is_empty(), "a new MAC invalidates the entry");
+        assert_eq!(probe, vec![ip]);
+    }
+
+    #[test]
+    fn an_address_that_has_never_been_seen_is_probed() {
+        let known: IpAddr = "192.168.1.10".parse().unwrap();
+        let fresh: IpAddr = "192.168.1.11".parse().unwrap();
+        let now = Instant::now() + Duration::from_secs(3600);
+        let cache = cache_of(
+            known,
+            Some("aa:bb:cc:dd:ee:ff"),
+            now,
+            Duration::from_secs(1),
+        );
+        let macs = arp(&[("192.168.1.10", "aa:bb:cc:dd:ee:ff")]);
+
+        let (reused, probe) = plan_fingerprints(&[known, fresh], &cache, &macs, TEST_TTL, now);
+
+        assert_eq!(reused.len(), 1);
+        assert_eq!(probe, vec![fresh], "only the unknown address is probed");
+    }
+
+    #[test]
+    fn an_entry_taken_before_the_address_had_an_arp_record_still_matches() {
+        // Both sides are `None`: no ARP entry then, none now. That is the same
+        // device as far as this can tell, so it must not re-probe every cycle.
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let now = Instant::now() + Duration::from_secs(3600);
+        let cache = cache_of(ip, None, now, Duration::from_secs(1));
+
+        let (reused, probe) = plan_fingerprints(&[ip], &cache, &HashMap::new(), TEST_TTL, now);
+
+        assert_eq!(reused.len(), 1);
+        assert!(probe.is_empty());
+    }
+
+    #[test]
+    fn ipv6_has_no_arp_identity() {
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+        assert_eq!(
+            mac_at(v6, &arp(&[("192.168.1.10", "aa:bb:cc:dd:ee:ff")])),
+            None
+        );
     }
 }
