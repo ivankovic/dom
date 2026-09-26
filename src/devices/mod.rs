@@ -93,24 +93,39 @@ use crate::app::{ConnStatus, SharedState};
 // so the Client lives until the last Arc is released (after all tasks finish).
 
 // When scanning a large scope-link network (e.g. /12), the kernel must
-// ARP-resolve every destination directly. The neighbor table (gc_thresh3=1024)
-// fills up quickly, causing send_to to block until ARP times out (~3s). We
-// work around this with a two-pass strategy:
+// ARP-resolve every destination directly. The neighbor table (gc_thresh3=1024
+// on this host) fills up quickly, causing send_to to block until ARP times out
+// (~3s). That bound is what shapes the sweep into two passes:
 //
-//   1. Active scan  — ping the /24 subnet containing each interface's own IP.
-//                     At most 254 IPs per interface; never overflows the ARP table.
-//   2. Passive pass — read /proc/net/arp for complete (0x2) entries on non-loopback
+//   1. Passive pass — read /proc/net/arp for complete (0x2) entries on non-loopback
 //                     interfaces. These are devices that are or have recently been
 //                     reachable; we ping-confirm them to get latency and verify liveness.
+//   2. Active sweep — ping every host address of every subnet Dom has reason to
+//                     believe is occupied. See `scan_subnets` for which those are.
 //
-// Together this finds: all new devices on the local segment *and* all known
-// devices spread across the wider network that appear in the kernel's ARP cache.
+// Together this finds: every device in a subnet Dom cares about, whether or not
+// it has been seen before, *and* every device elsewhere on the wider network
+// that still appears in the kernel's ARP cache.
 
-// Phase-1 (ARP cache) and Phase-2 (/24 probe) each use a fresh Client, so
-// Phase-2's INCOMPLETE ARP entries cannot pollute Phase-1's dispatch map.
-// 256 concurrent keeps max INCOMPLETE entries ≈ 256 per /24 sweep (well within
-// gc_thresh3=1024) while completing two /24 subnets in ~1 second.
+// Each ping batch uses a fresh Client, so one batch's INCOMPLETE ARP entries
+// cannot pollute the next one's dispatch map.
+//
+// 256 concurrent bounds how many resolutions are in flight, but *not* how many
+// INCOMPLETE entries a batch leaves behind: a failed resolution stays in the
+// table after its task has gone. What bounds those is the size of the batch,
+// which is why the active sweep runs one subnet at a time rather than handing
+// every address of every subnet to a single call — at most 254 per batch,
+// against a gc_thresh3 of 1024, however many subnets a sweep covers.
 const CONCURRENT_PINGS: usize = 256;
+// How many subnets one active sweep covers, at most.
+//
+// Only a bound on the pathological case — a flat network whose ARP cache names
+// dozens of subnets — not a budget anything normally reaches: a house has a
+// handful. At 254 addresses and roughly half a second each, this caps a sweep
+// that finds nothing at all at about four thousand pings and fifteen seconds,
+// four hours apart. Interface subnets are never dropped to respect it; see
+// `scan_subnets` for what is.
+const MAX_SCAN_SUBNETS: usize = 16;
 // Outer timeout wraps the full ping_once future (send + reply wait) so that
 // a blocked send_to due to ARP table pressure cannot hang a task indefinitely.
 const TIMEOUT: Duration = Duration::from_millis(500);
@@ -490,23 +505,40 @@ pub struct PingScanResult {
 ///
 /// surge-ping tries a DGRAM socket first (works without root when
 /// ping_group_range covers the current GID) and falls back to RAW automatically.
-pub async fn scan_all_networks() -> Result<PingScanResult, std::io::Error> {
+///
+/// `known_ips` is every address Dom holds a device row for. They are not
+/// scanned as addresses — the ARP pass already covers any that answer — but as
+/// evidence of which subnets are worth sweeping; see `scan_subnets`.
+pub async fn scan_all_networks(known_ips: &[IpAddr]) -> Result<PingScanResult, std::io::Error> {
+    // Read once and used by both passes, so what is confirmed and what decides
+    // the sweep are the same reading of the cache.
+    let arp_ips = arp_cache_ips();
+
     // Phase 1: confirm ARP-cache entries with a dedicated client.
-    // Running this first (before the /24 probe) avoids dispatch-map pollution
-    // from the hundreds of timed-out tasks in the /24 sweep.
-    let known_ips = arp_cache_ips();
-    let mut result = ping_batch_with_failures(known_ips).await?;
+    // Running this first (before the active sweep) avoids dispatch-map pollution
+    // from the hundreds of timed-out tasks the sweep leaves behind.
+    let mut result = ping_batch_with_failures(arp_ips.clone()).await?;
 
-    // Phase 2: active /24 sweep to discover new devices not yet in the ARP cache.
-    // Uses a fresh Client so the Phase-1 dispatch map is gone.
-    let scan_ips: Vec<Ipv4Addr> = collect_scan_targets()
-        .into_iter()
-        .filter(|ip| !result.successful.iter().any(|d| d.ip == IpAddr::V4(*ip)))
+    let answered: HashSet<Ipv4Addr> = result
+        .successful
+        .iter()
+        .filter_map(|d| match d.ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
         .collect();
-    let phase2_result = ping_batch_with_failures(scan_ips).await?;
 
-    result.successful.extend(phase2_result.successful);
-    result.failed.extend(phase2_result.failed);
+    // Phase 2: active sweep of each occupied subnet, to find devices not in the
+    // ARP cache — including one that has moved to an address nothing has spoken
+    // to yet. One batch per subnet, each with a fresh Client: see
+    // `CONCURRENT_PINGS` for why the batch, not the concurrency, is what keeps
+    // the neighbour table from overflowing.
+    for subnet in scan_subnets(&interface_v4s(), &arp_ips, known_ips) {
+        let ips: Vec<Ipv4Addr> = subnet.hosts().filter(|ip| !answered.contains(ip)).collect();
+        let swept = ping_batch_with_failures(ips).await?;
+        result.successful.extend(swept.successful);
+        result.failed.extend(swept.failed);
+    }
 
     Ok(result)
 }
@@ -555,30 +587,156 @@ async fn ping_batch_with_failures(ips: Vec<Ipv4Addr>) -> Result<PingScanResult, 
     Ok(PingScanResult { successful, failed })
 }
 
-fn collect_scan_targets() -> Vec<Ipv4Addr> {
-    let mut ips: HashSet<Ipv4Addr> = HashSet::new();
-    if let Ok(ifaces) = get_if_addrs() {
-        for iface in ifaces {
-            if iface.is_loopback() || !is_iface_up(&iface.name) {
-                continue;
-            }
-            let IfAddr::V4(v4) = iface.addr else {
-                continue;
-            };
-            // Clamp to /24 to keep INCOMPLETE ARP entries per batch ≤ 254,
-            // preserving gc_thresh3 headroom across consecutive scans.
-            let prefix = prefix_len(v4.netmask).max(24);
-            let mask = !0u32 << (32 - prefix);
-            let network = u32::from(v4.ip) & mask;
-            let broadcast = network | !mask;
-            for host in (network + 1)..broadcast {
-                ips.insert(Ipv4Addr::from(host));
-            }
+/// An IPv4 subnet the active sweep covers, as a network address and a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Subnet {
+    network: u32,
+    prefix: u8,
+}
+
+impl Subnet {
+    /// The subnet of `prefix` bits that `ip` falls in.
+    fn containing(ip: Ipv4Addr, prefix: u8) -> Self {
+        Self {
+            network: u32::from(ip) & mask_of(prefix),
+            prefix,
         }
     }
-    let mut v: Vec<Ipv4Addr> = ips.into_iter().collect();
-    v.sort_unstable();
-    v
+
+    fn contains(self, ip: Ipv4Addr) -> bool {
+        u32::from(ip) & mask_of(self.prefix) == self.network
+    }
+
+    /// Every address in it a host can have.
+    ///
+    /// The network and broadcast addresses are skipped, as they are not host
+    /// addresses of the subnet they delimit. On a flat segment carved into
+    /// `/24`-shaped ranges by convention rather than by netmask — the
+    /// `172.16.<group>.<host>` scheme this was written against — `x.y.z.0` and
+    /// `x.y.z.255` *are* usable, and a device there is missed. Left alone: the
+    /// address a person hands a heat pump is not that one, and treating them as
+    /// hosts would mean ARP-resolving two more dead addresses per subnet on
+    /// every sweep.
+    fn hosts(self) -> impl Iterator<Item = Ipv4Addr> {
+        let broadcast = self.network | !mask_of(self.prefix);
+        (self.network.saturating_add(1)..broadcast).map(Ipv4Addr::from)
+    }
+}
+
+/// The netmask of a prefix length, as bits.
+fn mask_of(prefix: u8) -> u32 {
+    match prefix {
+        0 => 0,
+        p => !0u32 << (32 - p.min(32)),
+    }
+}
+
+/// Whether `ip` is on the same link as an interface addressed `iface_ip/netmask`
+/// — i.e. whether this host reaches it by ARP rather than through a router.
+fn on_link(ip: Ipv4Addr, iface_ip: Ipv4Addr, netmask: Ipv4Addr) -> bool {
+    let mask = u32::from(netmask);
+    u32::from(ip) & mask == u32::from(iface_ip) & mask
+}
+
+/// Address and netmask of every up, non-loopback IPv4 interface.
+fn interface_v4s() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let Ok(ifaces) = get_if_addrs() else {
+        return Vec::new();
+    };
+    ifaces
+        .into_iter()
+        .filter(|iface| !iface.is_loopback() && is_iface_up(&iface.name))
+        .filter_map(|iface| match iface.addr {
+            IfAddr::V4(v4) => Some((v4.ip, v4.netmask)),
+            IfAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// The subnets one active sweep covers.
+///
+/// The sweep used to be each interface's own subnet and nothing else, clamped
+/// to a `/24` so a large scope-link prefix could not turn into a million pings.
+/// On a flat `/12` addressed as `172.16.<group>.<host>` that clamp meant only
+/// `172.16.0.0/24` was ever swept, and every device in every other group — the
+/// energy hardware among them — was reachable by discovery *only* while its own
+/// poll loop kept its ARP entry warm. That is a circular condition, and it
+/// breaks exactly when it is needed: a device that changes address leaves an
+/// INCOMPLETE entry at the old one, has none at the new one, and so falls out
+/// of the only pass that would have found it. It stays lost until someone
+/// notices, which is what happened to a heat pump that moved from
+/// `172.16.20.1` to `172.16.20.7`.
+///
+/// So a subnet is swept when there is reason to think something lives in it:
+///
+/// - **Each interface's own subnet**, at its own prefix, still clamped to a
+///   `/24`. Unchanged, and the only source that needs no prior knowledge: it is
+///   what finds the first device on a network Dom has never seen.
+/// - **The `/24` around every address Dom holds a device row for.** This is the
+///   durable half. A row outlives the ARP cache, a restart, and the device
+///   being unplugged for a week, so the subnet a configured device lives in
+///   goes on being swept while the device itself is silent — which is the
+///   condition under which a move has to be noticed.
+/// - **The `/24` around every complete ARP-cache entry.** The live half: a
+///   neighbour Dom has never registered is still evidence that its subnet is
+///   worth a look.
+///
+/// A candidate is taken only if it is on-link (reaching it must be ARP, not a
+/// route through the gateway — sweeping someone else's network is both rude
+/// and pointless) and not already covered. "Already covered" rather than "not
+/// equal" so that a small interface prefix keeps its size: an ARP entry inside
+/// a `/28` interface's own subnet must not widen that sweep to a `/24`.
+///
+/// Known-device subnets are considered before ARP-derived ones because
+/// `MAX_SCAN_SUBNETS` truncates the tail, and a cache full of transient
+/// neighbours must never crowd out the subnet a configured device lives in.
+fn scan_subnets(
+    ifaces: &[(Ipv4Addr, Ipv4Addr)],
+    arp_ips: &[Ipv4Addr],
+    known_ips: &[IpAddr],
+) -> Vec<Subnet> {
+    let mut subnets: Vec<Subnet> = Vec::new();
+
+    for (ip, netmask) in ifaces {
+        let subnet = Subnet::containing(*ip, prefix_len(*netmask).max(24));
+        if !subnets.contains(&subnet) {
+            subnets.push(subnet);
+        }
+    }
+
+    // Sorted, because `arp_cache` is a `HashMap` and iterating one is
+    // deliberately not stable. Unsorted, which subnets `MAX_SCAN_SUBNETS` drops
+    // would differ from run to run on a network large enough to reach it — the
+    // same unreproducibility `ip_sort_key` exists to keep out of the device
+    // list. `known_ips` arrives ordered from `db::all_device_ips`.
+    let mut cached: Vec<Ipv4Addr> = arp_ips.to_vec();
+    cached.sort_unstable();
+
+    let candidates = known_ips
+        .iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })
+        .chain(cached);
+
+    for ip in candidates {
+        if subnets.len() >= MAX_SCAN_SUBNETS {
+            break;
+        }
+        if subnets.iter().any(|subnet| subnet.contains(ip)) {
+            continue;
+        }
+        if !ifaces
+            .iter()
+            .any(|(iface_ip, netmask)| on_link(ip, *iface_ip, *netmask))
+        {
+            continue;
+        }
+        subnets.push(Subnet::containing(ip, 24));
+    }
+
+    subnets
 }
 
 fn is_iface_up(name: &str) -> bool {
@@ -680,6 +838,125 @@ mod tests {
     fn parse_arp_cache_handles_empty_input() {
         assert!(parse_arp_cache("").is_empty());
         assert!(parse_arp_cache("IP address HW type Flags HW address Mask Device\n").is_empty());
+    }
+
+    // ── scan_subnets ────────────────────────────────────────────────────────
+
+    fn v4(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The flat `/12` this was written against: one interface, whole prefix
+    /// on-link, devices grouped into `/24`-shaped ranges by convention.
+    fn flat_slash_12() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+        vec![(v4("172.16.0.3"), v4("255.240.0.0"))]
+    }
+
+    fn subnet(s: &str, prefix: u8) -> Subnet {
+        Subnet::containing(v4(s), prefix)
+    }
+
+    #[test]
+    fn an_interfaces_own_subnet_is_swept_clamped_to_a_slash_24() {
+        let subnets = scan_subnets(&flat_slash_12(), &[], &[]);
+
+        // Not the whole /12, which would be a million addresses.
+        assert_eq!(subnets, vec![subnet("172.16.0.0", 24)]);
+    }
+
+    #[test]
+    fn a_neighbour_outside_the_interfaces_own_slash_24_adds_its_subnet() {
+        // The old behaviour swept 172.16.0.0/24 and stopped, so a device in
+        // any other group was invisible unless it was already in the ARP cache.
+        let subnets = scan_subnets(&flat_slash_12(), &[v4("172.16.20.2")], &[]);
+
+        assert_eq!(
+            subnets,
+            vec![subnet("172.16.0.0", 24), subnet("172.16.20.0", 24)]
+        );
+    }
+
+    #[test]
+    fn a_configured_devices_subnet_is_swept_though_nothing_in_it_is_in_the_arp_cache() {
+        // The regression this exists for: the heat pump left 172.16.20.1, so
+        // there is no complete ARP entry anywhere in that group — but the row
+        // for the address it left is enough to keep sweeping the group, which
+        // is what finds it at its new address.
+        let subnets = scan_subnets(&flat_slash_12(), &[], &[ip("172.16.20.1")]);
+
+        assert!(
+            subnets.contains(&subnet("172.16.20.0", 24)),
+            "a device row must keep its own subnet in the sweep: {subnets:?}"
+        );
+        assert!(subnets.iter().any(|s| s.contains(v4("172.16.20.7"))));
+    }
+
+    #[test]
+    fn an_address_reached_through_a_router_is_not_swept() {
+        // Off-link: scanning it would mean scanning somebody else's network.
+        let subnets = scan_subnets(&flat_slash_12(), &[v4("10.9.0.4")], &[ip("192.0.2.7")]);
+
+        assert_eq!(subnets, vec![subnet("172.16.0.0", 24)]);
+    }
+
+    #[test]
+    fn a_neighbour_inside_a_small_interface_prefix_does_not_widen_it_to_a_slash_24() {
+        // The interface owns a /28, so its sweep stays a /28: the rest of the
+        // surrounding /24 is not on-link and must not be pulled in.
+        let ifaces = vec![(v4("192.168.5.20"), v4("255.255.255.240"))];
+
+        let subnets = scan_subnets(&ifaces, &[v4("192.168.5.22")], &[]);
+
+        assert_eq!(subnets, vec![subnet("192.168.5.16", 28)]);
+    }
+
+    #[test]
+    fn the_subnet_cap_drops_cached_neighbours_before_configured_devices() {
+        // More groups in the ARP cache than the cap allows. The device row must
+        // survive the truncation; a transient neighbour is what gets dropped.
+        let noise: Vec<Ipv4Addr> = (30..60).map(|g| v4(&format!("172.16.{g}.9"))).collect();
+
+        let subnets = scan_subnets(&flat_slash_12(), &noise, &[ip("172.16.20.1")]);
+
+        assert_eq!(subnets.len(), MAX_SCAN_SUBNETS);
+        assert!(
+            subnets.contains(&subnet("172.16.20.0", 24)),
+            "the configured device's subnet was crowded out: {subnets:?}"
+        );
+    }
+
+    #[test]
+    fn a_subnet_is_swept_once_however_many_neighbours_name_it() {
+        let arp = vec![v4("172.16.20.2"), v4("172.16.20.3"), v4("172.16.20.4")];
+
+        let subnets = scan_subnets(&flat_slash_12(), &arp, &[ip("172.16.20.1")]);
+
+        assert_eq!(
+            subnets,
+            vec![subnet("172.16.0.0", 24), subnet("172.16.20.0", 24)]
+        );
+    }
+
+    #[test]
+    fn hosts_covers_the_subnet_without_its_network_and_broadcast_addresses() {
+        let hosts: Vec<Ipv4Addr> = subnet("172.16.20.0", 24).hosts().collect();
+
+        assert_eq!(hosts.len(), 254);
+        assert_eq!(hosts.first(), Some(&v4("172.16.20.1")));
+        assert_eq!(hosts.last(), Some(&v4("172.16.20.254")));
+        assert!(hosts.contains(&v4("172.16.20.7")));
+    }
+
+    #[test]
+    fn hosts_of_a_single_address_subnet_is_empty_rather_than_overflowing() {
+        // /31 and /32 have no host range. The top of the address space is the
+        // case that would wrap a `network + 1`.
+        assert_eq!(subnet("255.255.255.255", 32).hosts().count(), 0);
+        assert_eq!(subnet("172.16.20.6", 31).hosts().count(), 0);
     }
 
     // ── detect_type ───────────────────────────────────────────────────────────

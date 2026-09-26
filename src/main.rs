@@ -59,7 +59,8 @@
 //! them, and a task that dies takes only its own job with it.
 //!
 //! Discovery is two tasks rather than one, on independent schedules: an ICMP
-//! sweep of every local subnet, and a pass that reads the router's DHCP leases.
+//! sweep of every subnet something is known to live in, and a pass that reads
+//! the router's DHCP leases.
 //! Both can be woken early by the interface's "rescan now" key through a shared
 //! `Notify`. The rest keep something current on a timer — the charts, the
 //! outdoor temperature, the production forecast, the daily rollups, the
@@ -90,8 +91,11 @@ use dom::{alarm, app, cluster, db, devices, fingerprint, logging, online, solar,
 /// to catch devices that weren't up yet at the very first (t=0) scan.
 const PING_SCAN_FOLLOWUP_SECS: u64 = 5 * 60;
 /// Steady-state interval for the ICMP ping scan after the startup + follow-up
-/// runs. Kept long because a full-subnet sweep triggers an ARP-broadcast burst
-/// for every non-cached address — see `scan_all_networks`. Independent of
+/// runs. Kept long because the sweep triggers an ARP-broadcast burst for every
+/// non-cached address in every subnet it covers — see `scan_all_networks`. It
+/// is also the worst case for noticing that a device has changed address: the
+/// sweep is what finds it there, so a move is picked up at the next one, or at
+/// once on startup or 's'. Independent of
 /// `DISCOVERY_INTERVAL_SECS` — a broken or slow ping scan (e.g. missing
 /// CAP_NET_RAW) must never delay or block DHCP-lease-based device discovery,
 /// and vice versa.
@@ -259,7 +263,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Background: ICMP ping scan and DHCP-lease-based device discovery run as
     // independent tasks on independent schedules — see their doc comments.
-    tokio::spawn(ping_scan_task(state.clone(), rescan_notify.clone()));
+    tokio::spawn(ping_scan_task(
+        state.clone(),
+        pool.clone(),
+        rescan_notify.clone(),
+    ));
     tokio::spawn(discovery_task(
         state.clone(),
         pool.clone(),
@@ -636,7 +644,13 @@ async fn statistics_task(state: SharedState, pool: SqlitePool) {
 /// A failure here (e.g. missing CAP_NET_RAW / ping_group_range on this host)
 /// only records `last_scan_error` for visibility — it must never block or
 /// delay DHCP-lease-based discovery, which needs only plain TCP, not ICMP.
-async fn ping_scan_task(state: SharedState, rescan: Arc<Notify>) {
+///
+/// Reads the configured devices' addresses from the database on each pass and
+/// hands them to the sweep, which uses them to decide which subnets to cover —
+/// see `devices::scan_subnets`. That is what lets a device be found again after
+/// it changes address: the row for the address it *left* keeps its subnet in
+/// the sweep.
+async fn ping_scan_task(state: SharedState, pool: SqlitePool, rescan: Arc<Notify>) {
     let mut next_delay = Duration::ZERO;
     let mut did_followup = false;
 
@@ -652,7 +666,12 @@ async fn ping_scan_task(state: SharedState, rescan: Arc<Notify>) {
             Duration::from_secs(PING_SCAN_STEADY_INTERVAL_SECS)
         };
 
-        match devices::scan_all_networks().await {
+        // Read fresh each sweep: a device registered since the last one names a
+        // subnet this one should cover. A failed read costs coverage, not the
+        // sweep — the interface's own subnet and the ARP cache still stand.
+        let known_ips = db::all_device_ips(&pool).await.unwrap_or_default();
+
+        match devices::scan_all_networks(&known_ips).await {
             Ok(scan_result) => {
                 let mut app = state.write().unwrap();
                 app.last_scan_error = None;

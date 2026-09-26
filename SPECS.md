@@ -1961,3 +1961,136 @@ Tests are in `main.rs`'s module and are pure: a fresh entry for the same device 
 past the TTL is probed, a changed MAC on a familiar address is probed, an unknown address is probed,
 and an entry taken when the address had no ARP record still matches one that has none now (both
 `None` is the same device as far as this can tell, and must not re-probe every cycle).
+
+## The sweep covers every subnet something lives in, not just the interface's own (2026-09-19)
+
+### Problem
+
+A device that changed address was never found again.
+
+The Hot Water Heatpump, a myStrom switch, moved from `172.16.20.1` to `172.16.20.7` during a
+network change on 2026-09-18. Thirty hours later Dom still had it at the old address: `Devices`
+row 31 unchanged, no measurements recorded since, and `eco_job` failing both legs of its daily
+plan against an address nothing answers at — `eco could not switch 172.16.20.1 off: connect
+failed: No route to host`, five attempts, twice a day.
+
+Nothing was broken in the part of the system built for this. `db::upsert_device` matches on the
+MAC and migrates the row, `db::device_moved` lets the stale poll loop retire itself, and
+`devices::handle_poll_failure` re-asks the question periodically rather than once. All of it
+waits on discovery noticing the device at its new address, and discovery never did.
+
+The reason was one line in `collect_scan_targets`:
+
+    let prefix = prefix_len(v4.netmask).max(24);
+
+This host is `172.16.0.3/12` and the whole of `172.16.0.0/12` is on-link — one flat segment,
+addressed by convention as `172.16.<group>.<host>`, with the energy hardware in group 20, the
+access points in group 0, appliances in 50 and 75. The clamp raises the prefix from 12 to 24, so
+the active sweep only ever enumerated `172.16.0.1`–`172.16.0.254`. **Group 20 had never been
+swept, not once.**
+
+That left exactly two ways for an address outside the interface's own `/24` to become known:
+
+1. Phase 1 of `scan_all_networks`, which pings the addresses already in `/proc/net/arp`.
+2. `lease_addresses`, from the MikroTik DHCP lease table.
+
+The heat pump lived entirely on the first, and did it circularly: its own two-second poll loop
+kept the ARP entry warm, the warm entry kept the address in the ping list, and the ping list kept
+it a discovery target. Self-sustaining — and it unwinds the moment the thing it depends on stops
+being true. After the move the old address held an INCOMPLETE entry, which `parse_arp_cache`
+correctly drops, and the new address had no entry at all because nothing on this host had ever
+spoken to it. The one pass that could have found it was the one that needed it already found.
+
+The second way was unavailable: the lease feed has been silent since 2026-08-23. The router row
+does have credentials, so this is not the "no login configured" skip in
+`maybe_spawn_mikrotik_poll_loop`, and it is not visible in the log either — `handle_poll_failure`
+records `ConnStatus::Lost` and `last_error` in `App` and writes nothing to the log, so a failing
+RouterOS poll leaves no trace there. Undiagnosed, and deliberately not fixed here. It is a second
+path that has to work for discovery to work at all, and the point of this change is that
+discovery should not need it.
+
+This was never specific to the heat pump. The clothes dryer, the battery, the wallbox and every
+appliance in groups 50, 75, 99 and 255 were all hanging by the same thread, discoverable only for
+as long as each kept its own ARP entry warm. Any of them would have vanished the same way.
+
+### Decision: sweep the subnets there is evidence are occupied
+
+`scan_subnets` replaces `collect_scan_targets`. It answers "which subnets are worth pinging" from
+three sources, and the sweep covers each in full:
+
+- **Each interface's own subnet**, at its own prefix, still clamped to a `/24`. Unchanged. It is
+  the only source that needs no prior knowledge, and so the only one that can find the first
+  device on a network Dom has never seen.
+- **The `/24` around every address in `Devices`**, read fresh by `ping_scan_task` through
+  `db::all_device_ips`. This is the durable half, and the one that fixes the bug. A row outlives
+  the ARP cache, a restart, and the device being unplugged for a week, so the subnet a configured
+  device lives in keeps being swept while the device itself is silent — which is precisely the
+  condition a move creates. The address the heat pump *left* is what keeps group 20 in the sweep,
+  and group 20 is where it went.
+- **The `/24` around every complete ARP-cache entry.** The live half: a neighbour Dom has never
+  registered is still evidence that its subnet holds devices.
+
+A candidate is taken only if it is on-link — reaching it must be ARP rather than a route through
+the gateway, because sweeping a network on the other side of a router is both pointless and not
+ours to do — and only if no already-chosen subnet covers it. "Covers", not "differs from", so that
+an interface with a small prefix keeps it: an ARP entry inside a `/28` interface's own subnet must
+not widen that sweep to a `/24`.
+
+### One batch per subnet, because concurrency is not what bounds the ARP table
+
+The comment on `CONCURRENT_PINGS` claimed 256 in flight kept INCOMPLETE entries at about 256. That
+is wrong in a way that only mattered once the sweep grew: a failed resolution stays in the
+neighbour table after its task has finished, so what bounds the entries is the size of the batch,
+not how much of it runs at once. Handing 2,540 addresses to one `ping_batch_with_failures` call
+would have accumulated well past this host's `gc_thresh3` of 1024 (`gc_thresh1` 128, `gc_thresh2`
+512) and reproduced the blocking-`send_to` failure the two-pass design exists to avoid.
+
+So phase 2 loops the subnets and calls `ping_batch_with_failures` once per subnet: at most 254
+addresses per batch, each with a fresh `Client`, however many subnets a sweep covers. The existing
+"≤ 254 per batch" reasoning is now literally true rather than true by accident of there being one
+subnet.
+
+`MAX_SCAN_SUBNETS` (16) bounds the pathological case — a flat network whose ARP cache names dozens
+of groups — at roughly four thousand addresses and fifteen seconds. Nothing normal approaches it;
+this house comes to 10 subnets and 2,540 addresses. When it does bite, the order candidates are
+considered in decides what survives: interface subnets are added before the cap is consulted and
+are never dropped, then known-device subnets, then ARP-derived ones. A cache full of transient
+neighbours must not crowd out the subnet a configured device lives in. The ARP-derived candidates
+are sorted before that order is applied, and `db::all_device_ips` orders its query, so which
+subnets the cap drops is the same from run to run rather than following a `HashMap`'s iteration
+— the same unreproducibility `ip_sort_key` was fixed for.
+
+### What this leaves
+
+Verified against this host's real interfaces, ARP cache and `Devices` rows: 10 subnets, 2,540
+addresses, `172.16.20.0/24` among them, and `172.16.20.7` — the heat pump's new address — inside
+it. Sweeping it is what lets discovery fingerprint the pump, `db::upsert_device` match the MAC and
+migrate row 31, and the stale loop at `.20.1` retire itself through `db::device_moved`.
+
+Recovery is automatic but not instant. The sweep runs at startup, again after
+`PING_SCAN_FOLLOWUP_SECS`, then every `PING_SCAN_STEADY_INTERVAL_SECS` — so in steady state a move
+is noticed within four hours, and immediately on startup or `'s'`. That interval is what it is for
+a reason (see "Stop polling the network for its own sake"), and the sweep is now the more expensive
+thing behind it, so it was not shortened.
+
+**Not done: a scan fired on the transition into Lost.** It would cut recovery from four hours to
+minutes, and `is_moved_recheck_tick` is already the right trigger. It was left out because the
+obvious cheaper version of it — shortening the scan interval while any device is Lost — is a trap:
+a decommissioned device stays Lost forever and would pin the sweep at 2,540 pings every five
+minutes, which is worse than the burst "Discovery re-probes only what it does not already know"
+was written to remove. The bounded shape is a single scan on the edge into Lost, which needs a
+`Notify` in `App` so `handle_poll_failure` can nudge it without changing a signature four poll
+loops call. Worth doing, but it is a separate change and the four-hour path does not depend on it.
+
+Tests are pure and live in `devices`'s module: an interface's own subnet is clamped to a `/24`; a
+neighbour outside it adds its subnet; a configured device's subnet is swept though nothing in it is
+in the ARP cache (the regression itself); an off-link address is ignored; a neighbour inside a
+`/28` interface does not widen it; the cap drops cached neighbours before configured devices; a
+subnet named by several neighbours is swept once; and `hosts` covers a `/24` without its network
+and broadcast addresses and yields nothing — rather than overflowing — for a `/31` or `/32`.
+
+One known gap, recorded rather than fixed: `Subnet::hosts` skips the network and broadcast
+addresses, but on a flat segment carved into `/24`-shaped groups by convention rather than by
+netmask, `172.16.<group>.0` and `172.16.<group>.255` are usable host addresses. A device at one of
+those is missed. Not worth two more dead ARP resolutions per subnet per sweep to cover an address
+nobody assigns by hand.

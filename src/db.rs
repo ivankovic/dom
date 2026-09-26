@@ -2665,6 +2665,27 @@ async fn migrate_device_ip(pool: &SqlitePool, id: i64, new_ip: &str) -> anyhow::
     Ok(())
 }
 
+/// Every address Dom holds a device row for, whether or not it answers.
+///
+/// This is Dom's durable memory of where it has found hardware: it survives the
+/// kernel's ARP cache aging out, the device being unplugged, and the process
+/// restarting. The ping scan reads it to decide which subnets are worth
+/// sweeping — a device that has moved is found again because its *old* address
+/// still names the subnet to look in. See `devices::scan_subnets`.
+///
+/// Rows whose `ip` does not parse are skipped rather than failing the call: one
+/// bad row must not cost the sweep every subnet the other rows name.
+///
+/// Ordered so the caller gets the same list in the same order every time. The
+/// column is TEXT, so that order is lexicographic rather than numeric — which
+/// does not matter, as the only thing reading it needs is to be stable.
+pub async fn all_device_ips(pool: &SqlitePool) -> anyhow::Result<Vec<IpAddr>> {
+    let rows: Vec<String> = sqlx::query_scalar("SELECT ip FROM Devices ORDER BY ip")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().filter_map(|ip| ip.parse().ok()).collect())
+}
+
 /// True if device `id`'s address in the DB no longer matches `ip` (or the
 /// row is gone entirely) — i.e. a fingerprint match moved this row out from
 /// under a poll loop still bound to the old address. Poll loops check this
