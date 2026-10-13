@@ -2010,7 +2010,7 @@ mod tests {
         let pool = db_with_switch().await;
         let state = shared(App::default());
         let prompt = crate::app::ClusterPairingPrompt {
-            addr: "172.16.0.9:7878".into(),
+            addr: "172.16.0.9:7797".into(),
             node_id: "node-b".into(),
             public_key: "deadbeef".into(),
             replaces_pin: false,
@@ -2032,7 +2032,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("172.16.0.9:7878")
+            Some("172.16.0.9:7797")
         );
         assert!(state.read().unwrap().cluster_pairing_prompt.is_none());
     }

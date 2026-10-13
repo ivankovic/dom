@@ -557,7 +557,7 @@ reachable from an ordinary LAN:
 - `cluster::from_hex` took `&s[i..i + 2]` two bytes at a time. It decodes the `public_key`
   and `signature` fields of a `HeartbeatReply`, which arrive as JSON from whatever answered
   the probe — and `cluster_discovery_task` probes *every* candidate address on the LAN at
-  port 7878, not only the configured peer. The nonce check in `heartbeat_once` runs before
+  port 7797, not only the configured peer. The nonce check in `heartbeat_once` runs before
   `verify_reply`, but the nonce is handed to the responder in the request, so it gates
   nothing here.
 - `fingerprint::extract_location` compared `&line[..9]` against `"location:"`. Its input is

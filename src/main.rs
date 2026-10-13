@@ -194,8 +194,10 @@ const ECO_HISTORY_DAYS: i64 = 14;
 /// from afternoon".
 const ECO_MIN_FORECAST_STEPS: usize = 48;
 /// TCP port the cluster heartbeat listens on — see `cluster_heartbeat_listener_task` and
-/// `cluster_task`.
-const CLUSTER_HEARTBEAT_PORT: u16 = 7878;
+/// `cluster_task`. Not 7878: that is Radarr's default, and whichever of the two started first
+/// held it. A stored peer address on the old port heals itself, because discovery finds the
+/// pinned key at the new one and records that address.
+const CLUSTER_HEARTBEAT_PORT: u16 = 7797;
 /// How often a paired node attempts to reach its peer. Faster than `TIMER_TICK_SECS` because
 /// failover latency (`CLUSTER_HEARTBEAT_INTERVAL_SECS * CLUSTER_PEER_LOST_AFTER_FAILURES`)
 /// matters here in a way it doesn't for the other background tasks.

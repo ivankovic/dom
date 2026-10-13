@@ -3599,13 +3599,13 @@ mod tests {
     fn a_fresh_candidate_invites_pairing_without_implying_one_already_existed() {
         let mut app = net_app();
         app.cluster_pairing_prompt = Some(crate::app::ClusterPairingPrompt {
-            addr: "192.168.1.50:7878".to_string(),
+            addr: "192.168.1.50:7797".to_string(),
             node_id: "deadbeef".to_string(),
             public_key: "a".repeat(64),
             replaces_pin: false,
         });
         let out = cluster_text(&app);
-        assert!(out.contains("192.168.1.50:7878"), "{out}");
+        assert!(out.contains("192.168.1.50:7797"), "{out}");
         assert!(out.contains("Found a Dom instance"), "{out}");
         assert!(out.contains("press 'p' to pair"), "{out}");
         assert!(!out.contains("re-pair"), "{out}");
@@ -3616,7 +3616,7 @@ mod tests {
     fn a_mismatched_pin_is_worded_as_re_pairing_and_warns_against_blind_acceptance() {
         let mut app = net_app();
         app.cluster_pairing_prompt = Some(crate::app::ClusterPairingPrompt {
-            addr: "192.168.1.50:7878".to_string(),
+            addr: "192.168.1.50:7797".to_string(),
             node_id: "deadbeef".to_string(),
             public_key: "c".repeat(64),
             replaces_pin: true,
@@ -3634,14 +3634,14 @@ mod tests {
     fn the_network_view_draws_the_cluster_panel_only_when_a_prompt_is_pending() {
         let mut app = net_app();
         app.cluster_pairing_prompt = Some(crate::app::ClusterPairingPrompt {
-            addr: "192.168.1.50:7878".to_string(),
+            addr: "192.168.1.50:7797".to_string(),
             node_id: "deadbeef".to_string(),
             public_key: "a".repeat(64),
             replaces_pin: false,
         });
         let screen = draw(&app, 140, 30);
         assert!(screen.contains("Cluster"), "{screen}");
-        assert!(screen.contains("192.168.1.50:7878"), "{screen}");
+        assert!(screen.contains("192.168.1.50:7797"), "{screen}");
 
         let screen = draw(&net_app(), 140, 30);
         assert!(!screen.contains("Cluster"), "{screen}");

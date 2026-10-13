@@ -4751,12 +4751,12 @@ mod tests {
     async fn cluster_peer_addr_is_none_until_configured_then_reads_it_back() {
         let pool = init("sqlite::memory:").await.unwrap();
         assert_eq!(cluster_peer_addr(&pool).await.unwrap(), None);
-        set_config(&pool, CLUSTER_PEER_ADDR_KEY, "dom-b:7878")
+        set_config(&pool, CLUSTER_PEER_ADDR_KEY, "dom-b:7797")
             .await
             .unwrap();
         assert_eq!(
             cluster_peer_addr(&pool).await.unwrap(),
-            Some("dom-b:7878".to_string())
+            Some("dom-b:7797".to_string())
         );
     }
 
@@ -4790,12 +4790,12 @@ mod tests {
     async fn set_cluster_peer_addr_writes_what_cluster_peer_addr_reads_back() {
         let pool = init("sqlite::memory:").await.unwrap();
         assert_eq!(cluster_peer_addr(&pool).await.unwrap(), None);
-        set_cluster_peer_addr(&pool, "192.168.1.42:7878")
+        set_cluster_peer_addr(&pool, "192.168.1.42:7797")
             .await
             .unwrap();
         assert_eq!(
             cluster_peer_addr(&pool).await.unwrap(),
-            Some("192.168.1.42:7878".to_string())
+            Some("192.168.1.42:7797".to_string())
         );
     }
 
