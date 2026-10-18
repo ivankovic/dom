@@ -106,18 +106,31 @@ pub struct EcoPlan {
     /// crosses into a new local day.
     pub date: chrono::NaiveDate,
     pub on_at: DateTime<Utc>,
-    pub off_at: DateTime<Utc>,
-    /// Predicted grid import for the window, Wh — shown so the plan reads as
-    /// more than a guess.
-    ///
-    /// `None` marks the *timer fallback*: a day Eco could not score, placed at
-    /// the device's own configured timer clock times instead. A fallback plan
-    /// predicts nothing, so there is no figure to show — see
-    /// `main::compute_eco_plan` for what makes a day unscoreable.
-    pub predicted_grid_wh: Option<f64>,
+    /// `None` exactly for [`EcoPlanKind::Winter`]: a day that keeps the switch
+    /// running has no off leg to fire.
+    pub off_at: Option<DateTime<Utc>>,
+    pub kind: EcoPlanKind,
     /// True once `on_at`/`off_at` have actually been sent to the switch.
     pub on_fired: bool,
     pub off_fired: bool,
+}
+
+/// How a day's [`EcoPlan`] was arrived at — which the TUI says, so a window
+/// is never presented as more of a decision than it was.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EcoPlanKind {
+    /// A window Eco scored against the forecast, with its predicted grid
+    /// import in Wh — shown so the plan reads as more than a guess.
+    Scored { predicted_grid_wh: f64 },
+    /// A day Eco could not score, placed at the device's own configured timer
+    /// clock times instead. It predicts nothing, so there is no figure to show
+    /// — see `main::compute_eco_plan` for what makes a day unscoreable.
+    TimerFallback,
+    /// The coming week has too little sun to be worth switching off for, so the
+    /// switch runs all day — see `devices::mystrom_switch::ECO_WINTER_SOLAR_SHARE`.
+    /// `solar_share` is the share of the week's run solar was forecast to
+    /// cover, 0..=1.
+    Winter { solar_share: f64 },
 }
 
 #[derive(Clone)]
@@ -911,8 +924,8 @@ mod tests {
                 EcoPlan {
                     date: now.date_naive(),
                     on_at: now,
-                    off_at: now,
-                    predicted_grid_wh: None,
+                    off_at: Some(now),
+                    kind: EcoPlanKind::TimerFallback,
                     on_fired: false,
                     off_fired: false,
                 },

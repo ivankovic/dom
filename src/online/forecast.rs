@@ -73,9 +73,13 @@ const HOST_ARCHIVE: &str = "historical-forecast-api.open-meteo.com";
 /// Credit the data licence requires wherever the data is shown.
 pub const ATTRIBUTION: &str = "Weather data by Open-Meteo.com";
 
-/// How far ahead the forward forecast reaches. Two days covers the rest of today
-/// and all of tomorrow from any hour, which is the question being asked.
-const FORECAST_DAYS: u8 = 2;
+/// How far ahead the forward forecast reaches. The view asks only about today
+/// and tomorrow, but Eco mode asks whether the coming *week* has enough sun to
+/// be worth switching a heat pump off for (`main::ECO_WINTER_OUTLOOK_DAYS`), so
+/// the fetch covers a week. Past the ICON-CH models' reach this is a coarser
+/// model interpolated to 15 minutes, which is fine for a question about a week's
+/// total; the document grows to roughly 25 KB.
+const FORECAST_DAYS: u8 = 7;
 
 /// The variables fetched, in both directions.
 ///

@@ -50,6 +50,9 @@
 //!   not one. Ties are the expected outcome rather than an edge case: on a sunny
 //!   day with surplus all afternoon, many windows genuinely cost the same.
 //! - [`choose_window`] resolves that to a single answer.
+//! - [`solar_share`] asks the question before all of that: over the coming
+//!   week, is there enough sun to be worth placing a window at all? Below
+//!   [`ECO_WINTER_SOLAR_SHARE`] Eco keeps the switch running instead.
 //!
 //! A day Eco cannot score falls back to the device's own timer, which is the
 //! safe direction: the thing still runs when the user said it should.
@@ -590,6 +593,62 @@ pub fn choose_window(
     ))
 }
 
+/// Below this share of its run covered by solar over the coming week, Eco
+/// stops placing a window at all and keeps the switch running — "winter mode".
+///
+/// Placing a window only pays while there is sun to place it under. On a day
+/// the forecast says is dark, every window costs the full draw anyway, and the
+/// hours the device spends switched off are not free either: a hot-water heat
+/// pump left off overnight in winter loses heat to a cold room, then works
+/// hardest to win it back at the lowest outdoor temperature of the day. Past
+/// this point that is a worse trade than simply leaving it on. A quarter is a
+/// judgement, not a measurement — there is no sensor here for the tank's
+/// standby loss — chosen low enough that an ordinary cloudy spell in spring or
+/// autumn does not trigger it.
+pub const ECO_WINTER_SOLAR_SHARE: f64 = 0.25;
+
+/// The share, 0..=1, of the switch's run that solar could cover across `days`
+/// — each a forecast production curve like `choose_window`'s — if each day ran
+/// at its own best window. This is what [`ECO_WINTER_SOLAR_SHARE`] is compared
+/// against.
+///
+/// Pooled over the days rather than averaged per day, so one bright day in a
+/// grey week counts for the energy it actually offers, not for a seventh of
+/// a percentage. `None` for no days, or a run that draws nothing or does not
+/// fit in a day — there is no share of nothing.
+pub fn solar_share(
+    duration_steps: usize,
+    typical_power_w: f64,
+    days: &[[f64; STEPS_PER_DAY]],
+    baseline_w: &[f64; STEPS_PER_DAY],
+) -> Option<f64> {
+    if days.is_empty() || duration_steps == 0 || duration_steps > STEPS_PER_DAY {
+        return None;
+    }
+    let need_wh = typical_power_w * duration_steps as f64 / crate::solar::STEPS_PER_HOUR;
+    if need_wh <= 0.0 {
+        return None;
+    }
+    let grid_wh: f64 = days
+        .iter()
+        .map(|production_w| {
+            (0..STEPS_PER_DAY)
+                .map(|start| {
+                    window_cost_wh(
+                        start,
+                        duration_steps,
+                        typical_power_w,
+                        production_w,
+                        baseline_w,
+                    )
+                })
+                .fold(f64::INFINITY, f64::min)
+        })
+        .sum();
+    let total_need_wh = need_wh * days.len() as f64;
+    Some(((total_need_wh - grid_wh) / total_need_wh).clamp(0.0, 1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +948,59 @@ mod tests {
                 "start {start} was not among the tied candidates"
             );
         }
+    }
+
+    #[test]
+    fn a_dark_week_leaves_solar_no_share_of_the_run() {
+        let week = [zeros(); 7];
+        assert_eq!(solar_share(8, 1000.0, &week, &zeros()), Some(0.0));
+    }
+
+    #[test]
+    fn a_week_of_full_sun_covers_the_whole_run() {
+        let mut sunny = zeros();
+        for slot in &mut sunny[40..56] {
+            *slot = 3000.0;
+        }
+        let share = solar_share(8, 1000.0, &[sunny; 7], &zeros()).unwrap();
+        assert!((share - 1.0).abs() < 1e-9, "{share}");
+    }
+
+    #[test]
+    fn one_bright_day_counts_for_the_energy_it_offers() {
+        // Six dark days and one that covers the run entirely: a seventh of the
+        // week's need, not more and not less.
+        let mut sunny = zeros();
+        for slot in &mut sunny[40..56] {
+            *slot = 3000.0;
+        }
+        let mut week = [zeros(); 7];
+        week[3] = sunny;
+        let share = solar_share(8, 1000.0, &week, &zeros()).unwrap();
+        assert!((share - 1.0 / 7.0).abs() < 1e-9, "{share}");
+        assert!(share < ECO_WINTER_SOLAR_SHARE);
+    }
+
+    #[test]
+    fn the_house_gets_the_sun_before_the_switch_does() {
+        // Production that only matches what the rest of the house already
+        // draws leaves nothing over for the switch.
+        let mut production = zeros();
+        for slot in &mut production[40..56] {
+            *slot = 800.0;
+        }
+        let baseline = [800.0; STEPS_PER_DAY];
+        assert_eq!(
+            solar_share(8, 1000.0, &[production; 7], &baseline),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn there_is_no_share_of_nothing() {
+        assert_eq!(solar_share(8, 1000.0, &[], &zeros()), None);
+        assert_eq!(solar_share(8, 0.0, &[zeros()], &zeros()), None);
+        assert_eq!(solar_share(0, 1000.0, &[zeros()], &zeros()), None);
     }
 
     #[test]

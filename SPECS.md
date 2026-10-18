@@ -1545,6 +1545,37 @@ day's 96 steps actually arrived and falls back below half. Open-Meteo serves the
 15-minute resolution in one document, so a normal day has all 96 and a short count means the
 fetch has not landed, not that the sky is dark.
 
+### Winter mode: a dark week keeps the switch running (2026-10-18)
+By October the scheduled shutdown had stopped paying. On a day with no usable surplus every
+window costs the full draw anyway, so placing one saves nothing — and the hours the hot-water heat
+pump spends off are not free: the tank loses heat to a cold room overnight, and the pump then wins
+it back at the coldest hours, which is when it works least efficiently. Past some point, running
+continuously uses less energy than shutting down.
+
+Before placing a window, Eco now asks whether one is worth placing. For each of the next seven
+local days (today included) it takes that day's forecast production, scores the best window as
+before, and pools the result: the share of the week's total run that solar would cover
+(`mystrom_switch::solar_share`). Below `ECO_WINTER_SOLAR_SHARE` (25%), today's plan is *winter*:
+switch on now, and no off leg. The TUI says so, with the share.
+
+- **A week, not a day.** One grey day in October must not leave the tank running, and one bright
+  day in January must not switch it off. Pooled energy rather than an average of daily shares, so a
+  single sunny day counts for what it offers.
+- **The forecast was extended to seven days** (`online::forecast::FORECAST_DAYS`, previously 2).
+  Beyond the ICON-CH models' reach Open-Meteo serves a coarser model interpolated to 15 minutes;
+  for a question about a week's total that is enough. The document grows from ~7 KB to ~25 KB.
+- **Days the forecast does not reach are left out, not read as dark** — the same mistake
+  `production_curve`'s coverage gate exists to avoid. With fewer than five days covered the week is
+  not judged at all, and today is planned on its own as before.
+- **Still decided once a day, sticky like every other plan.** The plan's `on_at` is the moment it is
+  made, not midnight, so a plan made at startup mid-afternoon still falls inside the catch-up bound
+  and fires.
+- **Leaving winter switches off.** A winter plan has no off leg, so on the first Eco day after one
+  the relay would otherwise stay on from midnight until the new window's *off*. `eco_job` switches it
+  off once, with the usual retry bound, until that day's window opens.
+- **The threshold is a judgement.** Nothing here measures the tank's standby loss, so 25% is chosen
+  to sit below what an ordinary cloudy spell in spring or autumn leaves, rather than derived.
+
 ## High availability: a two-node active/standby cluster (2026-08-30)
 
 ### Status

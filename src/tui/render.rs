@@ -67,7 +67,7 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, ConnStatus, Focus, KebaReading, LiveReading, NetworkDeviceStatus, ScanPhase,
+    App, ConnStatus, EcoPlanKind, Focus, KebaReading, LiveReading, NetworkDeviceStatus, ScanPhase,
     ScannedDevice, SwitchAutoMode, SwitchReading, TimerDialogField, View,
 };
 use crate::devices;
@@ -1476,17 +1476,25 @@ fn switch_reading_lines(lines: &mut Vec<Line>, r: &SwitchReading, app: &App, ip:
     if is_eco {
         let text = match app.switch_eco_plans.get(&ip) {
             Some(plan) => {
-                let on = plan.on_at.with_timezone(&chrono::Local).format("%H:%M");
-                let off = plan.off_at.with_timezone(&chrono::Local).format("%H:%M");
-                match plan.predicted_grid_wh {
-                    Some(wh) => format!(
+                let local = |t: chrono::DateTime<chrono::Utc>| {
+                    t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+                };
+                let on = local(plan.on_at);
+                // Every kind but Winter has an off leg.
+                let off = plan.off_at.map(local).unwrap_or_default();
+                match plan.kind {
+                    EcoPlanKind::Scored { predicted_grid_wh } => format!(
                         "  Eco      today {on}\u{2013}{off}, ~{:.1} kWh from grid",
-                        wh / 1000.0
+                        predicted_grid_wh / 1000.0
                     ),
                     // The timer fallback — say so, rather than dressing the
                     // user's own clock times up as something Eco chose.
-                    None => format!(
+                    EcoPlanKind::TimerFallback => format!(
                         "  Eco      today {on}\u{2013}{off} — timer fallback, not enough data to plan"
+                    ),
+                    EcoPlanKind::Winter { solar_share } => format!(
+                        "  Eco      winter — running all day, sun covers ~{:.0}% this week",
+                        solar_share * 100.0
                     ),
                 }
             }

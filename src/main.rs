@@ -193,6 +193,16 @@ const ECO_HISTORY_DAYS: i64 = 14;
 /// day is dark. Half a day is the loosest reading of "enough to tell morning
 /// from afternoon".
 const ECO_MIN_FORECAST_STEPS: usize = 48;
+/// How many local days, today included, Eco weighs before deciding the coming
+/// week is winter — see `devices::mystrom_switch::ECO_WINTER_SOLAR_SHARE`. A
+/// week rather than a day, so one grey day in October does not leave the tank
+/// running and one bright day in January does not switch it off; matches
+/// `online::forecast`'s reach.
+const ECO_WINTER_OUTLOOK_DAYS: u64 = 7;
+/// How many of those days need a forecast (`ECO_MIN_FORECAST_STEPS` each)
+/// before the week is judged at all. A week judged on two days is a day judged
+/// twice; short of this, today is planned on its own as before.
+const ECO_WINTER_MIN_DAYS: usize = 5;
 /// TCP port the cluster heartbeat listens on — see `cluster_heartbeat_listener_task` and
 /// `cluster_task`. Not 7878: that is Radarr's default, and whichever of the two started first
 /// held it. A stored peer address on the old port heals itself, because discovery finds the
@@ -1479,6 +1489,11 @@ fn window_instants(
 /// house around it. Called once per local day per Eco-mode device by
 /// `eco_job`, which answers `None` with `timer_fallback_plan`.
 ///
+/// Before placing a window it asks whether one is worth placing: if the coming
+/// week's forecast leaves solar too small a share of the run
+/// (`devices::mystrom_switch::solar_share`), the plan is winter mode instead —
+/// on from `now`, and no off leg.
+///
 /// `on_hhmm`/`off_hhmm` are the device's own configured timer pair — Eco mode
 /// reads only their *length* (`duration_steps_from_timers`), not their clock
 /// time, which is what it replaces each day. See
@@ -1488,16 +1503,22 @@ async fn compute_eco_plan(
     switch_device_id: i64,
     on_hhmm: &str,
     off_hhmm: &str,
-    today: chrono::NaiveDate,
+    now: chrono::DateTime<Utc>,
 ) -> Option<app::EcoPlan> {
     use devices::mystrom_switch::{duration_steps_from_timers, step_of_hhmm};
+
+    let today = now.with_timezone(&chrono::Local).date_naive();
 
     let duration_steps = duration_steps_from_timers(on_hhmm, off_hhmm)?;
     let on_step = step_of_hhmm(on_hhmm)?;
 
     let calibration = db::get_calibration(pool).await.ok().flatten()?;
 
-    let forecast = db::query_forecast(pool, today, today).await.ok()?;
+    let week: Vec<chrono::NaiveDate> = today
+        .iter_days()
+        .take(ECO_WINTER_OUTLOOK_DAYS as usize)
+        .collect();
+    let forecast = db::query_forecast(pool, today, *week.last()?).await.ok()?;
     let production_w = production_curve(&forecast, calibration.k, today)?;
 
     let house_id: Option<i64> =
@@ -1534,6 +1555,25 @@ async fn compute_eco_plan(
 
     let typical_power_w = typical_running_power(&switch_curve, on_step, duration_steps)?;
 
+    // Days past today that the forecast does not reach are left out rather than
+    // read as dark — that would be the missing-forecast-as-overcast mistake
+    // `production_curve` exists to avoid, made a week at a time.
+    let week_w: Vec<_> = week
+        .iter()
+        .filter_map(|day| production_curve(&forecast, calibration.k, *day))
+        .collect();
+    if week_w.len() >= ECO_WINTER_MIN_DAYS {
+        let solar_share = devices::mystrom_switch::solar_share(
+            duration_steps,
+            typical_power_w,
+            &week_w,
+            &baseline_w,
+        )?;
+        if solar_share < devices::mystrom_switch::ECO_WINTER_SOLAR_SHARE {
+            return Some(winter_plan(now, solar_share));
+        }
+    }
+
     let (start, predicted_grid_wh) = devices::mystrom_switch::choose_window(
         duration_steps,
         typical_power_w,
@@ -1546,11 +1586,28 @@ async fn compute_eco_plan(
     Some(app::EcoPlan {
         date: today,
         on_at,
-        off_at,
-        predicted_grid_wh: Some(predicted_grid_wh),
+        off_at: Some(off_at),
+        kind: app::EcoPlanKind::Scored { predicted_grid_wh },
         on_fired: false,
         off_fired: false,
     })
+}
+
+/// Today's plan when the week is winter: switch on now, and leave it on.
+///
+/// `on_at` is `now` rather than local midnight so that a plan made mid-day —
+/// at startup, or when Eco is first switched on — is still within
+/// `MAX_TIMER_CATCHUP_MINUTES` and actually fires. On the following winter
+/// day it fires again, which is harmless: the relay is already on.
+fn winter_plan(now: chrono::DateTime<Utc>, solar_share: f64) -> app::EcoPlan {
+    app::EcoPlan {
+        date: now.with_timezone(&chrono::Local).date_naive(),
+        on_at: now,
+        off_at: None,
+        kind: app::EcoPlanKind::Winter { solar_share },
+        on_fired: false,
+        off_fired: false,
+    }
 }
 
 /// Today's plan for a switch whose day Eco could not score: its own configured
@@ -1590,8 +1647,8 @@ fn timer_fallback_plan(
     Some(app::EcoPlan {
         date: today,
         on_at,
-        off_at,
-        predicted_grid_wh: None,
+        off_at: Some(off_at),
+        kind: app::EcoPlanKind::TimerFallback,
         on_fired: false,
         off_fired: false,
     })
@@ -1651,8 +1708,8 @@ async fn fire_eco_leg(
 /// at all — see `compute_eco_plan`) and fires its on/off instants as they
 /// come due.
 ///
-/// Unlike `timer_job`'s sweep, a plan has exactly one on and one off instant,
-/// so there is no minute-window to catch: "now is at or past `on_at` and it
+/// Unlike `timer_job`'s sweep, a plan has exactly one on and one off instant
+/// (a winter plan has no off at all — see `winter_plan`), so there is no minute-window to catch: "now is at or past `on_at` and it
 /// has not fired yet" is its own catch-up, self-healing after any gap.
 /// `MAX_TIMER_CATCHUP_MINUTES` (shared with `timer_job`) only bounds how late
 /// a catch-up is still worth attempting, so a multi-hour outage does not fire
@@ -1692,12 +1749,53 @@ fn leg_is_due(
     !fired && now >= at && now - at <= catchup
 }
 
+/// Whether a switch yesterday's winter plan left running should still be
+/// switched off: only until today's window opens.
+///
+/// A winter plan has no off leg, so without this the first Eco day after a
+/// winter spell would run from midnight until its window's *off* — the on leg
+/// being a no-op on a relay that was never switched off. Once the window has
+/// opened, the switch is meant to be on anyway.
+fn winter_stop_is_due(plan: &app::EcoPlan, now: chrono::DateTime<Utc>) -> bool {
+    plan.off_at.is_some() && !plan.on_fired && now < plan.on_at
+}
+
+/// Switches off a switch a winter plan left running, retrying across ticks as
+/// `fire_eco_leg` does and giving up after `TIMER_MAX_ATTEMPTS`. It has no plan
+/// leg to record against, so it is tracked in `winter_stops` instead.
+async fn stop_after_winter(ip: IpAddr, winter_stops: &mut HashMap<IpAddr, u32>) {
+    match devices::mystrom_switch::set_relay(ip, devices::mystrom_switch::API_PORT, false).await {
+        Ok(()) => {
+            log::info!("eco {ip} switched off, winter mode over until its window");
+            winter_stops.remove(&ip);
+        }
+        Err(e) => {
+            let count = winter_stops.entry(ip).or_insert(0);
+            *count += 1;
+            if *count >= TIMER_MAX_ATTEMPTS {
+                log::warn!(
+                    "eco could not switch {ip} off after winter mode after {count} attempts ({e:#}); giving up"
+                );
+                winter_stops.remove(&ip);
+            } else {
+                log::warn!(
+                    "eco could not switch {ip} off after winter mode: {e:#}; attempt {count}, will retry"
+                );
+            }
+        }
+    }
+}
+
 async fn eco_job(state: SharedState, pool: SqlitePool) {
     let mut ticker = tokio::time::interval(Duration::from_secs(TIMER_TICK_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut on_attempts: HashMap<IpAddr, u32> = HashMap::new();
     let mut off_attempts: HashMap<IpAddr, u32> = HashMap::new();
+    // Switches left running by yesterday's winter plan whose today is not
+    // winter, with the attempts spent switching them off — see
+    // `winter_stop_is_due`.
+    let mut winter_stops: HashMap<IpAddr, u32> = HashMap::new();
 
     loop {
         ticker.tick().await;
@@ -1718,13 +1816,17 @@ async fn eco_job(state: SharedState, pool: SqlitePool) {
                 continue;
             };
 
-            let needs_plan = !matches!(
-                state.read().unwrap().switch_eco_plans.get(&ip),
-                Some(p) if p.date == today
-            );
+            let (needs_plan, was_winter) = match state.read().unwrap().switch_eco_plans.get(&ip) {
+                Some(p) => (
+                    p.date != today,
+                    matches!(p.kind, app::EcoPlanKind::Winter { .. }),
+                ),
+                None => (true, false),
+            };
             if needs_plan {
                 on_attempts.remove(&ip);
                 off_attempts.remove(&ip);
+                winter_stops.remove(&ip);
                 // A day Eco cannot score falls back to the device's own timer
                 // pair rather than leaving the relay untouched — see
                 // `timer_fallback_plan`. Either way the day now has a plan, so
@@ -1733,14 +1835,17 @@ async fn eco_job(state: SharedState, pool: SqlitePool) {
                 // re-deciding mid-day would build a fresh plan with
                 // `on_fired: false` and switch a tank that had already been
                 // heated back on.
-                let plan =
-                    match compute_eco_plan(&pool, device_id, &on_hhmm, &off_hhmm, today).await {
-                        Some(plan) => Some(plan),
-                        None => timer_fallback_plan(&on_hhmm, &off_hhmm, today),
-                    };
+                let plan = match compute_eco_plan(&pool, device_id, &on_hhmm, &off_hhmm, now).await
+                {
+                    Some(plan) => Some(plan),
+                    None => timer_fallback_plan(&on_hhmm, &off_hhmm, today),
+                };
                 let mut app = state.write().unwrap();
                 match plan {
                     Some(plan) => {
+                        if was_winter && plan.off_at.is_some() {
+                            winter_stops.insert(ip, 0);
+                        }
                         app.switch_eco_plans.insert(ip, plan);
                     }
                     None => {
@@ -1754,10 +1859,19 @@ async fn eco_job(state: SharedState, pool: SqlitePool) {
             };
             let catchup = chrono::Duration::minutes(MAX_TIMER_CATCHUP_MINUTES);
 
+            if winter_stops.contains_key(&ip) {
+                if winter_stop_is_due(&plan, now) {
+                    stop_after_winter(ip, &mut winter_stops).await;
+                } else {
+                    winter_stops.remove(&ip);
+                }
+            }
             if leg_is_due(plan.on_fired, plan.on_at, now, catchup) {
                 fire_eco_leg(&state, ip, true, &mut on_attempts).await;
             }
-            if leg_is_due(plan.off_fired, plan.off_at, now, catchup) {
+            if let Some(off_at) = plan.off_at
+                && leg_is_due(plan.off_fired, off_at, now, catchup)
+            {
                 fire_eco_leg(&state, ip, false, &mut off_attempts).await;
             }
         }
@@ -3382,11 +3496,11 @@ mod tests {
     fn the_timer_fallback_runs_at_the_users_own_clock_times() {
         let plan = timer_fallback_plan("09:00", "18:00", a_day()).unwrap();
         assert_eq!(local_hhmm(plan.on_at), "09:00");
-        assert_eq!(local_hhmm(plan.off_at), "18:00");
+        assert_eq!(local_hhmm(plan.off_at.unwrap()), "18:00");
         assert_eq!(plan.date, a_day());
         // Nothing was predicted — this window was placed by the clock, not
         // scored, and the TUI reads exactly this to say so.
-        assert_eq!(plan.predicted_grid_wh, None);
+        assert_eq!(plan.kind, app::EcoPlanKind::TimerFallback);
         assert!(!plan.on_fired && !plan.off_fired);
     }
 
@@ -3394,16 +3508,50 @@ mod tests {
     fn a_timer_fallback_across_midnight_lands_on_the_next_day() {
         let plan = timer_fallback_plan("22:00", "05:00", a_day()).unwrap();
         assert_eq!(local_hhmm(plan.on_at), "22:00");
-        assert_eq!(local_hhmm(plan.off_at), "05:00");
+        let off_at = plan.off_at.unwrap();
+        assert_eq!(local_hhmm(off_at), "05:00");
         assert!(
-            plan.off_at > plan.on_at,
+            off_at > plan.on_at,
             "the off leg should be the following morning, not the same one"
         );
         assert_eq!(
-            plan.off_at - plan.on_at,
+            off_at - plan.on_at,
             chrono::Duration::hours(7),
             "a wrapping pair should keep the length its timers imply"
         );
+    }
+
+    #[test]
+    fn a_winter_plan_switches_on_now_and_never_off() {
+        // Mid-afternoon, as at a restart: an `on_at` of midnight would be far
+        // outside the catch-up and never fire.
+        let now = at("15:20").with_timezone(&Utc);
+        let plan = winter_plan(now, 0.1);
+        assert_eq!(plan.on_at, now);
+        assert_eq!(plan.off_at, None);
+        assert_eq!(plan.date, now.with_timezone(&chrono::Local).date_naive());
+        let catchup = chrono::Duration::minutes(MAX_TIMER_CATCHUP_MINUTES);
+        assert!(leg_is_due(plan.on_fired, plan.on_at, now, catchup));
+    }
+
+    #[test]
+    fn a_switch_left_on_by_winter_is_stopped_only_until_its_window_opens() {
+        let plan = timer_fallback_plan("09:00", "18:00", a_day()).unwrap();
+        let before = plan.on_at - chrono::Duration::hours(8);
+        assert!(winter_stop_is_due(&plan, before));
+        assert!(
+            !winter_stop_is_due(&plan, plan.on_at),
+            "once the window is open the switch is meant to be on"
+        );
+
+        let fired = app::EcoPlan {
+            on_fired: true,
+            ..plan.clone()
+        };
+        assert!(!winter_stop_is_due(&fired, before));
+
+        // Winter again today: nothing to stop.
+        assert!(!winter_stop_is_due(&winter_plan(before, 0.1), before));
     }
 
     #[test]
