@@ -3064,8 +3064,11 @@ pub async fn query_avg_power_by_local_quarter_hour(
         "SELECT
              CAST(strftime('%H', minute, 'localtime') AS INTEGER) * 4
                  + CAST(strftime('%M', minute, 'localtime') AS INTEGER) / 15 AS step,
-             SUM(energy_ws) AS total_ws,
-             SUM(span_secs) AS total_secs
+             -- `span_secs` is an INTEGER column, and sqlx will not decode
+             -- an integer into the f64 below. Uncast, every real database
+             -- failed this query and Eco silently fell back to the timer.
+             CAST(SUM(energy_ws) AS REAL) AS total_ws,
+             CAST(SUM(span_secs) AS REAL) AS total_secs
          FROM EnergyMinute
          WHERE device_id = ? AND metric = ?
            AND minute >= ? AND minute < ?
@@ -3230,6 +3233,26 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn quarter_hour_averages_read_minutes_the_rollup_actually_wrote() {
+        // Through the real rollup rather than hand-written rows: it is what
+        // writes `span_secs` as an integer, which this query once could not
+        // decode — and Eco, reading the error as "no history", never scored.
+        let pool = init("sqlite::memory:").await.unwrap();
+        let id = device(&pool, "172.16.75.9").await;
+        sample(&pool, id, "2026-03-14 10:00:00", "power", 1000.0).await;
+        sample(&pool, id, "2026-03-14 10:00:02", "power", 1000.0).await;
+        roll_day(&pool, id, day("2026-03-14")).await;
+
+        let curve =
+            query_avg_power_by_local_quarter_hour(&pool, id, "power", day("2026-03-15"), 14)
+                .await
+                .unwrap();
+        // 10:00 is step 40; 2000 Ws over 4 s covered is 500 W.
+        assert_eq!(curve.len(), 1, "{curve:?}");
+        assert!((curve[&40] - 500.0).abs() < 1e-9, "{curve:?}");
     }
 
     #[tokio::test]

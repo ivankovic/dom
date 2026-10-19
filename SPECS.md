@@ -1576,6 +1576,14 @@ switch on now, and no off leg. The TUI says so, with the share.
 - **The threshold is a judgement.** Nothing here measures the tank's standby loss, so 25% is chosen
   to sit below what an ordinary cloudy spell in spring or autumn leaves, rather than derived.
 
+### Eco had never scored a day (2026-10-19)
+`query_avg_power_by_local_quarter_hour` decoded `SUM(span_secs)` as `f64`, but `span_secs` is an
+INTEGER column and sqlx refuses the conversion. `compute_eco_plan` reads that error as "no history"
+(`.ok()?`), so on every real database every day since Eco shipped fell back to the timer — the
+09:00–18:00 the log showed was the user's own pair, not a placement — and winter mode could not
+trigger either. The sums are now cast to REAL, and a test reads minutes written by the real rollup
+rather than hand-made rows, which is how this slipped past: the query had no test at all.
+
 ## High availability: a two-node active/standby cluster (2026-08-30)
 
 ### Status
